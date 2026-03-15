@@ -648,4 +648,35 @@ mod tests {
         assert_send_sync::<Linear<f32>>();
         assert_send_sync::<Linear<f64>>();
     }
+
+    // -----------------------------------------------------------------------
+    // Device transfer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_device_cpu_preserves_weights() {
+        let mut layer = Linear::<f32>::new(4, 3, true).unwrap();
+        layer.weight = Parameter::from_slice(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[3, 4],
+        )
+        .unwrap();
+        *layer.bias.as_mut().unwrap() =
+            Parameter::from_slice(&[0.1, 0.2, 0.3], &[3]).unwrap();
+
+        layer.to_device(ferrotorch_core::Device::Cpu).unwrap();
+
+        assert_eq!(layer.weight.shape(), &[3, 4]);
+        assert_close(layer.weight.data().unwrap(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], 1e-7);
+        assert_close(layer.bias.as_ref().unwrap().data().unwrap(), &[0.1, 0.2, 0.3], 1e-7);
+        assert!(layer.weight.requires_grad());
+        assert!(layer.bias.as_ref().unwrap().requires_grad());
+    }
+
+    #[test]
+    fn test_to_device_cuda_returns_device_unavailable() {
+        let mut layer = Linear::<f32>::new(4, 3, true).unwrap();
+        let result = layer.to_device(ferrotorch_core::Device::Cuda(0));
+        assert!(result.is_err());
+    }
 }

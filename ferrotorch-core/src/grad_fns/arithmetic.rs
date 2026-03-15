@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::autograd::no_grad::is_grad_enabled;
 use crate::dtype::Float;
-use crate::error::FerrotorchResult;
+use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::ops::elementwise::{binary_map, scalar_map, unary_map, fast_add, fast_mul};
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
@@ -68,20 +68,39 @@ impl<T: Float> GradFn<T> for AddBackward<T> {
 
 /// Elementwise addition: `c = a + b`.
 pub fn add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = fast_add(a, b)?;
+    if a.device() != b.device() {
+        return Err(FerrotorchError::DeviceMismatch { expected: a.device(), got: b.device() });
+    }
 
-    if needs_grad(a, b) {
-        let storage = TensorStorage::cpu(result.data()?.to_vec());
-        Tensor::from_operation(
-            storage,
-            result.shape().to_vec(),
-            Arc::new(AddBackward {
-                a: a.clone(),
-                b: b.clone(),
-            }),
-        )
+    if a.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = backend.add_f32(a.gpu_handle()?, b.gpu_handle()?)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = a.shape().to_vec();
+
+        if needs_grad(a, b) {
+            Tensor::from_operation(
+                storage,
+                shape,
+                Arc::new(AddBackward { a: a.clone(), b: b.clone() }),
+            )
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = fast_add(a, b)?;
+
+        if needs_grad(a, b) {
+            let storage = TensorStorage::cpu(result.data()?.to_vec());
+            Tensor::from_operation(
+                storage,
+                result.shape().to_vec(),
+                Arc::new(AddBackward { a: a.clone(), b: b.clone() }),
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -130,20 +149,39 @@ impl<T: Float> GradFn<T> for SubBackward<T> {
 
 /// Elementwise subtraction: `c = a - b`.
 pub fn sub<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = binary_map(a, b, |x, y| x - y)?;
+    if a.device() != b.device() {
+        return Err(FerrotorchError::DeviceMismatch { expected: a.device(), got: b.device() });
+    }
 
-    if needs_grad(a, b) {
-        let storage = TensorStorage::cpu(result.data()?.to_vec());
-        Tensor::from_operation(
-            storage,
-            result.shape().to_vec(),
-            Arc::new(SubBackward {
-                a: a.clone(),
-                b: b.clone(),
-            }),
-        )
+    if a.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = backend.sub_f32(a.gpu_handle()?, b.gpu_handle()?)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = a.shape().to_vec();
+
+        if needs_grad(a, b) {
+            Tensor::from_operation(
+                storage,
+                shape,
+                Arc::new(SubBackward { a: a.clone(), b: b.clone() }),
+            )
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = binary_map(a, b, |x, y| x - y)?;
+
+        if needs_grad(a, b) {
+            let storage = TensorStorage::cpu(result.data()?.to_vec());
+            Tensor::from_operation(
+                storage,
+                result.shape().to_vec(),
+                Arc::new(SubBackward { a: a.clone(), b: b.clone() }),
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -223,20 +261,39 @@ impl<T: Float> GradFn<T> for MulBackward<T> {
 
 /// Elementwise multiplication: `c = a * b`.
 pub fn mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = fast_mul(a, b)?;
+    if a.device() != b.device() {
+        return Err(FerrotorchError::DeviceMismatch { expected: a.device(), got: b.device() });
+    }
 
-    if needs_grad(a, b) {
-        let storage = TensorStorage::cpu(result.data()?.to_vec());
-        Tensor::from_operation(
-            storage,
-            result.shape().to_vec(),
-            Arc::new(MulBackward {
-                a: a.clone(),
-                b: b.clone(),
-            }),
-        )
+    if a.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = backend.mul_f32(a.gpu_handle()?, b.gpu_handle()?)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = a.shape().to_vec();
+
+        if needs_grad(a, b) {
+            Tensor::from_operation(
+                storage,
+                shape,
+                Arc::new(MulBackward { a: a.clone(), b: b.clone() }),
+            )
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = fast_mul(a, b)?;
+
+        if needs_grad(a, b) {
+            let storage = TensorStorage::cpu(result.data()?.to_vec());
+            Tensor::from_operation(
+                storage,
+                result.shape().to_vec(),
+                Arc::new(MulBackward { a: a.clone(), b: b.clone() }),
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -359,17 +416,35 @@ impl<T: Float> GradFn<T> for NegBackward<T> {
 
 /// Elementwise negation: `c = -a`.
 pub fn neg<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = unary_map(a, |x| -x)?;
+    if a.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = backend.neg_f32(a.gpu_handle()?)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = a.shape().to_vec();
 
-    if needs_grad_unary(a) {
-        let storage = TensorStorage::cpu(result.data()?.to_vec());
-        Tensor::from_operation(
-            storage,
-            result.shape().to_vec(),
-            Arc::new(NegBackward { a: a.clone() }),
-        )
+        if needs_grad_unary(a) {
+            Tensor::from_operation(
+                storage,
+                shape,
+                Arc::new(NegBackward { a: a.clone() }),
+            )
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = unary_map(a, |x| -x)?;
+
+        if needs_grad_unary(a) {
+            let storage = TensorStorage::cpu(result.data()?.to_vec());
+            Tensor::from_operation(
+                storage,
+                result.shape().to_vec(),
+                Arc::new(NegBackward { a: a.clone() }),
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 

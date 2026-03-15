@@ -7,12 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [0.1.0] - 2026-03-15
 
 ### Fixed
+- Fix FlashAttention GPU PTX register name collision (#168)
 - Rewrite GPU conv2d as pure GPU — im2col PTX kernel, no CPU roundtrip (#163)
 - Fix flaky watchdog timing test (#144)
 - Wire up ferray-ufunc SIMD kernels for elementwise ops (#141)
 - Wire up ferray-linalg for CPU matmul and fix crates.io dependency versions (#140)
 
 ### Added
+- Implement unified device-aware Tensor — Step 1: core infrastructure (#170)
+- Design unified device-aware Tensor architecture (#169)
+- Phase 10 Wave 4: FlashAttention GPU, gradient penalty, PagedAttention, GGUF (#165)
 - Phase 10 Wave 3: higher-order grads, FlashAttention, autocast wiring, model hub (#160)
 - Phase 10 Wave 2: linalg, vmap, pack_padded_seq, special functions, TensorBoard (#154)
 - Add per-crate READMEs and prep new crates for publishing (#153)

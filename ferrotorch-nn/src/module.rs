@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ferrotorch_core::{Float, FerrotorchError, FerrotorchResult, Tensor};
+use ferrotorch_core::{Device, Float, FerrotorchError, FerrotorchResult, Tensor};
 
 use crate::parameter::Parameter;
 
@@ -45,6 +45,16 @@ pub trait Module<T: Float>: Send + Sync {
 
     /// Whether the module is in training mode.
     fn is_training(&self) -> bool;
+
+    /// Move all parameters to a device.
+    ///
+    /// Default implementation iterates `parameters_mut()` and transfers each.
+    fn to_device(&mut self, device: Device) -> FerrotorchResult<()> {
+        for param in self.parameters_mut() {
+            *param = param.to(device)?;
+        }
+        Ok(())
+    }
 
     /// Export parameters as a state dict.
     fn state_dict(&self) -> StateDict<T> {
@@ -228,5 +238,20 @@ mod tests {
     fn test_reduction_enum() {
         assert_eq!(Reduction::Mean, Reduction::Mean);
         assert_ne!(Reduction::Mean, Reduction::Sum);
+    }
+
+    #[test]
+    fn test_to_device_cpu_preserves_weights() {
+        let mut m = SimpleModule::<f32>::new(4).unwrap();
+        m.to_device(ferrotorch_core::Device::Cpu).unwrap();
+        assert_eq!(m.parameters().len(), 1);
+        assert_eq!(m.parameters()[0].shape(), &[4]);
+    }
+
+    #[test]
+    fn test_to_device_cuda_without_backend() {
+        let mut m = SimpleModule::<f32>::new(3).unwrap();
+        let result = m.to_device(ferrotorch_core::Device::Cuda(0));
+        assert!(result.is_err());
     }
 }

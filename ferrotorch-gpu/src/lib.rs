@@ -23,6 +23,7 @@
 //! ```
 
 pub mod allocator;
+pub mod backend_impl;
 pub mod blas;
 pub mod buffer;
 pub mod conv;
@@ -35,6 +36,7 @@ pub mod tensor_bridge;
 pub mod transfer;
 
 // Re-exports for ergonomic use.
+pub use backend_impl::{init_cuda_backend, CudaBackendImpl};
 pub use allocator::CudaAllocator;
 pub use blas::{gpu_matmul_f32, gpu_matmul_f64};
 pub use conv::gpu_conv2d_f32;
