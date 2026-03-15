@@ -34,7 +34,7 @@ use crate::transfer::{alloc_zeros, cpu_to_gpu, gpu_to_cpu};
 
 /// PTX source for `add_kernel`: `out[i] = a[i] + b[i]`.
 #[cfg(feature = "cuda")]
-const ADD_PTX: &str = "\
+pub(crate) const ADD_PTX: &str = "\
 .version 7.0
 .target sm_52
 .address_size 64
@@ -82,7 +82,7 @@ DONE:
 
 /// PTX source for `sub_kernel`: `out[i] = a[i] - b[i]`.
 #[cfg(feature = "cuda")]
-const SUB_PTX: &str = "\
+pub(crate) const SUB_PTX: &str = "\
 .version 7.0
 .target sm_52
 .address_size 64
@@ -130,7 +130,7 @@ DONE:
 
 /// PTX source for `mul_kernel`: `out[i] = a[i] * b[i]`.
 #[cfg(feature = "cuda")]
-const MUL_PTX: &str = "\
+pub(crate) const MUL_PTX: &str = "\
 .version 7.0
 .target sm_52
 .address_size 64
@@ -178,7 +178,7 @@ DONE:
 
 /// PTX source for `neg_kernel`: `out[i] = -a[i]`.
 #[cfg(feature = "cuda")]
-const NEG_PTX: &str = "\
+pub(crate) const NEG_PTX: &str = "\
 .version 7.0
 .target sm_52
 .address_size 64
@@ -222,7 +222,7 @@ DONE:
 
 /// PTX source for `relu_kernel`: `out[i] = max(a[i], 0.0)`.
 #[cfg(feature = "cuda")]
-const RELU_PTX: &str = "\
+pub(crate) const RELU_PTX: &str = "\
 .version 7.0
 .target sm_52
 .address_size 64
@@ -340,24 +340,19 @@ fn try_launch_binary(
     a: &CudaBuffer<f32>,
     b: &CudaBuffer<f32>,
     device: &GpuDevice,
-    ptx_src: &str,
-    kernel_name: &str,
+    ptx_src: &'static str,
+    kernel_name: &'static str,
 ) -> GpuResult<Option<CudaBuffer<f32>>> {
     use cudarc::driver::PushKernelArg;
-    use cudarc::nvrtc::Ptx;
 
     let n = a.len();
     let ctx = device.context();
     let stream = device.stream();
 
-    // Attempt to load the PTX module. If it fails (e.g. unsupported arch),
-    // return None so the caller can use the CPU fallback.
-    let module = match ctx.load_module(Ptx::from_src(ptx_src)) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-
-    let f = match module.load_function(kernel_name) {
+    // Attempt to load the kernel (cached after first compilation).
+    // If it fails (e.g. unsupported arch), return None so the caller
+    // can use the CPU fallback.
+    let f = match crate::module_cache::get_or_compile(ctx, ptx_src, kernel_name) {
         Ok(f) => f,
         Err(_) => return Ok(None),
     };
@@ -388,22 +383,17 @@ fn try_launch_binary(
 fn try_launch_unary(
     a: &CudaBuffer<f32>,
     device: &GpuDevice,
-    ptx_src: &str,
-    kernel_name: &str,
+    ptx_src: &'static str,
+    kernel_name: &'static str,
 ) -> GpuResult<Option<CudaBuffer<f32>>> {
     use cudarc::driver::PushKernelArg;
-    use cudarc::nvrtc::Ptx;
 
     let n = a.len();
     let ctx = device.context();
     let stream = device.stream();
 
-    let module = match ctx.load_module(Ptx::from_src(ptx_src)) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-
-    let f = match module.load_function(kernel_name) {
+    // Attempt to load the kernel (cached after first compilation).
+    let f = match crate::module_cache::get_or_compile(ctx, ptx_src, kernel_name) {
         Ok(f) => f,
         Err(_) => return Ok(None),
     };

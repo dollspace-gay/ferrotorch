@@ -387,7 +387,6 @@ pub fn gpu_conv2d_f32(
     device: &GpuDevice,
 ) -> GpuResult<(CudaBuffer<f32>, [usize; 4])> {
     use cudarc::driver::PushKernelArg;
-    use cudarc::nvrtc::Ptx;
 
     let [batch, c_in, h, w] = input_shape;
     let [c_out, c_in_w, kh, kw] = weight_shape;
@@ -472,23 +471,19 @@ pub fn gpu_conv2d_f32(
     let mut output_buf = crate::transfer::alloc_zeros::<f32>(total_out_elems, device)?;
 
     // -----------------------------------------------------------------------
-    // Load PTX modules
+    // Load PTX modules (cached after first compilation)
     // -----------------------------------------------------------------------
 
     let ctx = device.context();
     let stream = device.stream();
 
-    let im2col_module = ctx.load_module(Ptx::from_src(IM2COL_PTX))?;
-    let im2col_fn = im2col_module.load_function("im2col_kernel")?;
+    let im2col_fn = crate::module_cache::get_or_compile(ctx, IM2COL_PTX, "im2col_kernel")?;
 
-    let bias_module;
-    let bias_fn;
-    if bias.is_some() {
-        bias_module = ctx.load_module(Ptx::from_src(BIAS_ADD_PTX))?;
-        bias_fn = Some(bias_module.load_function("bias_add_kernel")?);
+    let bias_fn = if bias.is_some() {
+        Some(crate::module_cache::get_or_compile(ctx, BIAS_ADD_PTX, "bias_add_kernel")?)
     } else {
-        bias_fn = None;
-    }
+        None
+    };
 
     // -----------------------------------------------------------------------
     // Per-batch loop: im2col -> GEMM -> D2D copy -> bias add
