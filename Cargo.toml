@@ -28,25 +28,25 @@ keywords = ["deep-learning", "machine-learning", "autograd", "neural-network", "
 categories = ["science", "mathematics", "algorithms"]
 
 [workspace.dependencies]
-# Internal crates
-ferrotorch-core = { path = "ferrotorch-core" }
-ferrotorch-nn = { path = "ferrotorch-nn" }
-ferrotorch-nn-derive = { path = "ferrotorch-nn-derive" }
-ferrotorch-optim = { path = "ferrotorch-optim" }
-ferrotorch-data = { path = "ferrotorch-data" }
-ferrotorch-vision = { path = "ferrotorch-vision" }
-ferrotorch-jit = { path = "ferrotorch-jit" }
-ferrotorch-serialize = { path = "ferrotorch-serialize" }
-ferrotorch-gpu = { path = "ferrotorch-gpu" }
-ferrotorch-distributed = { path = "ferrotorch-distributed" }
-ferrotorch-train = { path = "ferrotorch-train" }
-ferrotorch-cubecl = { path = "ferrotorch-cubecl" }
+# Internal crates (version for crates.io, path for local dev)
+ferrotorch-core = { version = "0.1.0", path = "ferrotorch-core" }
+ferrotorch-nn = { version = "0.1.0", path = "ferrotorch-nn" }
+ferrotorch-nn-derive = { version = "0.1.0", path = "ferrotorch-nn-derive" }
+ferrotorch-optim = { version = "0.1.0", path = "ferrotorch-optim" }
+ferrotorch-data = { version = "0.1.0", path = "ferrotorch-data" }
+ferrotorch-vision = { version = "0.1.0", path = "ferrotorch-vision" }
+ferrotorch-jit = { version = "0.1.0", path = "ferrotorch-jit" }
+ferrotorch-serialize = { version = "0.1.0", path = "ferrotorch-serialize" }
+ferrotorch-gpu = { version = "0.1.0", path = "ferrotorch-gpu" }
+ferrotorch-distributed = { version = "0.1.0", path = "ferrotorch-distributed" }
+ferrotorch-train = { version = "0.1.0", path = "ferrotorch-train" }
+ferrotorch-cubecl = { version = "0.1.0", path = "ferrotorch-cubecl" }
 
-# ferray ecosystem (path deps for development — switch to registry for release)
-ferray-core = { path = "../ferray/ferray-core", features = ["bf16"] }
-ferray-ufunc = { path = "../ferray/ferray-ufunc" }
-ferray-linalg = { path = "../ferray/ferray-linalg" }
-ferray-random = { path = "../ferray/ferray-random" }
+# ferray ecosystem (version for crates.io, path for local dev)
+ferray-core = { version = "0.2.5", path = "../ferray/ferray-core", features = ["bf16"] }
+ferray-ufunc = { version = "0.2.5", path = "../ferray/ferray-ufunc" }
+ferray-linalg = { version = "0.2.5", path = "../ferray/ferray-linalg" }
+ferray-random = { version = "0.2.5", path = "../ferray/ferray-random" }
 
 # CubeCL portable GPU compute
 cubecl = "0.10.0-pre.2"

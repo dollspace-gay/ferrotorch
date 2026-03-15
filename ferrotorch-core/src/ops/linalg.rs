@@ -79,20 +79,32 @@ pub fn mm<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>>
         });
     }
 
+    // Delegate to ferray-linalg (faer-backed optimized BLAS).
+    // LinalgFloat is only f32/f64 — dispatch based on element size.
     let a_data = a.data()?;
     let b_data = b.data()?;
-    let mut result = vec![<T as num_traits::Zero>::zero(); m * n];
 
-    // Naive triple loop — replace with ferray-linalg or BLAS call for perf.
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = <T as num_traits::Zero>::zero();
-            for p in 0..k {
-                acc = acc + a_data[i * k + p] * b_data[p * n + j];
-            }
-            result[i * n + j] = acc;
-        }
-    }
+    let result = if std::mem::size_of::<T>() == 4 {
+        // f32 path
+        let a_f32: Vec<f32> = a_data.iter().map(|&v| v.to_f64().unwrap() as f32).collect();
+        let b_f32: Vec<f32> = b_data.iter().map(|&v| v.to_f64().unwrap() as f32).collect();
+        let a_arr = ferray_core::Array::from_vec(ferray_core::IxDyn::new(&[m, k]), a_f32)
+            .map_err(FerrotorchError::Ferray)?;
+        let b_arr = ferray_core::Array::from_vec(ferray_core::IxDyn::new(&[k, n]), b_f32)
+            .map_err(FerrotorchError::Ferray)?;
+        let r = ferray_linalg::matmul(&a_arr, &b_arr).map_err(FerrotorchError::Ferray)?;
+        r.as_slice().unwrap().iter().map(|&v| T::from(v).unwrap()).collect::<Vec<T>>()
+    } else {
+        // f64 path
+        let a_f64: Vec<f64> = a_data.iter().map(|&v| v.to_f64().unwrap()).collect();
+        let b_f64: Vec<f64> = b_data.iter().map(|&v| v.to_f64().unwrap()).collect();
+        let a_arr = ferray_core::Array::from_vec(ferray_core::IxDyn::new(&[m, k]), a_f64)
+            .map_err(FerrotorchError::Ferray)?;
+        let b_arr = ferray_core::Array::from_vec(ferray_core::IxDyn::new(&[k, n]), b_f64)
+            .map_err(FerrotorchError::Ferray)?;
+        let r = ferray_linalg::matmul(&a_arr, &b_arr).map_err(FerrotorchError::Ferray)?;
+        r.as_slice().unwrap().iter().map(|&v| T::from(v).unwrap()).collect::<Vec<T>>()
+    };
 
     Tensor::from_storage(TensorStorage::cpu(result), vec![m, n], false)
 }
