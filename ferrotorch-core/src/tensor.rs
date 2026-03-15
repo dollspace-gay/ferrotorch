@@ -267,7 +267,13 @@ impl<T: Float> Tensor<T> {
     }
 
     /// Borrow the underlying data as a flat slice.
+    ///
+    /// Returns `Err(GpuTensorNotAccessible)` if the tensor is on a GPU.
+    /// Call `.cpu()` first to transfer it.
     pub fn data(&self) -> FerrotorchResult<&[T]> {
+        if self.inner.storage.is_gpu() {
+            return Err(FerrotorchError::GpuTensorNotAccessible);
+        }
         let slice = self.inner.storage.as_slice();
         let end = self.inner.offset + self.numel();
         if end > slice.len() {
@@ -276,6 +282,80 @@ impl<T: Float> Tensor<T> {
             });
         }
         Ok(&slice[self.inner.offset..end])
+    }
+
+    /// Move this tensor to a device, returning a new tensor.
+    ///
+    /// If the tensor is already on the target device, returns a cheap clone
+    /// (shared Arc storage).
+    pub fn to(&self, device: Device) -> FerrotorchResult<Tensor<T>> {
+        if self.device() == device {
+            return Ok(self.clone());
+        }
+        match (self.device(), device) {
+            (Device::Cpu, Device::Cuda(ordinal)) => {
+                let backend = crate::gpu_dispatch::gpu_backend()
+                    .ok_or(FerrotorchError::DeviceUnavailable)?;
+                let cpu_data = self.data()?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        cpu_data.as_ptr() as *const u8,
+                        cpu_data.len() * std::mem::size_of::<T>(),
+                    )
+                };
+                let handle = backend.cpu_to_gpu(bytes, std::mem::size_of::<T>(), ordinal)?;
+                let storage = TensorStorage::gpu(handle);
+                Tensor::from_storage(storage, self.shape().to_vec(), self.requires_grad())
+            }
+            (Device::Cuda(_), Device::Cpu) => {
+                let backend = crate::gpu_dispatch::gpu_backend()
+                    .ok_or(FerrotorchError::DeviceUnavailable)?;
+                let handle = self.gpu_handle()?;
+                let bytes = backend.gpu_to_cpu(handle)?;
+                let data: Vec<T> = unsafe {
+                    let mut bytes = std::mem::ManuallyDrop::new(bytes);
+                    let len = bytes.len() / std::mem::size_of::<T>();
+                    let cap = bytes.capacity() / std::mem::size_of::<T>();
+                    Vec::from_raw_parts(bytes.as_mut_ptr() as *mut T, len, cap)
+                };
+                Tensor::from_storage(TensorStorage::cpu(data), self.shape().to_vec(), self.requires_grad())
+            }
+            (Device::Cuda(a), Device::Cuda(b)) if a != b => {
+                // Cross-GPU: go through CPU for now
+                let cpu = self.to(Device::Cpu)?;
+                cpu.to(Device::Cuda(b))
+            }
+            _ => Ok(self.clone()),
+        }
+    }
+
+    /// Move to CUDA device 0.
+    pub fn cuda(&self) -> FerrotorchResult<Tensor<T>> {
+        self.to(Device::Cuda(0))
+    }
+
+    /// Move to CPU.
+    pub fn cpu(&self) -> FerrotorchResult<Tensor<T>> {
+        self.to(Device::Cpu)
+    }
+
+    /// Returns `true` if this tensor is on CPU.
+    #[inline]
+    pub fn is_cpu(&self) -> bool {
+        self.device().is_cpu()
+    }
+
+    /// Returns `true` if this tensor is on a CUDA GPU.
+    #[inline]
+    pub fn is_cuda(&self) -> bool {
+        self.device().is_cuda()
+    }
+
+    /// Get the GPU buffer handle. Returns `Err` for CPU tensors.
+    pub fn gpu_handle(&self) -> FerrotorchResult<&crate::gpu_dispatch::GpuBufferHandle> {
+        self.inner.storage.gpu_handle().ok_or(FerrotorchError::InvalidArgument {
+            message: "tensor is on CPU, not GPU".into(),
+        })
     }
 
     /// Borrow the underlying data as a mutable flat slice.
