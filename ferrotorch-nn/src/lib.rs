@@ -17,6 +17,7 @@ pub mod linear;
 pub mod loss;
 pub mod module;
 pub mod norm;
+pub mod paged_attention;
 pub mod parameter;
 pub mod pooling;
 pub mod rnn;
@@ -48,6 +49,7 @@ pub use module::{Module, Reduction, StateDict};
 // and `#[derive(Module)]` resolves to the derive macro.
 pub use ferrotorch_nn_derive::Module;
 pub use norm::{BatchNorm2d, GroupNorm, LayerNorm, RMSNorm};
+pub use paged_attention::{KVPage, PagePool, PagedAttentionManager, PagedKVCache};
 pub use parameter::Parameter;
 pub use pooling::{
     adaptive_avg_pool2d, avg_pool2d, max_pool2d, AdaptiveAvgPool2d, AvgPool2d, MaxPool2d,
