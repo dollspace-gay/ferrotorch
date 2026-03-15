@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::autograd::no_grad::is_grad_enabled;
 use crate::dtype::Float;
-use crate::error::FerrotorchResult;
+use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::ops::elementwise::unary_map;
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
@@ -412,22 +412,39 @@ impl<T: Float> GradFn<T> for LogSoftmaxBackward<T> {
 
 /// Compute `relu(x)`, attaching a backward node when gradients are enabled.
 pub fn relu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let zero = <T as num_traits::Zero>::zero();
-    let output = unary_map(input, |x| if x > zero { x } else { zero })?;
+    if input.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = backend.relu_f32(input.gpu_handle()?)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = input.shape().to_vec();
 
-    if is_grad_enabled() && input.requires_grad() {
-        let grad_fn = Arc::new(ReluBackward::new(input.clone()));
-        Tensor::from_operation(
-            TensorStorage::cpu(output.data()?.to_vec()),
-            output.shape().to_vec(),
-            grad_fn,
-        )
+        if is_grad_enabled() && input.requires_grad() {
+            let grad_fn = Arc::new(ReluBackward::new(input.clone()));
+            Tensor::from_operation(storage, shape, grad_fn)
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(output)
+        let zero = <T as num_traits::Zero>::zero();
+        let output = unary_map(input, |x| if x > zero { x } else { zero })?;
+
+        if is_grad_enabled() && input.requires_grad() {
+            let grad_fn = Arc::new(ReluBackward::new(input.clone()));
+            Tensor::from_operation(
+                TensorStorage::cpu(output.data()?.to_vec()),
+                output.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(output)
+        }
     }
 }
 
 /// Compute `sigmoid(x)`, attaching a backward node when gradients are enabled.
+///
+/// No GPU sigmoid kernel yet -- GPU tensors transfer to CPU for this op.
 pub fn sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     // SIMD-accelerated sigmoid: compute exp(-x) via SIMD, then 1/(1+exp(-x))
     let output = if std::mem::size_of::<T>() == 4 {

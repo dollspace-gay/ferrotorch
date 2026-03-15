@@ -1,4 +1,4 @@
-use ferrotorch_core::{Float, FerrotorchResult, Tensor};
+use ferrotorch_core::{Device, Float, FerrotorchResult, Tensor};
 
 /// A tensor registered for gradient descent.
 ///
@@ -61,6 +61,11 @@ impl<T: Float> Parameter<T> {
     pub fn set_data(&mut self, tensor: Tensor<T>) {
         self.data = tensor.requires_grad_(true);
     }
+
+    /// Move this parameter to a device.
+    pub fn to(&self, device: Device) -> FerrotorchResult<Self> {
+        Ok(Self::new(self.data.to(device)?))
+    }
 }
 
 impl<T: Float> std::ops::Deref for Parameter<T> {
@@ -94,5 +99,21 @@ mod tests {
         let p = Parameter::<f32>::zeros(&[4]).unwrap();
         let p2 = p.clone();
         assert!(p.tensor().is_same(p2.tensor()));
+    }
+
+    #[test]
+    fn test_parameter_to_cpu_preserves_data() {
+        let p = Parameter::<f32>::from_slice(&[1.0, 2.0, 3.0], &[3]).unwrap();
+        let p2 = p.to(ferrotorch_core::Device::Cpu).unwrap();
+        assert_eq!(p2.shape(), &[3]);
+        assert_eq!(p2.data().unwrap(), &[1.0, 2.0, 3.0]);
+        assert!(p2.requires_grad());
+    }
+
+    #[test]
+    fn test_parameter_to_cuda_without_backend() {
+        let p = Parameter::<f32>::zeros(&[2]).unwrap();
+        let result = p.to(ferrotorch_core::Device::Cuda(0));
+        assert!(result.is_err());
     }
 }

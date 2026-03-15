@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::autograd::no_grad::is_grad_enabled;
 use crate::dtype::Float;
-use crate::error::FerrotorchResult;
+use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::ops::linalg::{self, mm, transpose};
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
@@ -385,17 +385,39 @@ impl<T: Float> GradFn<T> for MatmulBackward<T> {
 /// Differentiable matrix-matrix multiply. If either input requires grad and
 /// grad is enabled, attaches `MmBackward`.
 pub fn mm_differentiable<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = mm(a, b)?;
+    if a.device() != b.device() {
+        return Err(FerrotorchError::DeviceMismatch { expected: a.device(), got: b.device() });
+    }
 
-    if is_grad_enabled() && (a.requires_grad() || b.requires_grad()) {
-        let grad_fn = Arc::new(MmBackward::new(a.clone(), b.clone()));
-        Tensor::from_operation(
-            TensorStorage::cpu(result.data()?.to_vec()),
-            result.shape().to_vec(),
-            grad_fn,
-        )
+    if a.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let m = a.shape()[0];
+        let k = a.shape()[1];
+        let n = b.shape()[1];
+        let handle = backend.matmul_f32(a.gpu_handle()?, b.gpu_handle()?, m, k, n)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = vec![m, n];
+
+        if is_grad_enabled() && (a.requires_grad() || b.requires_grad()) {
+            let grad_fn = Arc::new(MmBackward::new(a.clone(), b.clone()));
+            Tensor::from_operation(storage, shape, grad_fn)
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = mm(a, b)?;
+
+        if is_grad_enabled() && (a.requires_grad() || b.requires_grad()) {
+            let grad_fn = Arc::new(MmBackward::new(a.clone(), b.clone()));
+            Tensor::from_operation(
+                TensorStorage::cpu(result.data()?.to_vec()),
+                result.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -456,17 +478,39 @@ pub fn matmul_differentiable<T: Float>(
     a: &Tensor<T>,
     b: &Tensor<T>,
 ) -> FerrotorchResult<Tensor<T>> {
-    let result = linalg::matmul(a, b)?;
+    if a.device() != b.device() {
+        return Err(FerrotorchError::DeviceMismatch { expected: a.device(), got: b.device() });
+    }
 
-    if is_grad_enabled() && (a.requires_grad() || b.requires_grad()) {
-        let grad_fn = Arc::new(MatmulBackward::new(a.clone(), b.clone()));
-        Tensor::from_operation(
-            TensorStorage::cpu(result.data()?.to_vec()),
-            result.shape().to_vec(),
-            grad_fn,
-        )
+    if a.is_cuda() && a.ndim() == 2 && b.ndim() == 2 {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let m = a.shape()[0];
+        let k = a.shape()[1];
+        let n = b.shape()[1];
+        let handle = backend.matmul_f32(a.gpu_handle()?, b.gpu_handle()?, m, k, n)?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = vec![m, n];
+
+        if is_grad_enabled() && (a.requires_grad() || b.requires_grad()) {
+            let grad_fn = Arc::new(MatmulBackward::new(a.clone(), b.clone()));
+            Tensor::from_operation(storage, shape, grad_fn)
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = linalg::matmul(a, b)?;
+
+        if is_grad_enabled() && (a.requires_grad() || b.requires_grad()) {
+            let grad_fn = Arc::new(MatmulBackward::new(a.clone(), b.clone()));
+            Tensor::from_operation(
+                TensorStorage::cpu(result.data()?.to_vec()),
+                result.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 

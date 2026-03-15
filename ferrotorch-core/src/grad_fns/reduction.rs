@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::autograd::no_grad::is_grad_enabled;
 use crate::dtype::Float;
-use crate::error::FerrotorchResult;
+use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::ops::elementwise;
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
@@ -49,19 +49,36 @@ impl<T: Float> GradFn<T> for SumBackward<T> {
 /// When gradient tracking is enabled and the input requires grad, the returned
 /// tensor carries a [`SumBackward`] node.
 pub fn sum<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = elementwise::sum(input)?;
+    if input.is_cuda() {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = backend.sum_f32(input.gpu_handle()?, input.numel())?;
+        let storage = TensorStorage::gpu(handle);
+        let shape = vec![];
 
-    if is_grad_enabled() && input.requires_grad() {
-        let grad_fn = Arc::new(SumBackward {
-            input: input.clone(),
-        });
-        Tensor::from_operation(
-            TensorStorage::cpu(result.data()?.to_vec()),
-            result.shape().to_vec(),
-            grad_fn,
-        )
+        if is_grad_enabled() && input.requires_grad() {
+            let grad_fn = Arc::new(SumBackward {
+                input: input.clone(),
+            });
+            Tensor::from_operation(storage, shape, grad_fn)
+        } else {
+            Tensor::from_storage(storage, shape, false)
+        }
     } else {
-        Ok(result)
+        let result = elementwise::sum(input)?;
+
+        if is_grad_enabled() && input.requires_grad() {
+            let grad_fn = Arc::new(SumBackward {
+                input: input.clone(),
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(result.data()?.to_vec()),
+                result.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(result)
+        }
     }
 }
 
