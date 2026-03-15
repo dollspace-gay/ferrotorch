@@ -1,6 +1,6 @@
 {
   "uuid": "238f4440-5396-4525-9a6a-6f43909915ad",
-  "display_id": 87,
+  "display_id": 88,
   "title": "Implement IR graph interpreter (ferrotorch-jit/src/interpreter.rs)",
   "status": "open",
   "priority": "high",
