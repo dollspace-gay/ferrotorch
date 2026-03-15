@@ -702,6 +702,8 @@ pub struct MemoryWatchdog {
     paused: AtomicBool,
     /// Signal to stop the background thread.
     stop: AtomicBool,
+    /// Set to `true` after the first check cycle completes.
+    has_checked: AtomicBool,
 }
 
 impl MemoryWatchdog {
@@ -718,6 +720,7 @@ impl MemoryWatchdog {
             check_interval,
             paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            has_checked: AtomicBool::new(false),
         }
     }
 
@@ -740,6 +743,7 @@ impl MemoryWatchdog {
                         }
                         self.paused.store(false, Ordering::SeqCst);
                     }
+                    self.has_checked.store(true, Ordering::SeqCst);
                     std::thread::sleep(self.check_interval);
                 }
             })
@@ -766,6 +770,18 @@ impl MemoryWatchdog {
         }
     }
 
+    /// Block until the watchdog has completed at least one check cycle.
+    /// Useful in tests to avoid timing races.
+    pub fn wait_for_first_check(&self, timeout: Duration) {
+        let start = std::time::Instant::now();
+        while !self.has_checked.load(Ordering::SeqCst) {
+            if start.elapsed() > timeout {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The pressure threshold in bytes.
     #[inline]
     pub fn pressure_threshold_bytes(&self) -> usize {
@@ -773,10 +789,15 @@ impl MemoryWatchdog {
     }
 
     /// Query the amount of free device memory.
+    ///
+    /// Binds the device's CUDA context on the current thread before querying,
+    /// so this is safe to call from the watchdog's background thread.
     fn query_free_memory(&self) -> usize {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.device; // ensure context is alive
+            // Bind the CUDA context on this thread so mem_get_info works.
+            let ctx = self.device.context();
+            let _ = ctx.bind_to_thread();
             cudarc::driver::result::mem_get_info()
                 .map(|(free, _)| free)
                 .unwrap_or(0)
@@ -1144,7 +1165,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "timing-dependent, run with --ignored"]
         fn watchdog_detects_no_pressure_when_plenty_free() {
             let device = make_device();
             // Threshold of 1 byte — should never trigger pressure.
@@ -1157,10 +1177,10 @@ mod tests {
             assert!(!watchdog.check_pressure());
             watchdog.wait_if_paused(); // should return immediately
 
-            // Start and immediately stop.
+            // Start watchdog and wait for it to complete at least one cycle.
             let wd = Arc::clone(&watchdog);
             let handle = wd.start();
-            std::thread::sleep(Duration::from_millis(100));
+            watchdog.wait_for_first_check(Duration::from_secs(5));
             assert!(!watchdog.check_pressure());
             watchdog.stop();
             handle.join().expect("watchdog thread");
