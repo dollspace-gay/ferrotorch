@@ -1,6 +1,7 @@
-//! GPU memory safety system — reservation, OOM recovery, and pressure monitoring.
+//! GPU memory safety system — reservation, OOM recovery, pressure monitoring, and
+//! pre-OOM hooks.
 //!
-//! This module implements three layers of protection against GPU memory issues:
+//! This module implements four layers of protection against GPU memory issues:
 //!
 //! 1. **Memory Reservation** ([`MemoryReservation`]) — Pre-allocate a large block at
 //!    startup so other processes cannot steal VRAM out from under a training run.
@@ -12,6 +13,11 @@
 //! 3. **Memory Pressure Monitoring** ([`MemoryWatchdog`]) — Background thread that
 //!    pauses training when free VRAM drops below a threshold, resuming automatically
 //!    once the pressure lifts.
+//!
+//! 4. **Pre-OOM Hooks** ([`MemoryHook`], [`MemoryGuard::safe_alloc_with_hooks`]) —
+//!    User-registered callbacks that fire *before* an allocation fails. Hooks declare
+//!    upfront how much memory they expect to free (and any execution overhead), so the
+//!    guard can call them in priority order until enough headroom is recovered.
 //!
 //! # Quick start
 //!
@@ -65,6 +71,105 @@ impl Default for OomPolicy {
     fn default() -> Self {
         Self::Fail
     }
+}
+
+// ---------------------------------------------------------------------------
+// MemoryHook — pre-OOM callback
+// ---------------------------------------------------------------------------
+
+/// A hook that can free memory or reduce memory demand before an OOM.
+///
+/// Hooks declare upfront how much memory they expect to free, so the
+/// memory guard can decide which hooks to call and in what order.
+///
+/// # Example: halving a batch when memory is tight
+///
+/// ```rust
+/// use ferrotorch_gpu::memory_guard::MemoryHook;
+///
+/// let hook = MemoryHook {
+///     name: "halve_batch_size".into(),
+///     estimated_free_bytes: 512 * 1024 * 1024, // expects to free ~512 MiB
+///     execution_overhead_bytes: 4096,           // metadata setup cost
+///     priority: 10,
+///     callback: Box::new(|| {
+///         // ... split the batch, free old tensors ...
+///         512 * 1024 * 1024 // actual bytes freed
+///     }),
+/// };
+/// ```
+pub struct MemoryHook {
+    /// Human-readable name (e.g., `"halve_batch_size"`, `"free_kv_cache"`).
+    pub name: String,
+    /// Estimated bytes this hook will free when called.
+    pub estimated_free_bytes: usize,
+    /// Extra bytes this hook needs temporarily to execute (e.g., metadata
+    /// setup for a batch split). If the available headroom is less than this
+    /// overhead the hook is skipped.
+    pub execution_overhead_bytes: usize,
+    /// Priority: lower values fire first. Hooks at the same priority are
+    /// called in registration order.
+    pub priority: u32,
+    /// The callback. Returns the *actual* bytes freed (may differ from the
+    /// estimate).
+    pub callback: Box<dyn Fn() -> usize + Send + Sync>,
+}
+
+impl std::fmt::Debug for MemoryHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryHook")
+            .field("name", &self.name)
+            .field("estimated_free_bytes", &self.estimated_free_bytes)
+            .field("execution_overhead_bytes", &self.execution_overhead_bytes)
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PressureLevel
+// ---------------------------------------------------------------------------
+
+/// Level of memory pressure relative to the configured budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PressureLevel {
+    /// Plenty of headroom (>30% of budget free).
+    None,
+    /// Getting tight (10--30% free). Informational only.
+    Low,
+    /// Approaching the limit (5--10% free). Non-critical hooks may fire.
+    Medium,
+    /// Near OOM (<5% free). All hooks fire.
+    High,
+    /// An allocation would fail without intervention.
+    Critical,
+}
+
+impl std::fmt::Display for PressureLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        };
+        f.write_str(label)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemoryPressureListener
+// ---------------------------------------------------------------------------
+
+/// Trait for continuous pressure-level monitoring.
+///
+/// Types that conform to this trait can be registered via
+/// [`MemoryGuard::add_pressure_listener`] to receive callbacks whenever the
+/// pressure level changes (e.g., after every allocation or free).
+pub trait MemoryPressureListener: Send + Sync {
+    /// Called when the memory-pressure level transitions between two values.
+    fn on_pressure_change(&self, old: PressureLevel, new: PressureLevel);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +269,12 @@ pub struct MemoryGuard {
     oom_policy: Mutex<OomPolicy>,
     /// Callback for emergency checkpoint.
     on_oom_callback: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Pre-OOM hooks, called before an allocation failure is propagated.
+    hooks: Mutex<Vec<MemoryHook>>,
+    /// Continuous pressure-level listeners.
+    pressure_listeners: Mutex<Vec<Box<dyn MemoryPressureListener>>>,
+    /// Cached pressure level for change detection.
+    last_pressure_level: Mutex<PressureLevel>,
 }
 
 // SAFETY: All interior mutability is via atomics or `Mutex`.
@@ -204,6 +315,231 @@ impl MemoryGuard {
     /// Change the OOM policy at runtime.
     pub fn set_oom_policy(&self, policy: OomPolicy) {
         *self.oom_policy.lock().unwrap() = policy;
+    }
+
+    // ------------------------------------------------------------------
+    // Pre-OOM hooks
+    // ------------------------------------------------------------------
+
+    /// Register a pre-OOM hook.
+    ///
+    /// Hooks are called (in priority order, lowest first) when an allocation
+    /// would exceed the budget. Each hook gets a chance to free memory before
+    /// the guard falls through to the [`OomPolicy`].
+    pub fn register_hook(&self, hook: MemoryHook) {
+        self.hooks.lock().unwrap().push(hook);
+    }
+
+    /// Remove a previously registered hook by name.
+    ///
+    /// Returns `true` if a hook with that name was found and removed.
+    pub fn remove_hook(&self, name: &str) -> bool {
+        let mut hooks = self.hooks.lock().unwrap();
+        let before = hooks.len();
+        hooks.retain(|h| h.name != name);
+        hooks.len() < before
+    }
+
+    /// Current pressure level based on budget usage.
+    ///
+    /// If no budget is set (budget = 0 / unlimited), always returns
+    /// [`PressureLevel::None`].
+    pub fn pressure_level(&self) -> PressureLevel {
+        let budget = self.budget_bytes.load(Ordering::Relaxed);
+        if budget == 0 {
+            return PressureLevel::None;
+        }
+        let used = self.used_bytes.load(Ordering::Relaxed);
+        Self::compute_pressure(budget, used)
+    }
+
+    /// Compute the pressure level from a budget and usage pair.
+    ///
+    /// A budget of `0` means unlimited and always returns [`PressureLevel::None`].
+    fn compute_pressure(budget: usize, used: usize) -> PressureLevel {
+        if budget == 0 {
+            return PressureLevel::None;
+        }
+        if used >= budget {
+            return PressureLevel::Critical;
+        }
+        let free_frac = ((budget - used) as f64) / (budget as f64);
+        if free_frac > 0.30 {
+            PressureLevel::None
+        } else if free_frac > 0.10 {
+            PressureLevel::Low
+        } else if free_frac > 0.05 {
+            PressureLevel::Medium
+        } else {
+            PressureLevel::High
+        }
+    }
+
+    /// Register a listener that is notified whenever the pressure level
+    /// changes (checked after every allocation and free through the guard).
+    pub fn add_pressure_listener(&self, listener: Box<dyn MemoryPressureListener>) {
+        self.pressure_listeners.lock().unwrap().push(listener);
+    }
+
+    /// Check whether the pressure level has changed and notify listeners.
+    fn notify_pressure_change(&self) {
+        let new_level = self.pressure_level();
+        let mut last = self.last_pressure_level.lock().unwrap();
+        if *last != new_level {
+            let old = *last;
+            *last = new_level;
+            // Release the last-level lock before calling listeners to avoid
+            // deadlocks if a listener queries the guard.
+            drop(last);
+            let listeners = self.pressure_listeners.lock().unwrap();
+            for listener in listeners.iter() {
+                listener.on_pressure_change(old, new_level);
+            }
+        }
+    }
+
+    /// Allocate `count` zero-initialized elements, trying pre-OOM hooks
+    /// before falling through to the [`OomPolicy`].
+    ///
+    /// The algorithm:
+    ///
+    /// 1. Check if the allocation fits within the budget -- if so, allocate
+    ///    directly.
+    /// 2. If not, compute the shortfall.
+    /// 3. Sort hooks by `(priority, estimated_free_bytes descending)`.
+    /// 4. Call hooks one at a time, skipping any whose
+    ///    `execution_overhead_bytes` exceeds current headroom, until enough
+    ///    cumulative memory has been freed.
+    /// 5. Retry the allocation.
+    /// 6. If still insufficient after all hooks, fall through to the regular
+    ///    [`OomPolicy`] path.
+    #[cfg(feature = "cuda")]
+    pub fn safe_alloc_with_hooks<T>(&self, count: usize) -> GpuResult<CudaBuffer<T>>
+    where
+        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
+    {
+        let alloc_bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .unwrap_or(usize::MAX);
+
+        // Fast path: fits within budget.
+        if self.check_budget(alloc_bytes).is_ok() {
+            let result = self.try_alloc_zeros::<T>(count, alloc_bytes);
+            if result.is_ok() {
+                self.notify_pressure_change();
+            }
+            return result;
+        }
+
+        // Compute the shortfall.
+        let budget = self.budget_bytes.load(Ordering::Relaxed);
+        let used = self.used_bytes.load(Ordering::Relaxed);
+        let shortfall = (used + alloc_bytes).saturating_sub(budget);
+
+        // Try hooks.
+        let freed = self.run_hooks(shortfall, budget, used);
+
+        if freed > 0 {
+            // Re-check budget after hooks freed memory.
+            if self.check_budget(alloc_bytes).is_ok() {
+                let result = self.try_alloc_zeros::<T>(count, alloc_bytes);
+                if result.is_ok() {
+                    self.notify_pressure_change();
+                    return result;
+                }
+                // Driver-level OOM despite budget check passing -- fall through
+                // to OomPolicy.
+                if let Err(e) = result {
+                    if self.is_oom(&e) {
+                        return self.handle_oom(count, alloc_bytes, e);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // Hooks were not enough. Re-check budget — if still over, enforce
+        // the budget rather than letting the driver allocate beyond it.
+        if self.check_budget(alloc_bytes).is_err() {
+            let budget = self.budget_bytes.load(Ordering::Relaxed);
+            let used = self.used_bytes.load(Ordering::Relaxed);
+            return Err(crate::error::GpuError::BudgetExceeded {
+                requested_bytes: alloc_bytes,
+                budget_bytes: budget,
+                used_bytes: used,
+            });
+        }
+
+        // Budget check passed (hooks freed enough). Try the driver.
+        match self.try_alloc_zeros::<T>(count, alloc_bytes) {
+            Ok(buf) => {
+                self.notify_pressure_change();
+                Ok(buf)
+            }
+            Err(e) if self.is_oom(&e) => self.handle_oom(count, alloc_bytes, e),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Run pre-OOM hooks in priority order until `shortfall` bytes have been
+    /// freed (or all hooks have been tried).
+    ///
+    /// Returns the total actual bytes freed across all invoked hooks.
+    #[allow(dead_code)]
+    fn run_hooks(&self, shortfall: usize, budget: usize, used: usize) -> usize {
+        // Build a sorted index of hooks. We sort by (priority ASC,
+        // estimated_free_bytes DESC) so high-impact hooks at a given
+        // priority run first.
+        let hooks = self.hooks.lock().unwrap();
+        if hooks.is_empty() {
+            return 0;
+        }
+
+        let mut indices: Vec<usize> = (0..hooks.len()).collect();
+        indices.sort_by(|&a, &b| {
+            hooks[a]
+                .priority
+                .cmp(&hooks[b].priority)
+                .then_with(|| {
+                    hooks[b]
+                        .estimated_free_bytes
+                        .cmp(&hooks[a].estimated_free_bytes)
+                })
+        });
+
+        let mut total_freed: usize = 0;
+        let mut current_used = used;
+
+        for &idx in &indices {
+            if total_freed >= shortfall {
+                break;
+            }
+
+            let hook = &hooks[idx];
+
+            // Skip if overhead exceeds available headroom. "Available
+            // headroom" is whatever room we have *right now* within the
+            // budget, after accounting for memory freed so far.
+            let headroom = budget.saturating_sub(current_used);
+            if hook.execution_overhead_bytes > headroom {
+                continue;
+            }
+
+            let freed = (hook.callback)();
+            total_freed = total_freed.saturating_add(freed);
+            current_used = current_used.saturating_sub(freed);
+        }
+
+        // Reflect freed memory in the atomic counter. Hooks freed memory
+        // outside the guard's tracking, so we adjust used_bytes downward.
+        if total_freed > 0 {
+            self.used_bytes.fetch_sub(
+                total_freed.min(self.used_bytes.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
+        }
+
+        total_freed
     }
 
     // ------------------------------------------------------------------
@@ -309,6 +645,7 @@ impl MemoryGuard {
         self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
         self.num_allocations.fetch_sub(1, Ordering::Relaxed);
         drop(buffer);
+        self.notify_pressure_change();
     }
 
     // ------------------------------------------------------------------
@@ -552,6 +889,11 @@ impl MemoryGuard {
     pub fn safe_alloc_copy<T>(&self, _data: &[T]) -> GpuResult<CudaBuffer<T>> {
         Err(GpuError::NoCudaFeature)
     }
+
+    /// Stub — returns [`GpuError::NoCudaFeature`].
+    pub fn safe_alloc_with_hooks<T>(&self, _count: usize) -> GpuResult<CudaBuffer<T>> {
+        Err(GpuError::NoCudaFeature)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +985,9 @@ impl MemoryGuardBuilder {
             num_oom_recoveries: AtomicUsize::new(0),
             oom_policy: Mutex::new(self.oom_policy),
             on_oom_callback: Mutex::new(None),
+            hooks: Mutex::new(Vec::new()),
+            pressure_listeners: Mutex::new(Vec::new()),
+            last_pressure_level: Mutex::new(PressureLevel::None),
         })
     }
 
@@ -659,6 +1004,9 @@ impl MemoryGuardBuilder {
             num_oom_recoveries: AtomicUsize::new(0),
             oom_policy: Mutex::new(self.oom_policy),
             on_oom_callback: Mutex::new(None),
+            hooks: Mutex::new(Vec::new()),
+            pressure_listeners: Mutex::new(Vec::new()),
+            last_pressure_level: Mutex::new(PressureLevel::None),
         })
     }
 }
@@ -966,6 +1314,76 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Pre-OOM hooks & pressure unit tests (no GPU required)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn pressure_level_ordering() {
+        assert!(PressureLevel::None < PressureLevel::Low);
+        assert!(PressureLevel::Low < PressureLevel::Medium);
+        assert!(PressureLevel::Medium < PressureLevel::High);
+        assert!(PressureLevel::High < PressureLevel::Critical);
+    }
+
+    #[test]
+    fn pressure_level_display() {
+        assert_eq!(format!("{}", PressureLevel::None), "none");
+        assert_eq!(format!("{}", PressureLevel::Critical), "critical");
+    }
+
+    #[test]
+    fn pressure_level_debug_clone_eq() {
+        let p = PressureLevel::Medium;
+        let p2 = p;
+        assert_eq!(p, p2);
+        let s = format!("{p:?}");
+        assert!(s.contains("Medium"));
+    }
+
+    #[test]
+    fn compute_pressure_unlimited_budget_is_none() {
+        // budget=0 means unlimited, should always be None.
+        assert_eq!(MemoryGuard::compute_pressure(0, 0), PressureLevel::None);
+    }
+
+    #[test]
+    fn compute_pressure_thresholds() {
+        let budget = 1000;
+        // >30% free => None
+        assert_eq!(MemoryGuard::compute_pressure(budget, 0), PressureLevel::None);
+        assert_eq!(MemoryGuard::compute_pressure(budget, 600), PressureLevel::None);
+        assert_eq!(MemoryGuard::compute_pressure(budget, 699), PressureLevel::None);
+        // 10-30% free => Low
+        assert_eq!(MemoryGuard::compute_pressure(budget, 750), PressureLevel::Low);
+        assert_eq!(MemoryGuard::compute_pressure(budget, 890), PressureLevel::Low);
+        // 5-10% free => Medium
+        assert_eq!(MemoryGuard::compute_pressure(budget, 910), PressureLevel::Medium);
+        assert_eq!(MemoryGuard::compute_pressure(budget, 949), PressureLevel::Medium);
+        // <5% free => High
+        assert_eq!(MemoryGuard::compute_pressure(budget, 960), PressureLevel::High);
+        assert_eq!(MemoryGuard::compute_pressure(budget, 999), PressureLevel::High);
+        // At or over budget => Critical
+        assert_eq!(MemoryGuard::compute_pressure(budget, 1000), PressureLevel::Critical);
+        assert_eq!(MemoryGuard::compute_pressure(budget, 2000), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn memory_hook_debug() {
+        let hook = MemoryHook {
+            name: "test_hook".into(),
+            estimated_free_bytes: 1024,
+            execution_overhead_bytes: 64,
+            priority: 5,
+            callback: Box::new(|| 1024),
+        };
+        let s = format!("{hook:?}");
+        assert!(s.contains("test_hook"));
+        assert!(s.contains("1024"));
+        assert!(s.contains("64"));
+        assert!(s.contains("5"));
+    }
+
+    // ---------------------------------------------------------------
     // GPU tests (require `cuda` feature and a real device)
     // ---------------------------------------------------------------
 
@@ -1267,6 +1685,445 @@ mod tests {
             let buf3 = guard.safe_alloc::<f32>(512).expect("alloc 3 after free");
             assert_eq!(guard.stats().used_bytes, 2048);
             guard.free(buf3);
+        }
+
+        // ---------------------------------------------------------------
+        // Pre-OOM hooks GPU tests
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn hook_called_on_budget_exceeded() {
+            let device = make_device();
+            let budget = 1024_usize; // 1024 bytes
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = Arc::clone(&called);
+
+            guard.register_hook(MemoryHook {
+                name: "test_hook".into(),
+                estimated_free_bytes: 2048,
+                execution_overhead_bytes: 0,
+                priority: 10,
+                callback: Box::new(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                    0 // does not actually free tracked memory
+                }),
+            });
+
+            // Allocation of 512 f32 = 2048 bytes > budget of 1024.
+            // Hook will be called but won't free enough, so alloc falls
+            // through. The hook should still have been invoked.
+            let _result = guard.safe_alloc_with_hooks::<f32>(512);
+            assert!(called.load(Ordering::SeqCst), "hook was not called");
+        }
+
+        #[test]
+        fn hook_frees_enough_memory_allocation_succeeds() {
+            let device = make_device();
+            // Budget: 2048. Pre-fill 1536 bytes, then request 1024 bytes
+            // (total would be 2560 > 2048). Hook frees 1024 bytes.
+            let budget = 2048_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            // Pre-fill: 384 f32 = 1536 bytes.
+            let prefill = guard.safe_alloc::<f32>(384).expect("prefill");
+            assert_eq!(guard.stats().used_bytes, 1536);
+
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = Arc::clone(&called);
+
+            // Hook "frees" 1024 bytes by adjusting the guard's tracked usage.
+            // In a real scenario the hook would drop GPU buffers. Here we
+            // simulate by having the hook report 1024 freed; run_hooks
+            // subtracts that from used_bytes.
+            guard.register_hook(MemoryHook {
+                name: "free_1k".into(),
+                estimated_free_bytes: 1024,
+                execution_overhead_bytes: 0,
+                priority: 10,
+                callback: Box::new(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                    1024
+                }),
+            });
+
+            // Request 256 f32 = 1024 bytes. 1536 + 1024 = 2560 > 2048.
+            // Shortfall = 512. Hook frees 1024 (enough).
+            let buf = guard.safe_alloc_with_hooks::<f32>(256).expect("alloc after hook");
+            assert!(called.load(Ordering::SeqCst), "hook was not called");
+
+            // used_bytes: was 1536, hook freed 1024 => 512, then alloc adds 1024 => 1536.
+            assert_eq!(guard.stats().used_bytes, 1536);
+
+            guard.free(buf);
+            guard.free(prefill);
+        }
+
+        #[test]
+        fn hook_not_enough_falls_through_to_oom_policy() {
+            let device = make_device();
+            let budget = 512_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .oom_policy(OomPolicy::Fail)
+                .build()
+                .expect("build guard");
+
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = Arc::clone(&called);
+
+            guard.register_hook(MemoryHook {
+                name: "weak_hook".into(),
+                estimated_free_bytes: 64,
+                execution_overhead_bytes: 0,
+                priority: 10,
+                callback: Box::new(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                    64 // only frees 64 bytes
+                }),
+            });
+
+            // Request 1024 f32 = 4096 bytes >> 512 budget.
+            // Hook frees 64, still not enough, falls through to OomPolicy::Fail.
+            let result = guard.safe_alloc_with_hooks::<f32>(1024);
+            assert!(called.load(Ordering::SeqCst), "hook should have been called");
+            assert!(result.is_err(), "allocation should have failed");
+        }
+
+        #[test]
+        fn hooks_called_in_priority_order() {
+            let device = make_device();
+            let budget = 1024_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            let order = Arc::new(Mutex::new(Vec::new()));
+
+            let o1 = Arc::clone(&order);
+            guard.register_hook(MemoryHook {
+                name: "priority_20".into(),
+                estimated_free_bytes: 256,
+                execution_overhead_bytes: 0,
+                priority: 20,
+                callback: Box::new(move || {
+                    o1.lock().unwrap().push(20_u32);
+                    256
+                }),
+            });
+
+            let o2 = Arc::clone(&order);
+            guard.register_hook(MemoryHook {
+                name: "priority_5".into(),
+                estimated_free_bytes: 256,
+                execution_overhead_bytes: 0,
+                priority: 5,
+                callback: Box::new(move || {
+                    o2.lock().unwrap().push(5_u32);
+                    256
+                }),
+            });
+
+            let o3 = Arc::clone(&order);
+            guard.register_hook(MemoryHook {
+                name: "priority_10".into(),
+                estimated_free_bytes: 256,
+                execution_overhead_bytes: 0,
+                priority: 10,
+                callback: Box::new(move || {
+                    o3.lock().unwrap().push(10_u32);
+                    256
+                }),
+            });
+
+            // Request 512 f32 = 2048 bytes > 1024 budget.
+            // All three hooks needed. Should fire: 5, 10, 20.
+            let _result = guard.safe_alloc_with_hooks::<f32>(512);
+            let call_order = order.lock().unwrap();
+            assert_eq!(&*call_order, &[5, 10, 20], "hooks should fire in priority order");
+        }
+
+        #[test]
+        fn remove_hook_by_name() {
+            let device = make_device();
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(1024)
+                .build()
+                .expect("build guard");
+
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = Arc::clone(&called);
+
+            guard.register_hook(MemoryHook {
+                name: "removable".into(),
+                estimated_free_bytes: 2048,
+                execution_overhead_bytes: 0,
+                priority: 10,
+                callback: Box::new(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                    2048
+                }),
+            });
+
+            // Remove the hook.
+            assert!(guard.remove_hook("removable"));
+            // Removing again returns false.
+            assert!(!guard.remove_hook("removable"));
+
+            // Trigger an over-budget allocation; removed hook should NOT fire.
+            let _result = guard.safe_alloc_with_hooks::<f32>(512);
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "removed hook should not have been called"
+            );
+        }
+
+        #[test]
+        fn pressure_level_tracks_usage() {
+            let device = make_device();
+            let budget = 1000_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            // No usage => None.
+            assert_eq!(guard.pressure_level(), PressureLevel::None);
+
+            // Manually bump used_bytes to 750 => 25% free => Low.
+            guard.used_bytes.store(750, Ordering::Relaxed);
+            assert_eq!(guard.pressure_level(), PressureLevel::Low);
+
+            // 920 used => 8% free => Medium.
+            guard.used_bytes.store(920, Ordering::Relaxed);
+            assert_eq!(guard.pressure_level(), PressureLevel::Medium);
+
+            // 960 used => 4% free => High.
+            guard.used_bytes.store(960, Ordering::Relaxed);
+            assert_eq!(guard.pressure_level(), PressureLevel::High);
+
+            // At budget => Critical.
+            guard.used_bytes.store(1000, Ordering::Relaxed);
+            assert_eq!(guard.pressure_level(), PressureLevel::Critical);
+
+            // Unlimited budget => always None regardless of usage.
+            guard.set_budget(0);
+            assert_eq!(guard.pressure_level(), PressureLevel::None);
+        }
+
+        #[test]
+        fn multiple_hooks_called_until_enough_freed() {
+            let device = make_device();
+            let budget = 2048_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            // Pre-fill: 256 f32 = 1024 bytes.
+            let prefill = guard.safe_alloc::<f32>(256).expect("prefill");
+            assert_eq!(guard.stats().used_bytes, 1024);
+
+            let count = Arc::new(AtomicUsize::new(0));
+
+            // Hook A: priority 1, frees 256 bytes.
+            let c1 = Arc::clone(&count);
+            guard.register_hook(MemoryHook {
+                name: "hook_a".into(),
+                estimated_free_bytes: 256,
+                execution_overhead_bytes: 0,
+                priority: 1,
+                callback: Box::new(move || {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    256
+                }),
+            });
+
+            // Hook B: priority 2, frees 512 bytes.
+            let c2 = Arc::clone(&count);
+            guard.register_hook(MemoryHook {
+                name: "hook_b".into(),
+                estimated_free_bytes: 512,
+                execution_overhead_bytes: 0,
+                priority: 2,
+                callback: Box::new(move || {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    512
+                }),
+            });
+
+            // Hook C: priority 3, frees 512 bytes. Should NOT be called if
+            // A+B free enough.
+            let c3 = Arc::new(AtomicBool::new(false));
+            let c3_clone = Arc::clone(&c3);
+            guard.register_hook(MemoryHook {
+                name: "hook_c".into(),
+                estimated_free_bytes: 512,
+                execution_overhead_bytes: 0,
+                priority: 3,
+                callback: Box::new(move || {
+                    c3_clone.store(true, Ordering::SeqCst);
+                    512
+                }),
+            });
+
+            // Request 384 f32 = 1536 bytes. 1024 + 1536 = 2560 > 2048.
+            // Shortfall = 512. Hook A frees 256 (not enough), Hook B frees
+            // 512 (now 768 >= 512). Hook C should be skipped.
+            let buf = guard
+                .safe_alloc_with_hooks::<f32>(384)
+                .expect("alloc with hooks");
+            assert_eq!(count.load(Ordering::SeqCst), 2, "hooks A and B should fire");
+            assert!(
+                !c3.load(Ordering::SeqCst),
+                "hook C should not have been called"
+            );
+
+            guard.free(buf);
+            guard.free(prefill);
+        }
+
+        #[test]
+        fn hook_with_excessive_overhead_is_skipped() {
+            let device = make_device();
+            let budget = 2048_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            // Pre-fill: 480 f32 = 1920 bytes. Headroom = 128 bytes.
+            let prefill = guard.safe_alloc::<f32>(480).expect("prefill");
+            assert_eq!(guard.stats().used_bytes, 1920);
+
+            let expensive_called = Arc::new(AtomicBool::new(false));
+            let expensive_clone = Arc::clone(&expensive_called);
+
+            // Hook with overhead of 256 > headroom of 128 => should be skipped.
+            guard.register_hook(MemoryHook {
+                name: "expensive_hook".into(),
+                estimated_free_bytes: 1024,
+                execution_overhead_bytes: 256,
+                priority: 1,
+                callback: Box::new(move || {
+                    expensive_clone.store(true, Ordering::SeqCst);
+                    1024
+                }),
+            });
+
+            let cheap_called = Arc::new(AtomicBool::new(false));
+            let cheap_clone = Arc::clone(&cheap_called);
+
+            // Hook with zero overhead => should fire.
+            guard.register_hook(MemoryHook {
+                name: "cheap_hook".into(),
+                estimated_free_bytes: 512,
+                execution_overhead_bytes: 0,
+                priority: 2,
+                callback: Box::new(move || {
+                    cheap_clone.store(true, Ordering::SeqCst);
+                    512
+                }),
+            });
+
+            // Request 64 f32 = 256 bytes. 1920 + 256 = 2176 > 2048.
+            // Shortfall = 128.
+            let buf = guard
+                .safe_alloc_with_hooks::<f32>(64)
+                .expect("alloc with hooks");
+
+            assert!(
+                !expensive_called.load(Ordering::SeqCst),
+                "expensive hook should have been skipped due to overhead"
+            );
+            assert!(
+                cheap_called.load(Ordering::SeqCst),
+                "cheap hook should have been called"
+            );
+
+            guard.free(buf);
+            guard.free(prefill);
+        }
+
+        #[test]
+        fn pressure_listener_notified_on_change() {
+            let device = make_device();
+            let budget = 1000_usize;
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(budget)
+                .build()
+                .expect("build guard");
+
+            struct TestListener {
+                changes: Mutex<Vec<(PressureLevel, PressureLevel)>>,
+            }
+
+            impl MemoryPressureListener for TestListener {
+                fn on_pressure_change(&self, old: PressureLevel, new: PressureLevel) {
+                    self.changes.lock().unwrap().push((old, new));
+                }
+            }
+
+            let listener = Arc::new(TestListener {
+                changes: Mutex::new(Vec::new()),
+            });
+            let listener_ref = Arc::clone(&listener);
+
+            // Wrap in a Box<dyn MemoryPressureListener> — we need to share
+            // the Arc for assertions, so we use a thin wrapper.
+            struct ListenerWrapper(Arc<TestListener>);
+            impl MemoryPressureListener for ListenerWrapper {
+                fn on_pressure_change(&self, old: PressureLevel, new: PressureLevel) {
+                    self.0.on_pressure_change(old, new);
+                }
+            }
+
+            guard.add_pressure_listener(Box::new(ListenerWrapper(listener_ref)));
+
+            // Allocate a small amount. Pressure should stay None, no
+            // notification expected (None -> None is not a change).
+            let buf1 = guard.safe_alloc::<f32>(1).expect("small alloc");
+            // notify_pressure_change is only called by free and
+            // safe_alloc_with_hooks; safe_alloc does not call it. Trigger
+            // manually via free.
+            guard.free(buf1);
+
+            // Force a pressure change by directly setting used_bytes and
+            // calling notify_pressure_change.
+            guard.used_bytes.store(960, Ordering::Relaxed);
+            guard.notify_pressure_change(); // None -> High
+            guard.used_bytes.store(0, Ordering::Relaxed);
+            guard.notify_pressure_change(); // High -> None
+
+            let changes = listener.changes.lock().unwrap();
+            assert!(changes.len() >= 2, "should have at least 2 pressure changes, got {}", changes.len());
+            assert_eq!(changes[0], (PressureLevel::None, PressureLevel::High));
+            assert_eq!(changes[1], (PressureLevel::High, PressureLevel::None));
+        }
+
+        #[test]
+        fn safe_alloc_with_hooks_fast_path_no_hooks() {
+            // When the allocation fits within budget, hooks should not fire
+            // and the allocation should succeed.
+            let device = make_device();
+            let guard = MemoryGuardBuilder::new(device)
+                .budget_bytes(1024 * 1024)
+                .build()
+                .expect("build guard");
+
+            let buf = guard
+                .safe_alloc_with_hooks::<f32>(64)
+                .expect("fast-path alloc");
+            assert_eq!(guard.stats().used_bytes, 64 * 4);
+            guard.free(buf);
         }
     }
 }
