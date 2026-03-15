@@ -31,6 +31,7 @@ pub mod device;
 pub mod flash_attention;
 pub mod error;
 pub mod kernels;
+pub mod module_cache;
 pub mod memory_guard;
 pub mod tensor_bridge;
 pub mod transfer;

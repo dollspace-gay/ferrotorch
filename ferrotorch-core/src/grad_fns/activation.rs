@@ -646,6 +646,283 @@ pub fn log_softmax<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Softplus
+// ---------------------------------------------------------------------------
+
+/// Backward for `softplus(x)` with configurable beta and threshold.
+///
+/// VJP: `grad * sigmoid(beta * x)`.
+///
+/// For the threshold branch (beta * x > threshold), the derivative is 1
+/// (identity function), so grad passes through unchanged.
+#[derive(Debug)]
+pub struct SoftplusBackward<T: Float> {
+    input: Tensor<T>,
+    beta: f64,
+    threshold: f64,
+}
+
+impl<T: Float> SoftplusBackward<T> {
+    pub fn new(input: Tensor<T>, beta: f64, threshold: f64) -> Self {
+        Self {
+            input,
+            beta,
+            threshold,
+        }
+    }
+}
+
+impl<T: Float> GradFn<T> for SoftplusBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let one = <T as num_traits::One>::one();
+        let beta = T::from(self.beta).unwrap();
+        let threshold = T::from(self.threshold).unwrap();
+
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| {
+                let bx = beta * x;
+                if bx > threshold {
+                    // Threshold branch: softplus(x) = x, d/dx = 1.
+                    g
+                } else {
+                    // d/dx softplus(x) = sigmoid(beta * x).
+                    let sig = one / (one + (-bx).exp());
+                    g * sig
+                }
+            })
+            .collect();
+
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "SoftplusBackward"
+    }
+}
+
+/// Compute `softplus(x)` with configurable `beta` and `threshold`, attaching
+/// a backward node when gradients are enabled.
+///
+/// ```text
+/// softplus(x) = log(1 + exp(beta * x)) / beta
+/// ```
+///
+/// For numerical stability, when `beta * x > threshold` the output is `x`.
+pub fn softplus<T: Float>(
+    input: &Tensor<T>,
+    beta: f64,
+    threshold: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    let one = <T as num_traits::One>::one();
+    let beta_t = T::from(beta).unwrap();
+    let threshold_t = T::from(threshold).unwrap();
+
+    let output = unary_map(input, |x| {
+        let bx = beta_t * x;
+        if bx > threshold_t {
+            x
+        } else {
+            (one + bx.exp()).ln() / beta_t
+        }
+    })?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(SoftplusBackward::new(input.clone(), beta, threshold)),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ELU
+// ---------------------------------------------------------------------------
+
+/// Backward for `elu(x)` with configurable alpha.
+///
+/// VJP:
+/// - For `x > 0`: `grad * 1`
+/// - For `x <= 0`: `grad * alpha * exp(x)` (equivalently `grad * (output + alpha)`)
+#[derive(Debug)]
+pub struct EluBackward<T: Float> {
+    input: Tensor<T>,
+    alpha: f64,
+}
+
+impl<T: Float> EluBackward<T> {
+    pub fn new(input: Tensor<T>, alpha: f64) -> Self {
+        Self { input, alpha }
+    }
+}
+
+impl<T: Float> GradFn<T> for EluBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let alpha = T::from(self.alpha).unwrap();
+
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| {
+                if x > zero {
+                    g
+                } else {
+                    // d/dx [alpha * (exp(x) - 1)] = alpha * exp(x)
+                    g * alpha * x.exp()
+                }
+            })
+            .collect();
+
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "EluBackward"
+    }
+}
+
+/// Compute `elu(x)` with configurable `alpha`, attaching a backward node
+/// when gradients are enabled.
+///
+/// ```text
+/// elu(x) = x                    if x > 0
+///        = alpha * (exp(x) - 1)  if x <= 0
+/// ```
+pub fn elu<T: Float>(input: &Tensor<T>, alpha: f64) -> FerrotorchResult<Tensor<T>> {
+    let zero = <T as num_traits::Zero>::zero();
+    let one = <T as num_traits::One>::one();
+    let alpha_t = T::from(alpha).unwrap();
+
+    let output = unary_map(input, |x| {
+        if x > zero {
+            x
+        } else {
+            alpha_t * (x.exp() - one)
+        }
+    })?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(EluBackward::new(input.clone(), alpha)),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mish
+// ---------------------------------------------------------------------------
+
+/// Backward for `mish(x) = x * tanh(softplus(x))`.
+///
+/// Let `sp = softplus(x) = ln(1 + exp(x))` and `t = tanh(sp)`.
+///
+/// The derivative is:
+/// ```text
+/// d/dx mish(x) = t + x * (1 - t^2) * sigmoid(x)
+///              = t + x * sigmoid(x) * sech^2(sp)
+/// ```
+///
+/// which simplifies to: `tanh(sp) + x * sigmoid(x) * (1 - tanh(sp)^2)`.
+#[derive(Debug)]
+pub struct MishBackward<T: Float> {
+    input: Tensor<T>,
+}
+
+impl<T: Float> MishBackward<T> {
+    pub fn new(input: Tensor<T>) -> Self {
+        Self { input }
+    }
+}
+
+impl<T: Float> GradFn<T> for MishBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let one = <T as num_traits::One>::one();
+
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| {
+                let sp = (one + x.exp()).ln(); // softplus(x)
+                let t = sp.tanh(); // tanh(softplus(x))
+                let sig = one / (one + (-x).exp()); // sigmoid(x)
+                // d/dx mish(x) = tanh(sp) + x * sigmoid(x) * (1 - tanh(sp)^2)
+                let dmish = t + x * sig * (one - t * t);
+                g * dmish
+            })
+            .collect();
+
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "MishBackward"
+    }
+}
+
+/// Compute `mish(x) = x * tanh(softplus(x))`, attaching a backward node
+/// when gradients are enabled.
+pub fn mish<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let one = <T as num_traits::One>::one();
+
+    let output = unary_map(input, |x| {
+        let sp = (one + x.exp()).ln();
+        x * sp.tanh()
+    })?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(MishBackward::new(input.clone())),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1041,6 +1318,340 @@ mod tests {
             assert!(
                 y.grad_fn().is_none(),
                 "sigmoid inside no_grad should not attach grad_fn"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Softplus
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_softplus_forward_zero() {
+        let x = leaf_scalar(0.0);
+        let y = softplus(&x, 1.0, 20.0).unwrap();
+        // softplus(0) = ln(1 + 1) = ln(2)
+        assert!(
+            (y.item().unwrap() - 2.0_f64.ln()).abs() < 1e-7,
+            "softplus(0) = {}, expected {}",
+            y.item().unwrap(),
+            2.0_f64.ln()
+        );
+    }
+
+    #[test]
+    fn test_softplus_forward_large() {
+        let x = leaf_scalar(25.0);
+        let y = softplus(&x, 1.0, 20.0).unwrap();
+        // For beta*x > threshold, softplus(x) = x.
+        assert!(
+            (y.item().unwrap() - 25.0).abs() < 1e-5,
+            "softplus(25) = {}, expected 25.0",
+            y.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_at_zero() {
+        let x = leaf_scalar(0.0);
+        let y = softplus(&x, 1.0, 20.0).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        // d/dx softplus(0) = sigmoid(0) = 0.5
+        assert!(
+            (grad.item().unwrap() - 0.5).abs() < 1e-6,
+            "softplus grad at x=0: expected 0.5, got {}",
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_positive() {
+        let val = 2.0_f64;
+        let x = leaf_scalar(val);
+        let y = softplus(&x, 1.0, 20.0).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(|v| (1.0 + v.exp()).ln(), val);
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "softplus grad at x={}: expected {}, got {}",
+            val,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_negative() {
+        let val = -1.5_f64;
+        let x = leaf_scalar(val);
+        let y = softplus(&x, 1.0, 20.0).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(|v| (1.0 + v.exp()).ln(), val);
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "softplus grad at x={}: expected {}, got {}",
+            val,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_custom_beta() {
+        let val = 1.0_f64;
+        let beta = 2.0_f64;
+        let x = leaf_scalar(val);
+        let y = softplus(&x, beta, 20.0).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(|v| (1.0 + (beta * v).exp()).ln() / beta, val);
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "softplus grad at x={}, beta={}: expected {}, got {}",
+            val,
+            beta,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_vector() {
+        let x = leaf_vec(&[-2.0, -0.5, 0.0, 1.0, 3.0]);
+        let y = softplus(&x, 1.0, 20.0).unwrap();
+
+        // Sum to get a scalar for backward.
+        let sum = crate::grad_fns::reduction::sum(&y)?;
+        backward(&sum).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let grad_data = grad.data().unwrap();
+
+        for (i, &val) in [-2.0_f64, -0.5, 0.0, 1.0, 3.0].iter().enumerate() {
+            let expected = numerical_grad_scalar(|v| (1.0 + v.exp()).ln(), val);
+            assert!(
+                (grad_data[i] - expected).abs() < 1e-4,
+                "softplus grad[{}] at x={}: expected {}, got {}",
+                i,
+                val,
+                expected,
+                grad_data[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_softplus_no_grad() {
+        crate::autograd::no_grad::no_grad(|| {
+            let x = leaf_scalar(1.0);
+            let y = softplus(&x, 1.0, 20.0).unwrap();
+            assert!(
+                y.grad_fn().is_none(),
+                "softplus inside no_grad should not attach grad_fn"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // ELU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_elu_forward_positive() {
+        let x = leaf_scalar(2.0);
+        let y = elu(&x, 1.0).unwrap();
+        assert!((y.item().unwrap() - 2.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_elu_forward_negative() {
+        let x = leaf_scalar(-1.0);
+        let y = elu(&x, 1.0).unwrap();
+        let expected = (-1.0_f64).exp() - 1.0;
+        assert!(
+            (y.item().unwrap() - expected).abs() < 1e-7,
+            "elu(-1) = {}, expected {}",
+            y.item().unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_elu_backward_positive() {
+        let x = leaf_scalar(2.0);
+        let y = elu(&x, 1.0).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        // d/dx elu(x) at x=2 > 0 is 1.
+        assert!(
+            (grad.item().unwrap() - 1.0).abs() < 1e-6,
+            "elu grad at x=2: expected 1.0, got {}",
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_elu_backward_negative() {
+        let val = -1.0_f64;
+        let alpha = 1.0_f64;
+        let x = leaf_scalar(val);
+        let y = elu(&x, alpha).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(|v| if v > 0.0 { v } else { alpha * (v.exp() - 1.0) }, val);
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "elu grad at x={}: expected {}, got {}",
+            val,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_elu_backward_custom_alpha() {
+        let val = -0.5_f64;
+        let alpha = 2.0_f64;
+        let x = leaf_scalar(val);
+        let y = elu(&x, alpha).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        // d/dx [alpha * (exp(x) - 1)] = alpha * exp(x) at x = -0.5
+        let expected = alpha * val.exp();
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-5,
+            "elu grad at x={}, alpha={}: expected {}, got {}",
+            val,
+            alpha,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_elu_no_grad() {
+        crate::autograd::no_grad::no_grad(|| {
+            let x = leaf_scalar(1.0);
+            let y = elu(&x, 1.0).unwrap();
+            assert!(
+                y.grad_fn().is_none(),
+                "elu inside no_grad should not attach grad_fn"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Mish
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mish_forward_zero() {
+        let x = leaf_scalar(0.0);
+        let y = mish(&x).unwrap();
+        // mish(0) = 0 * tanh(ln(2)) = 0
+        assert!(y.item().unwrap().abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_mish_forward_positive() {
+        let x = leaf_scalar(20.0);
+        let y = mish(&x).unwrap();
+        // For large x, mish(x) -> x.
+        assert!(
+            (y.item().unwrap() - 20.0).abs() < 0.01,
+            "mish(20) = {}, expected ~20",
+            y.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_mish_backward_at_zero() {
+        let x = leaf_scalar(0.0);
+        let y = mish(&x).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(
+            |v| {
+                let sp = (1.0 + v.exp()).ln();
+                v * sp.tanh()
+            },
+            0.0,
+        );
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "mish grad at x=0: expected {}, got {}",
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_mish_backward_positive() {
+        let val = 1.5_f64;
+        let x = leaf_scalar(val);
+        let y = mish(&x).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(
+            |v| {
+                let sp = (1.0 + v.exp()).ln();
+                v * sp.tanh()
+            },
+            val,
+        );
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "mish grad at x={}: expected {}, got {}",
+            val,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_mish_backward_negative() {
+        let val = -1.0_f64;
+        let x = leaf_scalar(val);
+        let y = mish(&x).unwrap();
+        backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad_scalar(
+            |v| {
+                let sp = (1.0 + v.exp()).ln();
+                v * sp.tanh()
+            },
+            val,
+        );
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "mish grad at x={}: expected {}, got {}",
+            val,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_mish_no_grad() {
+        crate::autograd::no_grad::no_grad(|| {
+            let x = leaf_scalar(1.0);
+            let y = mish(&x).unwrap();
+            assert!(
+                y.grad_fn().is_none(),
+                "mish inside no_grad should not attach grad_fn"
             );
         });
     }

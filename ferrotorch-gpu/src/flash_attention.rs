@@ -471,7 +471,6 @@ pub fn gpu_flash_attention_f32(
     device: &GpuDevice,
 ) -> GpuResult<CudaBuffer<f32>> {
     use cudarc::driver::PushKernelArg;
-    use cudarc::nvrtc::Ptx;
 
     // --- Validate shapes ---------------------------------------------------
 
@@ -542,13 +541,16 @@ pub fn gpu_flash_attention_f32(
 
     let mut output = crate::transfer::alloc_zeros::<f32>(total_out, device)?;
 
-    // --- Load PTX module ---------------------------------------------------
+    // --- Load PTX module (cached after first compilation) -----------------
 
     let ctx = device.context();
     let stream = device.stream();
 
-    let module = ctx.load_module(Ptx::from_src(FLASH_ATTENTION_PTX))?;
-    let kernel_fn = module.load_function("flash_attention_kernel")?;
+    let kernel_fn = crate::module_cache::get_or_compile(
+        ctx,
+        FLASH_ATTENTION_PTX,
+        "flash_attention_kernel",
+    )?;
 
     // --- Compute shared memory requirement ---------------------------------
     //

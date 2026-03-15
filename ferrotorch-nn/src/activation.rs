@@ -403,10 +403,7 @@ impl_activation_module!(LeakyReLU);
 ///        = alpha * (exp(x) - 1)  if x <= 0
 /// ```
 ///
-/// The forward pass uses `unary_map` for correct output values.
-///
-/// **Note**: Autograd is not yet supported for `ELU`. To add backward
-/// support, implement `EluBackward` in `ferrotorch_core::grad_fns::activation`.
+/// Differentiable: autograd backward is supported via `EluBackward`.
 #[derive(Debug, Clone)]
 pub struct ELU {
     /// Scale for the negative region. Default: 1.0.
@@ -425,17 +422,7 @@ impl ELU {
 
     /// Forward pass.
     pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-        let zero = <T as num_traits::Zero>::zero();
-        let one = <T as num_traits::One>::one();
-        let alpha = T::from(self.alpha).unwrap();
-
-        unary_map(input, |x| {
-            if x > zero {
-                x
-            } else {
-                alpha * (x.exp() - one)
-            }
-        })
+        act::elu(input, self.alpha)
     }
 }
 
@@ -457,10 +444,7 @@ impl_activation_module!(ELU);
 ///
 /// where `softplus(x) = ln(1 + exp(x))`.
 ///
-/// The forward pass uses `unary_map` for correct output values.
-///
-/// **Note**: Autograd is not yet supported for `Mish`. To add backward
-/// support, implement `MishBackward` in `ferrotorch_core::grad_fns::activation`.
+/// Differentiable: autograd backward is supported via `MishBackward`.
 #[derive(Debug, Clone)]
 pub struct Mish {
     training: bool,
@@ -474,12 +458,7 @@ impl Mish {
 
     /// Forward pass.
     pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-        let one = <T as num_traits::One>::one();
-
-        unary_map(input, |x| {
-            let softplus = (one + x.exp()).ln();
-            x * softplus.tanh()
-        })
+        act::mish(input)
     }
 }
 
@@ -812,20 +791,10 @@ impl Softplus {
     }
 
     /// Forward pass.
+    ///
+    /// Differentiable: autograd backward is supported via `SoftplusBackward`.
     pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-        let one = <T as num_traits::One>::one();
-        let beta = T::from(self.beta).unwrap();
-        let threshold = T::from(self.threshold).unwrap();
-
-        unary_map(input, |x| {
-            let bx = beta * x;
-            if bx > threshold {
-                // For large values, softplus(x) ~ x to avoid overflow.
-                x
-            } else {
-                (one + (bx).exp()).ln() / beta
-            }
-        })
+        act::softplus(input, self.beta, self.threshold)
     }
 }
 
@@ -1619,6 +1588,263 @@ mod tests {
         assert_send_sync::<HardSwish>();
         assert_send_sync::<Softplus>();
         assert_send_sync::<GLU>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Backward (autograd) tests for Softplus, ELU, Mish
+    // -----------------------------------------------------------------------
+
+    /// Helper: 1-D tensor from a slice with `requires_grad = true`.
+    fn t_grad(data: &[f64]) -> Tensor<f64> {
+        Tensor::from_storage(TensorStorage::cpu(data.to_vec()), vec![data.len()], true).unwrap()
+    }
+
+    /// Helper: scalar leaf tensor with `requires_grad = true`.
+    fn t_scalar_grad(val: f64) -> Tensor<f64> {
+        Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], true).unwrap()
+    }
+
+    /// Numerical gradient via central difference: (f(x+h) - f(x-h)) / (2h).
+    fn numerical_grad(f: impl Fn(f64) -> f64, x: f64) -> f64 {
+        let h = 1e-5;
+        (f(x + h) - f(x - h)) / (2.0 * h)
+    }
+
+    // -- Softplus backward --
+
+    #[test]
+    fn test_softplus_backward_produces_grad() {
+        let x = t_scalar_grad(1.0);
+        let m = Softplus::new(1.0);
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap();
+        assert!(grad.is_some(), "Softplus backward should produce a gradient");
+    }
+
+    #[test]
+    fn test_softplus_backward_at_zero() {
+        let x = t_scalar_grad(0.0);
+        let m = Softplus::new(1.0);
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        // d/dx softplus(0) = sigmoid(0) = 0.5
+        assert!(
+            (grad.item().unwrap() - 0.5).abs() < 1e-6,
+            "Softplus grad at x=0: expected 0.5, got {}",
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_matches_numerical() {
+        for &val in &[-2.0, -0.5, 0.0, 1.0, 3.0] {
+            let x = t_scalar_grad(val);
+            let m = Softplus::new(1.0);
+            let y = m.forward(&x).unwrap();
+            ferrotorch_core::backward(&y).unwrap();
+
+            let grad = x.grad().unwrap().unwrap();
+            let expected = numerical_grad(|v| (1.0 + v.exp()).ln(), val);
+            assert!(
+                (grad.item().unwrap() - expected).abs() < 1e-4,
+                "Softplus grad at x={}: expected {}, got {}",
+                val,
+                expected,
+                grad.item().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_softplus_backward_custom_beta() {
+        let val = 1.0;
+        let beta = 2.0;
+        let x = t_scalar_grad(val);
+        let m = Softplus::new(beta);
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let expected = numerical_grad(|v| (1.0 + (beta * v).exp()).ln() / beta, val);
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-4,
+            "Softplus grad at x={}, beta={}: expected {}, got {}",
+            val,
+            beta,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_softplus_backward_vector() {
+        let x = t_grad(&[-2.0, -0.5, 0.0, 1.0, 3.0]);
+        let m = Softplus::new(1.0);
+        let y = m.forward(&x).unwrap();
+        // Sum to get a scalar for backward.
+        let sum = ferrotorch_core::grad_fns::reduction::sum(&y).unwrap();
+        ferrotorch_core::backward(&sum).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let grad_data = grad.data().unwrap();
+
+        for (i, &val) in [-2.0_f64, -0.5, 0.0, 1.0, 3.0].iter().enumerate() {
+            let expected = numerical_grad(|v| (1.0 + v.exp()).ln(), val);
+            assert!(
+                (grad_data[i] - expected).abs() < 1e-4,
+                "Softplus grad[{}] at x={}: expected {}, got {}",
+                i,
+                val,
+                expected,
+                grad_data[i]
+            );
+        }
+    }
+
+    // -- ELU backward --
+
+    #[test]
+    fn test_elu_backward_produces_grad() {
+        let x = t_scalar_grad(-1.0);
+        let m = ELU::new(1.0);
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap();
+        assert!(grad.is_some(), "ELU backward should produce a gradient");
+    }
+
+    #[test]
+    fn test_elu_backward_positive() {
+        let x = t_scalar_grad(2.0);
+        let m = ELU::new(1.0);
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        // d/dx elu(x) at x=2 (positive) = 1.
+        assert!(
+            (grad.item().unwrap() - 1.0).abs() < 1e-6,
+            "ELU grad at x=2: expected 1.0, got {}",
+            grad.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_elu_backward_matches_numerical() {
+        let alpha = 1.0;
+        for &val in &[-2.0, -1.0, -0.5, 0.5, 2.0] {
+            let x = t_scalar_grad(val);
+            let m = ELU::new(alpha);
+            let y = m.forward(&x).unwrap();
+            ferrotorch_core::backward(&y).unwrap();
+
+            let grad = x.grad().unwrap().unwrap();
+            let expected = numerical_grad(
+                |v| if v > 0.0 { v } else { alpha * (v.exp() - 1.0) },
+                val,
+            );
+            assert!(
+                (grad.item().unwrap() - expected).abs() < 1e-4,
+                "ELU grad at x={}: expected {}, got {}",
+                val,
+                expected,
+                grad.item().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_elu_backward_custom_alpha() {
+        let alpha = 2.0;
+        let val = -0.5;
+        let x = t_scalar_grad(val);
+        let m = ELU::new(alpha);
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        // d/dx [alpha * (exp(x) - 1)] = alpha * exp(x)
+        let expected = alpha * val.exp();
+        assert!(
+            (grad.item().unwrap() - expected).abs() < 1e-5,
+            "ELU grad at x={}, alpha={}: expected {}, got {}",
+            val,
+            alpha,
+            expected,
+            grad.item().unwrap()
+        );
+    }
+
+    // -- Mish backward --
+
+    #[test]
+    fn test_mish_backward_produces_grad() {
+        let x = t_scalar_grad(1.0);
+        let m = Mish::new();
+        let y = m.forward(&x).unwrap();
+        ferrotorch_core::backward(&y).unwrap();
+
+        let grad = x.grad().unwrap();
+        assert!(grad.is_some(), "Mish backward should produce a gradient");
+    }
+
+    #[test]
+    fn test_mish_backward_matches_numerical() {
+        let mish_fn = |v: f64| {
+            let sp = (1.0 + v.exp()).ln();
+            v * sp.tanh()
+        };
+
+        for &val in &[-2.0, -1.0, 0.0, 0.5, 1.5, 3.0] {
+            let x = t_scalar_grad(val);
+            let m = Mish::new();
+            let y = m.forward(&x).unwrap();
+            ferrotorch_core::backward(&y).unwrap();
+
+            let grad = x.grad().unwrap().unwrap();
+            let expected = numerical_grad(mish_fn, val);
+            assert!(
+                (grad.item().unwrap() - expected).abs() < 1e-4,
+                "Mish grad at x={}: expected {}, got {}",
+                val,
+                expected,
+                grad.item().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_mish_backward_vector() {
+        let x = t_grad(&[-1.0, 0.0, 1.0, 2.0]);
+        let m = Mish::new();
+        let y = m.forward(&x).unwrap();
+        let sum = ferrotorch_core::grad_fns::reduction::sum(&y).unwrap();
+        ferrotorch_core::backward(&sum).unwrap();
+
+        let grad = x.grad().unwrap().unwrap();
+        let grad_data = grad.data().unwrap();
+
+        let mish_fn = |v: f64| {
+            let sp = (1.0 + v.exp()).ln();
+            v * sp.tanh()
+        };
+
+        for (i, &val) in [-1.0_f64, 0.0, 1.0, 2.0].iter().enumerate() {
+            let expected = numerical_grad(mish_fn, val);
+            assert!(
+                (grad_data[i] - expected).abs() < 1e-4,
+                "Mish grad[{}] at x={}: expected {}, got {}",
+                i,
+                val,
+                expected,
+                grad_data[i]
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

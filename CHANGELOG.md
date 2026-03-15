@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Wire up ferray-linalg for CPU matmul and fix crates.io dependency versions (#140)
 
 ### Added
+- Update README and prep all crates for crates.io with per-crate READMEs (#176)
+- Add einops, LoRA, fixed-point derivatives, and natural gradient (#174)
 - Commit unified device-aware Tensor Steps 2-4 (#172)
 - Implement unified device-aware Tensor — Step 1: core infrastructure (#170)
 - Design unified device-aware Tensor architecture (#169)
