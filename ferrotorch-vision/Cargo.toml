@@ -1,0 +1,19 @@
+[package]
+name = "ferrotorch-vision"
+description = "Vision models, datasets, and transforms for ferrotorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ferrotorch-nn = { workspace = true }
+ferrotorch-data = { workspace = true }
+num-traits = { workspace = true }
+image = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "ferrotorch-core"
+description = "Core tensor and autograd engine for ferrotorch — PyTorch in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferray-core = { workspace = true }
+ferray-ufunc = { workspace = true }
+ferray-linalg = { workspace = true }
+ferray-random = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+half = { workspace = true }
+num-traits = { workspace = true }
+
+[dev-dependencies]

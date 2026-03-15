@@ -1,0 +1,20 @@
+[package]
+name = "ferrotorch-distributed"
+description = "Distributed training for ferrotorch — backends, collectives, and DDP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+gpu = ["dep:ferrotorch-gpu"]
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ferrotorch-nn = { workspace = true }
+ferrotorch-gpu = { workspace = true, optional = true }
+num-traits = { workspace = true }
+thiserror = { workspace = true }

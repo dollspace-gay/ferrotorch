@@ -1,0 +1,20 @@
+[package]
+name = "ferrotorch"
+description = "PyTorch in Rust — deep learning framework built on ferray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ferrotorch-nn = { workspace = true }
+ferrotorch-optim = { workspace = true }
+ferrotorch-data = { workspace = true }
+ferrotorch-vision = { workspace = true }
+
+[[example]]
+name = "train_mnist"
+path = "examples/train_mnist.rs"

@@ -1,0 +1,21 @@
+[package]
+name = "ferrotorch-cubecl"
+description = "Portable GPU backend for ferrotorch via CubeCL (CUDA, ROCm, WGPU)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cuda = ["cubecl-cuda"]
+wgpu = ["cubecl-wgpu"]
+rocm = ["cubecl-hip"]
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+cubecl = { workspace = true }
+cubecl-cuda = { workspace = true, optional = true }
+cubecl-wgpu = { workspace = true, optional = true }
+cubecl-hip = { workspace = true, optional = true }
+num-traits = { workspace = true }

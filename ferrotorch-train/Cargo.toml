@@ -1,0 +1,18 @@
+[package]
+name = "ferrotorch-train"
+description = "Training loop, metrics, and callbacks for ferrotorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ferrotorch-nn = { workspace = true }
+ferrotorch-optim = { workspace = true }
+ferrotorch-data = { workspace = true }
+num-traits = { workspace = true }
+
+[dev-dependencies]

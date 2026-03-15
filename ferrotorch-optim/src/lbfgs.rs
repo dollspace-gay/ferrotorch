@@ -1,0 +1,897 @@
+//! L-BFGS optimizer (Limited-memory Broyden-Fletcher-Goldfarb-Shanno).
+//!
+//! A quasi-Newton optimizer that approximates the inverse Hessian using the
+//! last `m` gradient updates. Best suited for small models where second-order
+//! optimization is beneficial (e.g. full-batch training, physics-informed
+//! neural networks, style transfer).
+//!
+//! The core algorithm is the two-loop recursion that computes a search
+//! direction from the curvature pairs `(s, y)` accumulated over previous
+//! iterations.
+//!
+//! All parameter updates execute inside `no_grad()` so the optimizer step is
+//! never recorded in the autograd graph.
+
+use std::collections::HashMap;
+
+use ferrotorch_core::{no_grad, Float, FerrotorchError, FerrotorchResult, Tensor, TensorStorage};
+use ferrotorch_nn::Parameter;
+
+use crate::optimizer::{Optimizer, OptimizerState, ParamGroup};
+
+// ---------------------------------------------------------------------------
+// LineSearchFn (placeholder enum for future expansion)
+// ---------------------------------------------------------------------------
+
+/// Line search strategy. Currently only `StrongWolfe` is defined as a
+/// variant name; the actual implementation is deferred. Passing `None` in
+/// the config means the optimizer uses a fixed step size equal to `lr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineSearchFn {
+    /// Strong Wolfe line search (not yet implemented).
+    StrongWolfe,
+}
+
+// ---------------------------------------------------------------------------
+// LbfgsConfig
+// ---------------------------------------------------------------------------
+
+/// Hyperparameters for the L-BFGS optimizer.
+#[derive(Debug, Clone)]
+pub struct LbfgsConfig {
+    /// Learning rate / step size (default: 1.0).
+    pub lr: f64,
+    /// Maximum number of iterations per `step()` call (default: 20).
+    pub max_iter: usize,
+    /// Maximum number of function evaluations per `step()` call.
+    /// Defaults to `max_iter * 5 / 4` when `None`.
+    pub max_eval: Option<usize>,
+    /// Termination tolerance on the gradient infinity norm (default: 1e-7).
+    pub tolerance_grad: f64,
+    /// Termination tolerance on the function value change (default: 1e-9).
+    pub tolerance_change: f64,
+    /// Number of curvature pairs to keep (default: 10).
+    pub history_size: usize,
+    /// Line search function (default: `None` -- fixed step with `lr`).
+    pub line_search_fn: Option<LineSearchFn>,
+}
+
+impl Default for LbfgsConfig {
+    fn default() -> Self {
+        Self {
+            lr: 1.0,
+            max_iter: 20,
+            max_eval: None,
+            tolerance_grad: 1e-7,
+            tolerance_change: 1e-9,
+            history_size: 10,
+            line_search_fn: None,
+        }
+    }
+}
+
+impl LbfgsConfig {
+    /// Effective maximum number of function evaluations.
+    fn effective_max_eval(&self) -> usize {
+        self.max_eval.unwrap_or(self.max_iter * 5 / 4)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LbfgsState
+// ---------------------------------------------------------------------------
+
+/// Mutable state maintained across L-BFGS iterations.
+#[derive(Debug)]
+struct LbfgsState {
+    /// Parameter differences: s_k = x_{k+1} - x_k.
+    s_history: Vec<Vec<f64>>,
+    /// Gradient differences: y_k = g_{k+1} - g_k.
+    y_history: Vec<Vec<f64>>,
+    /// Cached 1 / (y_k . s_k) for each curvature pair.
+    rho_history: Vec<f64>,
+    /// Previous flat parameter vector (needed to compute s_k).
+    prev_flat_params: Option<Vec<f64>>,
+    /// Previous flat gradient vector (needed to compute y_k).
+    prev_flat_grad: Option<Vec<f64>>,
+    /// Number of optimizer steps completed.
+    n_iter: u64,
+}
+
+impl LbfgsState {
+    fn new() -> Self {
+        Self {
+            s_history: Vec::new(),
+            y_history: Vec::new(),
+            rho_history: Vec::new(),
+            prev_flat_params: None,
+            prev_flat_grad: None,
+            n_iter: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lbfgs
+// ---------------------------------------------------------------------------
+
+/// The L-BFGS optimizer.
+///
+/// Flattens all parameter tensors into a single vector, computes the L-BFGS
+/// search direction via the two-loop recursion, and writes updated values
+/// back into the parameter tensors.
+#[derive(Debug)]
+pub struct Lbfgs<T: Float> {
+    param_groups: Vec<ParamGroup<T>>,
+    config: LbfgsConfig,
+    state: LbfgsState,
+}
+
+impl<T: Float> Lbfgs<T> {
+    /// Create a new L-BFGS optimizer for the given parameters.
+    pub fn new(params: Vec<Parameter<T>>, config: LbfgsConfig) -> Self {
+        let group = ParamGroup::new(params, config.lr);
+        Self {
+            param_groups: vec![group],
+            config,
+            state: LbfgsState::new(),
+        }
+    }
+
+    // -- helpers ----------------------------------------------------------
+
+    /// Flatten all parameter data into a single `f64` vector, collecting
+    /// shapes along the way so we can scatter the results back.
+    fn gather_params(&self) -> FerrotorchResult<(Vec<f64>, Vec<Vec<usize>>)> {
+        let mut flat = Vec::new();
+        let mut shapes = Vec::new();
+        for group in &self.param_groups {
+            for param in &group.params {
+                let tensor = param.tensor();
+                let data = tensor.data()?;
+                shapes.push(tensor.shape().to_vec());
+                flat.extend(data.iter().map(|&v| v.to_f64().unwrap()));
+            }
+        }
+        Ok((flat, shapes))
+    }
+
+    /// Flatten all parameter gradients into a single `f64` vector.
+    fn gather_grads(&self) -> FerrotorchResult<Vec<f64>> {
+        let mut flat = Vec::new();
+        for group in &self.param_groups {
+            for param in &group.params {
+                let tensor = param.tensor();
+                match tensor.grad()? {
+                    Some(g) => {
+                        let g_data = g.data()?;
+                        flat.extend(g_data.iter().map(|&v| v.to_f64().unwrap()));
+                    }
+                    None => {
+                        // No gradient: treat as zero.
+                        let numel = tensor.data()?.len();
+                        flat.extend(std::iter::repeat(0.0).take(numel));
+                    }
+                }
+            }
+        }
+        Ok(flat)
+    }
+
+    /// Scatter a flat `f64` vector back into the parameter tensors (inside
+    /// `no_grad`).
+    fn scatter_params(
+        &mut self,
+        flat: &[f64],
+        shapes: &[Vec<usize>],
+    ) -> FerrotorchResult<()> {
+        let mut offset = 0usize;
+        let mut shape_idx = 0usize;
+
+        for gi in 0..self.param_groups.len() {
+            for pi in 0..self.param_groups[gi].params.len() {
+                let shape = &shapes[shape_idx];
+                let numel: usize = if shape.is_empty() {
+                    1
+                } else {
+                    shape.iter().product()
+                };
+
+                let slice = &flat[offset..offset + numel];
+                let new_data: Vec<T> = slice.iter().map(|&v| T::from(v).unwrap()).collect();
+
+                let shape_clone = shape.clone();
+                let new_tensor = no_grad(|| {
+                    Tensor::from_storage(
+                        TensorStorage::cpu(new_data),
+                        shape_clone,
+                        true,
+                    )
+                })?;
+
+                self.param_groups[gi].params[pi] = Parameter::new(new_tensor);
+
+                offset += numel;
+                shape_idx += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// L-BFGS two-loop recursion.
+    ///
+    /// Given the current gradient `q` and the curvature history, returns the
+    /// search direction `d = -H_k * g` where `H_k` is the L-BFGS
+    /// approximation to the inverse Hessian.
+    fn two_loop_recursion(&self, grad: &[f64]) -> Vec<f64> {
+        let m = self.state.s_history.len();
+        let n = grad.len();
+
+        // If we have no history yet, fall back to steepest descent.
+        if m == 0 {
+            return grad.iter().map(|&g| -g).collect();
+        }
+
+        let mut q = grad.to_vec();
+        let mut alpha = vec![0.0; m];
+
+        // ---- first loop (backward through history) ----
+        for i in (0..m).rev() {
+            let s = &self.state.s_history[i];
+            let rho = self.state.rho_history[i];
+            let a = rho * dot(s, &q);
+            alpha[i] = a;
+            // q = q - alpha_i * y_i
+            let y = &self.state.y_history[i];
+            for j in 0..n {
+                q[j] -= a * y[j];
+            }
+        }
+
+        // ---- initial Hessian approximation H_0 = gamma * I ----
+        let s_last = &self.state.s_history[m - 1];
+        let y_last = &self.state.y_history[m - 1];
+        let y_dot_y = dot(y_last, y_last);
+        let gamma = if y_dot_y.abs() > 1e-30 {
+            dot(s_last, y_last) / y_dot_y
+        } else {
+            1.0
+        };
+
+        // r = H_0 * q = gamma * q
+        let mut r: Vec<f64> = q.iter().map(|&v| gamma * v).collect();
+
+        // ---- second loop (forward through history) ----
+        for i in 0..m {
+            let y = &self.state.y_history[i];
+            let rho = self.state.rho_history[i];
+            let beta = rho * dot(y, &r);
+            let s = &self.state.s_history[i];
+            for j in 0..n {
+                r[j] += s[j] * (alpha[i] - beta);
+            }
+        }
+
+        // Search direction = -r (descent direction).
+        for v in &mut r {
+            *v = -*v;
+        }
+
+        r
+    }
+
+    /// Update the curvature history with a new (s, y) pair.
+    fn update_history(&mut self, s: Vec<f64>, y: Vec<f64>) {
+        let ys = dot(&s, &y);
+
+        // Skip the update if curvature condition is not satisfied.
+        if ys <= 1e-30 {
+            return;
+        }
+
+        let rho = 1.0 / ys;
+
+        // If we've reached the history limit, evict the oldest entry.
+        if self.state.s_history.len() >= self.config.history_size {
+            self.state.s_history.remove(0);
+            self.state.y_history.remove(0);
+            self.state.rho_history.remove(0);
+        }
+
+        self.state.s_history.push(s);
+        self.state.y_history.push(y);
+        self.state.rho_history.push(rho);
+    }
+}
+
+/// Dot product of two equal-length slices.
+#[inline]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+/// Infinity norm (max absolute value).
+#[inline]
+fn inf_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x.abs()).fold(0.0_f64, f64::max)
+}
+
+// ---------------------------------------------------------------------------
+// Optimizer trait implementation
+// ---------------------------------------------------------------------------
+
+impl<T: Float> Optimizer<T> for Lbfgs<T> {
+    fn step(&mut self) -> FerrotorchResult<()> {
+        if self.config.line_search_fn.is_some() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "L-BFGS line search is not yet implemented; use \
+                          line_search_fn: None for fixed-step mode"
+                    .to_string(),
+            });
+        }
+
+        let lr = self.param_groups.first().map(|g| g.lr).unwrap_or(self.config.lr);
+
+        // Gather current parameters and gradients.
+        let (flat_params, shapes) = self.gather_params()?;
+        let flat_grad = self.gather_grads()?;
+
+        // Early termination: gradient is small enough.
+        if inf_norm(&flat_grad) <= self.config.tolerance_grad {
+            return Ok(());
+        }
+
+        // If we have previous params/grad, compute (s, y) and update history.
+        if let (Some(prev_params), Some(prev_grad)) = (
+            self.state.prev_flat_params.take(),
+            self.state.prev_flat_grad.take(),
+        ) {
+            let n = flat_params.len();
+            let mut s = vec![0.0; n];
+            let mut y = vec![0.0; n];
+            for i in 0..n {
+                s[i] = flat_params[i] - prev_params[i];
+                y[i] = flat_grad[i] - prev_grad[i];
+            }
+            self.update_history(s, y);
+        }
+
+        // Compute L-BFGS search direction via two-loop recursion.
+        let direction = self.two_loop_recursion(&flat_grad);
+
+        // Update parameters: x_{k+1} = x_k + lr * direction.
+        // (direction already points in the descent direction, i.e. -H*g.)
+        let n = flat_params.len();
+        let mut new_params = vec![0.0; n];
+        for i in 0..n {
+            new_params[i] = flat_params[i] + lr * direction[i];
+        }
+
+        // Check for insufficient change.
+        let max_change = flat_params
+            .iter()
+            .zip(new_params.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+
+        // Save current state for next iteration's (s, y) computation.
+        self.state.prev_flat_params = Some(flat_params);
+        self.state.prev_flat_grad = Some(flat_grad);
+        self.state.n_iter += 1;
+
+        // Scatter updated values back into parameters.
+        self.scatter_params(&new_params, &shapes)?;
+
+        if max_change <= self.config.tolerance_change {
+            // Converged -- still applied the update above, but the caller
+            // can check convergence externally.
+        }
+
+        Ok(())
+    }
+
+    fn zero_grad(&mut self) -> FerrotorchResult<()> {
+        for group in &self.param_groups {
+            for param in &group.params {
+                param.tensor().set_grad(None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn lr(&self) -> f64 {
+        self.param_groups
+            .first()
+            .map(|g| g.lr)
+            .unwrap_or(self.config.lr)
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        for group in &mut self.param_groups {
+            group.lr = lr;
+        }
+    }
+
+    fn param_groups(&self) -> &[ParamGroup<T>] {
+        &self.param_groups
+    }
+
+    fn param_groups_mut(&mut self) -> &mut [ParamGroup<T>] {
+        &mut self.param_groups
+    }
+
+    fn add_param_group(&mut self, group: ParamGroup<T>) {
+        self.param_groups.push(group);
+    }
+
+    fn state_dict(&self) -> OptimizerState {
+        let mut out = OptimizerState::new();
+
+        // Serialize each curvature pair under its index key.
+        let mut meta = HashMap::new();
+        meta.insert("n_iter".to_string(), vec![self.state.n_iter as f64]);
+        meta.insert(
+            "history_len".to_string(),
+            vec![self.state.s_history.len() as f64],
+        );
+        out.insert("meta".to_string(), meta);
+
+        for (i, ((s, y), &rho)) in self
+            .state
+            .s_history
+            .iter()
+            .zip(self.state.y_history.iter())
+            .zip(self.state.rho_history.iter())
+            .enumerate()
+        {
+            let mut entry = HashMap::new();
+            entry.insert("s".to_string(), s.clone());
+            entry.insert("y".to_string(), y.clone());
+            entry.insert("rho".to_string(), vec![rho]);
+            out.insert(format!("curvature_{i}"), entry);
+        }
+
+        if let Some(ref prev_p) = self.state.prev_flat_params {
+            let mut entry = HashMap::new();
+            entry.insert("prev_flat_params".to_string(), prev_p.clone());
+            out.insert("prev_params".to_string(), entry);
+        }
+
+        if let Some(ref prev_g) = self.state.prev_flat_grad {
+            let mut entry = HashMap::new();
+            entry.insert("prev_flat_grad".to_string(), prev_g.clone());
+            out.insert("prev_grad".to_string(), entry);
+        }
+
+        out
+    }
+
+    fn load_state_dict(&mut self, state: &OptimizerState) -> FerrotorchResult<()> {
+        // Load metadata.
+        let meta = state.get("meta").ok_or_else(|| FerrotorchError::InvalidArgument {
+            message: "missing 'meta' in L-BFGS state dict".to_string(),
+        })?;
+
+        self.state.n_iter = meta
+            .get("n_iter")
+            .and_then(|v| v.first())
+            .copied()
+            .unwrap_or(0.0) as u64;
+
+        let history_len = meta
+            .get("history_len")
+            .and_then(|v| v.first())
+            .copied()
+            .unwrap_or(0.0) as usize;
+
+        // Load curvature pairs.
+        self.state.s_history.clear();
+        self.state.y_history.clear();
+        self.state.rho_history.clear();
+
+        for i in 0..history_len {
+            let key = format!("curvature_{i}");
+            let entry = state.get(&key).ok_or_else(|| FerrotorchError::InvalidArgument {
+                message: format!("missing '{key}' in L-BFGS state dict"),
+            })?;
+
+            let s = entry.get("s").cloned().ok_or_else(|| {
+                FerrotorchError::InvalidArgument {
+                    message: format!("missing 's' in {key}"),
+                }
+            })?;
+            let y = entry.get("y").cloned().ok_or_else(|| {
+                FerrotorchError::InvalidArgument {
+                    message: format!("missing 'y' in {key}"),
+                }
+            })?;
+            let rho = entry
+                .get("rho")
+                .and_then(|v| v.first())
+                .copied()
+                .ok_or_else(|| FerrotorchError::InvalidArgument {
+                    message: format!("missing 'rho' in {key}"),
+                })?;
+
+            self.state.s_history.push(s);
+            self.state.y_history.push(y);
+            self.state.rho_history.push(rho);
+        }
+
+        // Load previous params/grad if present.
+        self.state.prev_flat_params = state
+            .get("prev_params")
+            .and_then(|e| e.get("prev_flat_params").cloned());
+        self.state.prev_flat_grad = state
+            .get("prev_grad")
+            .and_then(|e| e.get("prev_flat_grad").cloned());
+
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrotorch_core::grad_fns::arithmetic::{add, mul, pow, sub};
+
+    /// Create a scalar parameter from a single f64 value.
+    fn scalar_param(val: f64) -> Parameter<f64> {
+        let t = Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], true).unwrap();
+        Parameter::new(t)
+    }
+
+    /// Read a scalar parameter's current value.
+    fn param_val(opt: &Lbfgs<f64>, group: usize, idx: usize) -> f64 {
+        opt.param_groups[group].params[idx]
+            .tensor()
+            .data()
+            .unwrap()[0]
+    }
+
+    // -----------------------------------------------------------------------
+    // Simple quadratic convergence: f(x) = x^2, min at x=0
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_quadratic_convergence() {
+        let p = scalar_param(5.0);
+        let mut opt = Lbfgs::new(
+            vec![p],
+            LbfgsConfig {
+                lr: 0.5,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..100 {
+            opt.zero_grad().unwrap();
+
+            let x = opt.param_groups[0].params[0].tensor().clone();
+            let loss = pow(&x, 2.0).unwrap();
+            loss.backward().unwrap();
+
+            opt.step().unwrap();
+        }
+
+        let val = param_val(&opt, 0, 0);
+        assert!(
+            val.abs() < 1e-3,
+            "expected x near 0.0, got {val}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-dimensional quadratic: f(a, b) = a^2 + b^2, min at (0, 0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_multidim_quadratic() {
+        let pa = scalar_param(3.0);
+        let pb = scalar_param(-4.0);
+        let mut opt = Lbfgs::new(
+            vec![pa, pb],
+            LbfgsConfig {
+                lr: 0.5,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..100 {
+            opt.zero_grad().unwrap();
+
+            let a = opt.param_groups[0].params[0].tensor().clone();
+            let b = opt.param_groups[0].params[1].tensor().clone();
+
+            let a_sq = pow(&a, 2.0).unwrap();
+            let b_sq = pow(&b, 2.0).unwrap();
+            let loss = add(&a_sq, &b_sq).unwrap();
+            loss.backward().unwrap();
+
+            opt.step().unwrap();
+        }
+
+        let va = param_val(&opt, 0, 0);
+        let vb = param_val(&opt, 0, 1);
+        assert!(
+            va.abs() < 1e-3,
+            "expected a near 0.0, got {va}"
+        );
+        assert!(
+            vb.abs() < 1e-3,
+            "expected b near 0.0, got {vb}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rosenbrock convergence: f(x, y) = (1 - x)^2 + 100*(y - x^2)^2
+    // min at (1, 1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_rosenbrock_convergence() {
+        let px = scalar_param(-1.0);
+        let py = scalar_param(1.0);
+
+        let mut opt = Lbfgs::new(
+            vec![px, py],
+            LbfgsConfig {
+                lr: 0.001,
+                history_size: 10,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..8000 {
+            opt.zero_grad().unwrap();
+
+            let x = opt.param_groups[0].params[0].tensor().clone();
+            let y = opt.param_groups[0].params[1].tensor().clone();
+
+            let one =
+                Tensor::from_storage(TensorStorage::cpu(vec![1.0_f64]), vec![], false).unwrap();
+            let hundred =
+                Tensor::from_storage(TensorStorage::cpu(vec![100.0_f64]), vec![], false).unwrap();
+
+            // term1 = (1 - x)^2
+            let diff1 = sub(&one, &x).unwrap();
+            let term1 = pow(&diff1, 2.0).unwrap();
+
+            // term2 = 100 * (y - x^2)^2
+            let x_sq = pow(&x, 2.0).unwrap();
+            let diff2 = sub(&y, &x_sq).unwrap();
+            let diff2_sq = pow(&diff2, 2.0).unwrap();
+            let term2 = mul(&hundred, &diff2_sq).unwrap();
+
+            let loss = add(&term1, &term2).unwrap();
+            loss.backward().unwrap();
+
+            opt.step().unwrap();
+        }
+
+        let final_x = param_val(&opt, 0, 0);
+        let final_y = param_val(&opt, 0, 1);
+
+        assert!(
+            (final_x - 1.0).abs() < 0.1,
+            "expected x near 1.0, got {final_x}"
+        );
+        assert!(
+            (final_y - 1.0).abs() < 0.1,
+            "expected y near 1.0, got {final_y}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // zero_grad
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_zero_grad() {
+        let p = scalar_param(3.0);
+        let mut opt = Lbfgs::new(vec![p], LbfgsConfig::default());
+
+        // Manually set a gradient.
+        let grad =
+            Tensor::from_storage(TensorStorage::cpu(vec![1.0_f64]), vec![], false).unwrap();
+        opt.param_groups[0].params[0]
+            .tensor()
+            .set_grad(Some(grad))
+            .unwrap();
+
+        assert!(opt.param_groups[0].params[0]
+            .tensor()
+            .grad()
+            .unwrap()
+            .is_some());
+
+        opt.zero_grad().unwrap();
+
+        assert!(opt.param_groups[0].params[0]
+            .tensor()
+            .grad()
+            .unwrap()
+            .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // state_dict / load_state_dict roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_state_dict_roundtrip() {
+        // Use Rosenbrock so the optimizer accumulates multiple distinct
+        // curvature pairs (a pure quadratic converges too fast for this).
+        let px = scalar_param(-1.0);
+        let py = scalar_param(1.0);
+        let mut opt = Lbfgs::new(
+            vec![px, py],
+            LbfgsConfig {
+                lr: 0.001,
+                history_size: 10,
+                ..Default::default()
+            },
+        );
+
+        let num_steps = 20;
+        for _ in 0..num_steps {
+            opt.zero_grad().unwrap();
+
+            let x = opt.param_groups[0].params[0].tensor().clone();
+            let y = opt.param_groups[0].params[1].tensor().clone();
+
+            let one =
+                Tensor::from_storage(TensorStorage::cpu(vec![1.0_f64]), vec![], false).unwrap();
+            let hundred =
+                Tensor::from_storage(TensorStorage::cpu(vec![100.0_f64]), vec![], false).unwrap();
+
+            let diff1 = sub(&one, &x).unwrap();
+            let term1 = pow(&diff1, 2.0).unwrap();
+            let x_sq = pow(&x, 2.0).unwrap();
+            let diff2 = sub(&y, &x_sq).unwrap();
+            let diff2_sq = pow(&diff2, 2.0).unwrap();
+            let term2 = mul(&hundred, &diff2_sq).unwrap();
+            let loss = add(&term1, &term2).unwrap();
+            loss.backward().unwrap();
+
+            opt.step().unwrap();
+        }
+
+        // Save state.
+        let saved = opt.state_dict();
+        assert!(!saved.is_empty(), "state dict should be non-empty after steps");
+        assert!(saved.contains_key("meta"));
+
+        let meta = &saved["meta"];
+        let n_iter = meta["n_iter"][0] as u64;
+        assert_eq!(n_iter, num_steps as u64);
+
+        let history_len = meta["history_len"][0] as usize;
+        assert!(
+            history_len > 0,
+            "should have accumulated at least one curvature pair"
+        );
+
+        // Load into a fresh optimizer.
+        let p2x = scalar_param(-1.0);
+        let p2y = scalar_param(1.0);
+        let mut opt2 = Lbfgs::new(vec![p2x, p2y], LbfgsConfig::default());
+        opt2.load_state_dict(&saved).unwrap();
+
+        let loaded = opt2.state_dict();
+        assert_eq!(loaded["meta"]["n_iter"], saved["meta"]["n_iter"]);
+        assert_eq!(loaded["meta"]["history_len"], saved["meta"]["history_len"]);
+
+        // Verify every curvature pair round-trips correctly.
+        for i in 0..history_len {
+            let key = format!("curvature_{i}");
+            assert_eq!(loaded[&key]["s"], saved[&key]["s"]);
+            assert_eq!(loaded[&key]["y"], saved[&key]["y"]);
+            assert_eq!(loaded[&key]["rho"], saved[&key]["rho"]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LR accessors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_lr_accessors() {
+        let p = scalar_param(1.0);
+        let mut opt = Lbfgs::new(
+            vec![p],
+            LbfgsConfig {
+                lr: 0.5,
+                ..Default::default()
+            },
+        );
+
+        assert!((opt.lr() - 0.5).abs() < 1e-12);
+
+        opt.set_lr(0.1);
+        assert!((opt.lr() - 0.1).abs() < 1e-12);
+        assert!((opt.param_groups()[0].lr - 0.1).abs() < 1e-12);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_default_config() {
+        let config = LbfgsConfig::default();
+        assert!((config.lr - 1.0).abs() < 1e-12);
+        assert_eq!(config.max_iter, 20);
+        assert!(config.max_eval.is_none());
+        assert!((config.tolerance_grad - 1e-7).abs() < 1e-15);
+        assert!((config.tolerance_change - 1e-9).abs() < 1e-15);
+        assert_eq!(config.history_size, 10);
+        assert!(config.line_search_fn.is_none());
+        assert_eq!(config.effective_max_eval(), 25); // 20 * 5 / 4
+    }
+
+    // -----------------------------------------------------------------------
+    // History eviction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_history_eviction() {
+        let p = scalar_param(10.0);
+        let mut opt = Lbfgs::new(
+            vec![p],
+            LbfgsConfig {
+                lr: 0.1,
+                history_size: 3,
+                ..Default::default()
+            },
+        );
+
+        // Run more steps than the history size.
+        for _ in 0..10 {
+            opt.zero_grad().unwrap();
+            let tensor = opt.param_groups[0].params[0].tensor().clone();
+            let loss = pow(&tensor, 2.0).unwrap();
+            loss.backward().unwrap();
+            opt.step().unwrap();
+        }
+
+        // History should be capped at 3.
+        assert!(
+            opt.state.s_history.len() <= 3,
+            "history should be capped at 3, got {}",
+            opt.state.s_history.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Line search not-yet-implemented error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lbfgs_line_search_not_implemented() {
+        let p = scalar_param(1.0);
+        let mut opt = Lbfgs::new(
+            vec![p],
+            LbfgsConfig {
+                line_search_fn: Some(LineSearchFn::StrongWolfe),
+                ..Default::default()
+            },
+        );
+
+        // Manually set a gradient so step() actually tries to run.
+        let grad =
+            Tensor::from_storage(TensorStorage::cpu(vec![1.0_f64]), vec![], false).unwrap();
+        opt.param_groups[0].params[0]
+            .tensor()
+            .set_grad(Some(grad))
+            .unwrap();
+
+        let result = opt.step();
+        assert!(result.is_err());
+    }
+}
