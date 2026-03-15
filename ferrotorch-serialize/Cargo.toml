@@ -1,0 +1,19 @@
+[package]
+name = "ferrotorch-serialize"
+description = "State dict and checkpoint serialization for ferrotorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ferrotorch-nn = { workspace = true }
+ferrotorch-optim = { workspace = true }
+num-traits = { workspace = true }
+safetensors = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]

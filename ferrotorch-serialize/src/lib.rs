@@ -1,0 +1,18 @@
+//! Serialization for ferrotorch models and training checkpoints.
+//!
+//! Provides a simple JSON+binary format inspired by SafeTensors:
+//! - **Header**: JSON metadata (tensor names, shapes, dtypes, byte offsets)
+//! - **Body**: raw tensor data bytes, concatenated
+//!
+//! The format is intentionally simple and can be swapped to real SafeTensors
+//! when a stable Rust crate is available.
+
+pub mod checkpoint;
+pub mod pytorch_import;
+pub mod safetensors_io;
+pub mod state_dict;
+
+pub use checkpoint::{TrainingCheckpoint, load_checkpoint, save_checkpoint};
+pub use pytorch_import::{PickleValue, load_pytorch_state_dict, parse_pickle};
+pub use safetensors_io::{load_safetensors, save_safetensors};
+pub use state_dict::{load_state_dict, save_state_dict};

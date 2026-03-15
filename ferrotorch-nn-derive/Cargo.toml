@@ -1,0 +1,17 @@
+[package]
+name = "ferrotorch-nn-derive"
+description = "Derive macro for ferrotorch Module trait — auto-generates parameter collection and train/eval boilerplate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"

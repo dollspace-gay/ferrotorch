@@ -1,0 +1,1634 @@
+//! Activation function wrapper modules.
+//!
+//! Each struct is a zero-parameter [`Module`] that applies the corresponding
+//! elementwise non-linearity in its [`forward`](Module::forward) method.
+//! They carry a `training` flag for API consistency but their behaviour is
+//! identical in train and eval modes.
+
+use ferrotorch_core::grad_fns::activation as act;
+use ferrotorch_core::grad_fns::arithmetic;
+use ferrotorch_core::ops::elementwise::unary_map;
+use ferrotorch_core::{normalize_axis, Float, FerrotorchError, FerrotorchResult, Tensor};
+
+use crate::module::Module;
+use crate::parameter::Parameter;
+
+// ---------------------------------------------------------------------------
+// Macro: implements the full `Module` trait for a zero-parameter activation.
+// ---------------------------------------------------------------------------
+
+macro_rules! impl_activation_module {
+    ($ty:ident) => {
+        impl<T: Float> Module<T> for $ty {
+            fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+                self.forward(input)
+            }
+
+            fn parameters(&self) -> Vec<&Parameter<T>> {
+                vec![]
+            }
+
+            fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+                vec![]
+            }
+
+            fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+                vec![]
+            }
+
+            fn train(&mut self) {
+                self.training = true;
+            }
+
+            fn eval(&mut self) {
+                self.training = false;
+            }
+
+            fn is_training(&self) -> bool {
+                self.training
+            }
+        }
+    };
+}
+
+// ===========================================================================
+// ReLU
+// ===========================================================================
+
+/// Applies the rectified linear unit function elementwise:
+///
+/// `ReLU(x) = max(0, x)`
+#[derive(Debug, Clone)]
+pub struct ReLU {
+    training: bool,
+}
+
+impl ReLU {
+    /// Create a new `ReLU` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        act::relu(input)
+    }
+}
+
+impl Default for ReLU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(ReLU);
+
+// ===========================================================================
+// GELU
+// ===========================================================================
+
+/// Applies the Gaussian Error Linear Unit (sigmoid approximation):
+///
+/// `GELU(x) = x * sigmoid(1.702 * x)`
+#[derive(Debug, Clone)]
+pub struct GELU {
+    training: bool,
+}
+
+impl GELU {
+    /// Create a new `GELU` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        act::gelu(input)
+    }
+}
+
+impl Default for GELU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(GELU);
+
+// ===========================================================================
+// SiLU (Swish)
+// ===========================================================================
+
+/// Applies the Sigmoid Linear Unit (Swish) function:
+///
+/// `SiLU(x) = x * sigmoid(x)`
+#[derive(Debug, Clone)]
+pub struct SiLU {
+    training: bool,
+}
+
+impl SiLU {
+    /// Create a new `SiLU` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        act::silu(input)
+    }
+}
+
+impl Default for SiLU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(SiLU);
+
+// ===========================================================================
+// Sigmoid
+// ===========================================================================
+
+/// Applies the logistic sigmoid function elementwise:
+///
+/// `Sigmoid(x) = 1 / (1 + exp(-x))`
+#[derive(Debug, Clone)]
+pub struct Sigmoid {
+    training: bool,
+}
+
+impl Sigmoid {
+    /// Create a new `Sigmoid` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        act::sigmoid(input)
+    }
+}
+
+impl Default for Sigmoid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(Sigmoid);
+
+// ===========================================================================
+// Tanh
+// ===========================================================================
+
+/// Applies the hyperbolic tangent function elementwise.
+#[derive(Debug, Clone)]
+pub struct Tanh {
+    training: bool,
+}
+
+impl Tanh {
+    /// Create a new `Tanh` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        act::tanh(input)
+    }
+}
+
+impl Default for Tanh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(Tanh);
+
+// ===========================================================================
+// Softmax
+// ===========================================================================
+
+/// Applies the softmax function along a given dimension.
+///
+/// Currently only the last axis (`dim = -1`) is supported because the
+/// underlying `ferrotorch_core::grad_fns::activation::softmax` operates on
+/// the last axis. Passing any other dimension returns an error.
+#[derive(Debug, Clone)]
+pub struct Softmax {
+    /// The dimension along which to compute softmax.
+    pub dim: isize,
+    training: bool,
+}
+
+impl Softmax {
+    /// Create a new `Softmax` module operating along `dim`.
+    ///
+    /// Defaults to `dim = -1` (last axis), matching PyTorch convention.
+    pub fn new(dim: isize) -> Self {
+        Self {
+            dim,
+            training: true,
+        }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let ndim = input.ndim();
+        if ndim == 0 {
+            // Scalar: softmax is always 1.
+            return act::softmax(input);
+        }
+
+        let axis = normalize_axis(self.dim, ndim)?;
+        if axis != ndim - 1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "Softmax currently only supports dim=-1 (last axis), \
+                     but got dim={} (axis={}) for a {}-D tensor",
+                    self.dim, axis, ndim,
+                ),
+            });
+        }
+
+        act::softmax(input)
+    }
+}
+
+impl Default for Softmax {
+    fn default() -> Self {
+        Self::new(-1)
+    }
+}
+
+impl_activation_module!(Softmax);
+
+// ===========================================================================
+// LogSoftmax
+// ===========================================================================
+
+/// Applies log(softmax(x)) along a given dimension.
+///
+/// More numerically stable than computing `log(softmax(x))` separately.
+/// Currently only the last axis (`dim = -1`) is supported.
+#[derive(Debug, Clone)]
+pub struct LogSoftmax {
+    /// The dimension along which to compute log-softmax.
+    pub dim: isize,
+    training: bool,
+}
+
+impl LogSoftmax {
+    /// Create a new `LogSoftmax` module operating along `dim`.
+    pub fn new(dim: isize) -> Self {
+        Self {
+            dim,
+            training: true,
+        }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let ndim = input.ndim();
+        if ndim == 0 {
+            return act::log_softmax(input);
+        }
+
+        let axis = normalize_axis(self.dim, ndim)?;
+        if axis != ndim - 1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "LogSoftmax currently only supports dim=-1 (last axis), \
+                     but got dim={} (axis={}) for a {}-D tensor",
+                    self.dim, axis, ndim,
+                ),
+            });
+        }
+
+        act::log_softmax(input)
+    }
+}
+
+impl Default for LogSoftmax {
+    fn default() -> Self {
+        Self::new(-1)
+    }
+}
+
+impl_activation_module!(LogSoftmax);
+
+// ===========================================================================
+// LeakyReLU
+// ===========================================================================
+
+/// Applies the leaky rectified linear unit function:
+///
+/// `LeakyReLU(x) = max(0, x) + negative_slope * min(0, x)`
+///
+/// This is implemented by composing differentiable primitives so that
+/// autograd works automatically:
+///
+/// ```text
+/// forward(x) = (1 - negative_slope) * relu(x) + negative_slope * x
+/// ```
+#[derive(Debug, Clone)]
+pub struct LeakyReLU {
+    /// Slope for negative inputs. Default: 0.01.
+    pub negative_slope: f64,
+    training: bool,
+}
+
+impl LeakyReLU {
+    /// Create a new `LeakyReLU` with the given negative slope.
+    pub fn new(negative_slope: f64) -> Self {
+        Self {
+            negative_slope,
+            training: true,
+        }
+    }
+
+    /// Forward pass.
+    ///
+    /// Computes `(1 - negative_slope) * relu(x) + negative_slope * x`
+    /// using differentiable core operations so gradients propagate correctly.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if (self.negative_slope - 0.0).abs() < f64::EPSILON {
+            // Degenerate case: standard ReLU.
+            return act::relu(input);
+        }
+        if (self.negative_slope - 1.0).abs() < f64::EPSILON {
+            // Degenerate case: identity.
+            return Ok(input.clone());
+        }
+
+        // relu_x = relu(input)
+        let relu_x = act::relu(input)?;
+
+        // scale = (1 - negative_slope)
+        let scale = T::from(1.0 - self.negative_slope).unwrap();
+        let slope = T::from(self.negative_slope).unwrap();
+
+        // scale_tensor = scalar(1 - negative_slope)
+        let scale_tensor = ferrotorch_core::scalar(scale)?;
+        // slope_tensor = scalar(negative_slope)
+        let slope_tensor = ferrotorch_core::scalar(slope)?;
+
+        // result = scale * relu(x) + slope * x
+        let scaled_relu = arithmetic::mul(&relu_x, &scale_tensor)?;
+        let scaled_x = arithmetic::mul(input, &slope_tensor)?;
+        arithmetic::add(&scaled_relu, &scaled_x)
+    }
+}
+
+impl Default for LeakyReLU {
+    fn default() -> Self {
+        Self::new(0.01)
+    }
+}
+
+impl_activation_module!(LeakyReLU);
+
+// ===========================================================================
+// ELU
+// ===========================================================================
+
+/// Applies the Exponential Linear Unit function:
+///
+/// ```text
+/// ELU(x) = x            if x > 0
+///        = alpha * (exp(x) - 1)  if x <= 0
+/// ```
+///
+/// The forward pass uses `unary_map` for correct output values.
+///
+/// **Note**: Autograd is not yet supported for `ELU`. To add backward
+/// support, implement `EluBackward` in `ferrotorch_core::grad_fns::activation`.
+#[derive(Debug, Clone)]
+pub struct ELU {
+    /// Scale for the negative region. Default: 1.0.
+    pub alpha: f64,
+    training: bool,
+}
+
+impl ELU {
+    /// Create a new `ELU` module with the given alpha.
+    pub fn new(alpha: f64) -> Self {
+        Self {
+            alpha,
+            training: true,
+        }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let alpha = T::from(self.alpha).unwrap();
+
+        unary_map(input, |x| {
+            if x > zero {
+                x
+            } else {
+                alpha * (x.exp() - one)
+            }
+        })
+    }
+}
+
+impl Default for ELU {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl_activation_module!(ELU);
+
+// ===========================================================================
+// Mish
+// ===========================================================================
+
+/// Applies the Mish activation function:
+///
+/// `Mish(x) = x * tanh(softplus(x))`
+///
+/// where `softplus(x) = ln(1 + exp(x))`.
+///
+/// The forward pass uses `unary_map` for correct output values.
+///
+/// **Note**: Autograd is not yet supported for `Mish`. To add backward
+/// support, implement `MishBackward` in `ferrotorch_core::grad_fns::activation`.
+#[derive(Debug, Clone)]
+pub struct Mish {
+    training: bool,
+}
+
+impl Mish {
+    /// Create a new `Mish` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let one = <T as num_traits::One>::one();
+
+        unary_map(input, |x| {
+            let softplus = (one + x.exp()).ln();
+            x * softplus.tanh()
+        })
+    }
+}
+
+impl Default for Mish {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(Mish);
+
+// ===========================================================================
+// PReLU (Parametric ReLU)
+// ===========================================================================
+
+/// Parametric Rectified Linear Unit with a learnable negative slope.
+///
+/// `PReLU(x) = max(0, x) + alpha * min(0, x)`
+///
+/// where `alpha` is a learnable [`Parameter`]. This is equivalent to
+/// `(1 - alpha) * relu(x) + alpha * x` for differentiable composition.
+#[derive(Debug, Clone)]
+pub struct PReLU<T: Float> {
+    /// Learnable negative slope parameter.
+    pub alpha: Parameter<T>,
+    training: bool,
+}
+
+impl<T: Float> PReLU<T> {
+    /// Create a new `PReLU` module with the given initial negative slope.
+    pub fn new(init_alpha: f64) -> FerrotorchResult<Self> {
+        let alpha_val = T::from(init_alpha).unwrap();
+        let alpha_tensor = ferrotorch_core::from_slice(&[alpha_val], &[1])?;
+        Ok(Self {
+            alpha: Parameter::new(alpha_tensor),
+            training: true,
+        })
+    }
+
+    /// Forward pass.
+    ///
+    /// Computes `(1 - alpha) * relu(x) + alpha * x`.
+    pub fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // relu_x = relu(input)
+        let relu_x = act::relu(input)?;
+
+        // Get alpha value.
+        let alpha_data = self.alpha.data()?;
+        let alpha_val = alpha_data[0];
+
+        let one_minus_alpha = T::from(1.0).unwrap() - alpha_val;
+
+        // scale_tensor = scalar(1 - alpha)
+        let scale_tensor = ferrotorch_core::scalar(one_minus_alpha)?;
+        // alpha_tensor = scalar(alpha)
+        let alpha_tensor = ferrotorch_core::scalar(alpha_val)?;
+
+        // result = (1 - alpha) * relu(x) + alpha * x
+        let scaled_relu = arithmetic::mul(&relu_x, &scale_tensor)?;
+        let scaled_x = arithmetic::mul(input, &alpha_tensor)?;
+        arithmetic::add(&scaled_relu, &scaled_x)
+    }
+}
+
+impl<T: Float> Module<T> for PReLU<T> {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        self.forward(input)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![&self.alpha]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![&mut self.alpha]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![("alpha".to_string(), &self.alpha)]
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ===========================================================================
+// CELU
+// ===========================================================================
+
+/// Continuously Differentiable Exponential Linear Unit:
+///
+/// ```text
+/// CELU(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))
+/// ```
+///
+/// Unlike ELU, CELU is continuously differentiable everywhere.
+#[derive(Debug, Clone)]
+pub struct CELU {
+    /// Scale for the negative region. Default: 1.0.
+    pub alpha: f64,
+    training: bool,
+}
+
+impl CELU {
+    /// Create a new `CELU` module with the given alpha.
+    pub fn new(alpha: f64) -> Self {
+        Self {
+            alpha,
+            training: true,
+        }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let alpha = T::from(self.alpha).unwrap();
+
+        unary_map(input, |x| {
+            let pos = if x > zero { x } else { zero };
+            let neg = if x < zero {
+                alpha * ((x / alpha).exp() - one)
+            } else {
+                zero
+            };
+            pos + neg
+        })
+    }
+}
+
+impl Default for CELU {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl_activation_module!(CELU);
+
+// ===========================================================================
+// SELU
+// ===========================================================================
+
+/// Scaled Exponential Linear Unit with fixed constants:
+///
+/// ```text
+/// SELU(x) = lambda * (x                    if x > 0)
+///         = lambda * (alpha * (exp(x) - 1)  if x <= 0)
+/// ```
+///
+/// where `alpha = 1.6732632423543772` and `lambda = 1.0507009873554805`.
+/// These constants enable self-normalizing behaviour when used with
+/// properly initialized weights (LeCun normal).
+#[derive(Debug, Clone)]
+pub struct SELU {
+    training: bool,
+}
+
+/// SELU alpha constant.
+const SELU_ALPHA: f64 = 1.6732632423543772;
+/// SELU lambda (scale) constant.
+const SELU_LAMBDA: f64 = 1.0507009873554805;
+
+impl SELU {
+    /// Create a new `SELU` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let alpha = T::from(SELU_ALPHA).unwrap();
+        let lambda = T::from(SELU_LAMBDA).unwrap();
+
+        unary_map(input, |x| {
+            if x > zero {
+                lambda * x
+            } else {
+                lambda * alpha * (x.exp() - one)
+            }
+        })
+    }
+}
+
+impl Default for SELU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(SELU);
+
+// ===========================================================================
+// HardSigmoid
+// ===========================================================================
+
+/// Hard Sigmoid activation:
+///
+/// `HardSigmoid(x) = clamp((x + 3) / 6, 0, 1)`
+///
+/// A piecewise-linear approximation of the sigmoid function.
+#[derive(Debug, Clone)]
+pub struct HardSigmoid {
+    training: bool,
+}
+
+impl HardSigmoid {
+    /// Create a new `HardSigmoid` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let three = T::from(3.0).unwrap();
+        let six = T::from(6.0).unwrap();
+
+        unary_map(input, |x| {
+            let v = (x + three) / six;
+            if v < zero {
+                zero
+            } else if v > one {
+                one
+            } else {
+                v
+            }
+        })
+    }
+}
+
+impl Default for HardSigmoid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(HardSigmoid);
+
+// ===========================================================================
+// HardSwish
+// ===========================================================================
+
+/// Hard Swish activation:
+///
+/// `HardSwish(x) = x * HardSigmoid(x) = x * clamp((x + 3) / 6, 0, 1)`
+///
+/// A piecewise-linear approximation of SiLU (Swish).
+#[derive(Debug, Clone)]
+pub struct HardSwish {
+    training: bool,
+}
+
+impl HardSwish {
+    /// Create a new `HardSwish` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let three = T::from(3.0).unwrap();
+        let six = T::from(6.0).unwrap();
+
+        unary_map(input, |x| {
+            let hard_sig = {
+                let v = (x + three) / six;
+                if v < zero {
+                    zero
+                } else if v > one {
+                    one
+                } else {
+                    v
+                }
+            };
+            x * hard_sig
+        })
+    }
+}
+
+impl Default for HardSwish {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(HardSwish);
+
+// ===========================================================================
+// Softplus
+// ===========================================================================
+
+/// Softplus activation:
+///
+/// `Softplus(x) = log(1 + exp(beta * x)) / beta`
+///
+/// A smooth approximation of ReLU. As `beta` increases, Softplus converges
+/// to ReLU.
+#[derive(Debug, Clone)]
+pub struct Softplus {
+    /// Sharpness parameter. Default: 1.0.
+    pub beta: f64,
+    /// Threshold above which the function reverts to a linear function
+    /// for numerical stability. Default: 20.0.
+    pub threshold: f64,
+    training: bool,
+}
+
+impl Softplus {
+    /// Create a new `Softplus` module with the given beta.
+    pub fn new(beta: f64) -> Self {
+        Self {
+            beta,
+            threshold: 20.0,
+            training: true,
+        }
+    }
+
+    /// Forward pass.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let one = <T as num_traits::One>::one();
+        let beta = T::from(self.beta).unwrap();
+        let threshold = T::from(self.threshold).unwrap();
+
+        unary_map(input, |x| {
+            let bx = beta * x;
+            if bx > threshold {
+                // For large values, softplus(x) ~ x to avoid overflow.
+                x
+            } else {
+                (one + (bx).exp()).ln() / beta
+            }
+        })
+    }
+}
+
+impl Default for Softplus {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl_activation_module!(Softplus);
+
+// ===========================================================================
+// GLU (Gated Linear Unit)
+// ===========================================================================
+
+/// Gated Linear Unit:
+///
+/// `GLU(x) = a * sigmoid(b)`
+///
+/// where `a` and `b` are the two halves of the input split along the last
+/// dimension. The input's last dimension must be even.
+///
+/// Reference: *Language Modeling with Gated Convolutional Networks* (Dauphin et al., 2017).
+#[derive(Debug, Clone)]
+pub struct GLU {
+    training: bool,
+}
+
+impl GLU {
+    /// Create a new `GLU` module.
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    /// Forward pass.
+    ///
+    /// Splits the input along the last dimension into two equal halves,
+    /// then computes `first_half * sigmoid(second_half)`.
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let shape = input.shape();
+        let ndim = shape.len();
+        if ndim == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "GLU requires at least 1D input".to_string(),
+            });
+        }
+
+        let last_dim = shape[ndim - 1];
+        if last_dim % 2 != 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "GLU requires the last dimension to be even, got {}",
+                    last_dim
+                ),
+            });
+        }
+
+        let half = last_dim / 2;
+        let data = input.data()?;
+
+        // Compute the stride of the last dimension (number of elements per
+        // "row" in the last dimension).
+        let outer_size: usize = shape[..ndim - 1].iter().product();
+        let outer_size = if outer_size == 0 { 1 } else { outer_size };
+
+        let one = <T as num_traits::One>::one();
+
+        let mut result = Vec::with_capacity(outer_size * half);
+        for i in 0..outer_size {
+            let base = i * last_dim;
+            for j in 0..half {
+                let a = data[base + j];
+                let b = data[base + half + j];
+                let sig_b = one / (one + (-b).exp());
+                result.push(a * sig_b);
+            }
+        }
+
+        let mut out_shape = shape.to_vec();
+        out_shape[ndim - 1] = half;
+
+        Tensor::from_storage(
+            ferrotorch_core::TensorStorage::cpu(result),
+            out_shape,
+            false,
+        )
+    }
+}
+
+impl Default for GLU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(GLU);
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrotorch_core::TensorStorage;
+
+    /// Helper: 1-D tensor from a slice (no grad).
+    fn t(data: &[f64]) -> Tensor<f64> {
+        Tensor::from_storage(TensorStorage::cpu(data.to_vec()), vec![data.len()], false).unwrap()
+    }
+
+    /// Helper: 2-D tensor (no grad).
+    fn t2d(data: &[f64], rows: usize, cols: usize) -> Tensor<f64> {
+        Tensor::from_storage(TensorStorage::cpu(data.to_vec()), vec![rows, cols], false).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Module trait compliance helpers
+    // -----------------------------------------------------------------------
+
+    /// Verify that a module has zero parameters and responds to train/eval.
+    fn assert_zero_param_module<M, T: Float>(module: &mut M)
+    where
+        M: Module<T>,
+    {
+        assert!(module.parameters().is_empty(), "should have no parameters");
+        assert!(
+            module.parameters_mut().is_empty(),
+            "should have no mutable parameters"
+        );
+        assert!(
+            module.named_parameters().is_empty(),
+            "should have no named parameters"
+        );
+        assert!(module.is_training(), "default should be training mode");
+        module.eval();
+        assert!(!module.is_training(), "eval() should set training=false");
+        module.train();
+        assert!(module.is_training(), "train() should set training=true");
+    }
+
+    // -----------------------------------------------------------------------
+    // ReLU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_relu_forward() {
+        let m = ReLU::new();
+        let x = t(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] - 0.0).abs() < 1e-7);
+        assert!((d[1] - 0.0).abs() < 1e-7);
+        assert!((d[2] - 0.0).abs() < 1e-7);
+        assert!((d[3] - 1.0).abs() < 1e-7);
+        assert!((d[4] - 2.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_relu_module_trait() {
+        let mut m = ReLU::new();
+        assert_zero_param_module::<ReLU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // GELU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gelu_forward() {
+        let m = GELU::new();
+        // gelu(0) = 0
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        assert!(y.data().unwrap()[0].abs() < 1e-7);
+
+        // gelu(x) > 0 for x > 0
+        let x = t(&[1.0, 2.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!(d[0] > 0.0);
+        assert!(d[1] > 0.0);
+
+        // gelu(x) is close to x for large positive x
+        let x = t(&[10.0]);
+        let y = m.forward(&x).unwrap();
+        assert!((y.data().unwrap()[0] - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gelu_module_trait() {
+        let mut m = GELU::new();
+        assert_zero_param_module::<GELU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // SiLU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_silu_forward() {
+        let m = SiLU::new();
+        // silu(0) = 0 * sigmoid(0) = 0
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        assert!(y.data().unwrap()[0].abs() < 1e-7);
+
+        // silu(x) = x * sigmoid(x); for large x, sigmoid(x) -> 1 so silu(x) -> x
+        let x = t(&[10.0]);
+        let y = m.forward(&x).unwrap();
+        assert!((y.data().unwrap()[0] - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_silu_module_trait() {
+        let mut m = SiLU::new();
+        assert_zero_param_module::<SiLU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sigmoid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sigmoid_forward() {
+        let m = Sigmoid::new();
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        assert!((y.data().unwrap()[0] - 0.5).abs() < 1e-7);
+
+        let x = t(&[-100.0, 100.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!(d[0] < 1e-10, "sigmoid(-100) should be ~0");
+        assert!((d[1] - 1.0).abs() < 1e-10, "sigmoid(100) should be ~1");
+    }
+
+    #[test]
+    fn test_sigmoid_module_trait() {
+        let mut m = Sigmoid::new();
+        assert_zero_param_module::<Sigmoid, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tanh
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tanh_forward() {
+        let m = Tanh::new();
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        assert!(y.data().unwrap()[0].abs() < 1e-7);
+
+        let x = t(&[-100.0, 100.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] + 1.0).abs() < 1e-10, "tanh(-100) should be ~-1");
+        assert!((d[1] - 1.0).abs() < 1e-10, "tanh(100) should be ~1");
+    }
+
+    #[test]
+    fn test_tanh_module_trait() {
+        let mut m = Tanh::new();
+        assert_zero_param_module::<Tanh, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Softmax
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_softmax_forward_1d() {
+        let m = Softmax::new(-1);
+        let x = t(&[1.0, 2.0, 3.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        // Sum should be 1.
+        let total: f64 = d.iter().sum();
+        assert!((total - 1.0).abs() < 1e-7);
+
+        // Monotonicity.
+        assert!(d[0] < d[1]);
+        assert!(d[1] < d[2]);
+    }
+
+    #[test]
+    fn test_softmax_forward_2d() {
+        let m = Softmax::new(-1);
+        // [[1, 2], [3, 4]]
+        let x = t2d(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        // Each row should sum to 1.
+        let row0_sum = d[0] + d[1];
+        let row1_sum = d[2] + d[3];
+        assert!((row0_sum - 1.0).abs() < 1e-7);
+        assert!((row1_sum - 1.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_softmax_wrong_dim() {
+        let m = Softmax::new(0);
+        let x = t2d(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        // dim=0 is not the last axis for a 2-D tensor, should error.
+        assert!(m.forward(&x).is_err());
+    }
+
+    #[test]
+    fn test_softmax_module_trait() {
+        let mut m = Softmax::new(-1);
+        assert_zero_param_module::<Softmax, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // LogSoftmax
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_softmax_forward_1d() {
+        let m = LogSoftmax::new(-1);
+        let x = t(&[1.0, 2.0, 3.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        // exp(log_softmax) should sum to 1.
+        let total: f64 = d.iter().map(|&v| v.exp()).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-7,
+            "exp(log_softmax) sum = {total}"
+        );
+
+        // All log-probabilities should be negative.
+        assert!(d.iter().all(|&v| v <= 0.0));
+    }
+
+    #[test]
+    fn test_log_softmax_module_trait() {
+        let mut m = LogSoftmax::new(-1);
+        assert_zero_param_module::<LogSoftmax, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // LeakyReLU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_leaky_relu_forward() {
+        let m = LeakyReLU::new(0.01);
+        let x = t(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        assert!((d[0] - (-0.02)).abs() < 1e-7, "LeakyReLU(-2) = {}", d[0]);
+        assert!((d[1] - (-0.01)).abs() < 1e-7, "LeakyReLU(-1) = {}", d[1]);
+        assert!((d[2] - 0.0).abs() < 1e-7, "LeakyReLU(0) = {}", d[2]);
+        assert!((d[3] - 1.0).abs() < 1e-7, "LeakyReLU(1) = {}", d[3]);
+        assert!((d[4] - 2.0).abs() < 1e-7, "LeakyReLU(2) = {}", d[4]);
+    }
+
+    #[test]
+    fn test_leaky_relu_large_slope() {
+        let m = LeakyReLU::new(0.2);
+        let x = t(&[-5.0, 3.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        assert!((d[0] - (-1.0)).abs() < 1e-7, "LeakyReLU(-5, slope=0.2) = {}", d[0]);
+        assert!((d[1] - 3.0).abs() < 1e-7, "LeakyReLU(3, slope=0.2) = {}", d[1]);
+    }
+
+    #[test]
+    fn test_leaky_relu_zero_slope_is_relu() {
+        let m = LeakyReLU::new(0.0);
+        let x = t(&[-2.0, 0.0, 3.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        assert!((d[0] - 0.0).abs() < 1e-7);
+        assert!((d[1] - 0.0).abs() < 1e-7);
+        assert!((d[2] - 3.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_leaky_relu_module_trait() {
+        let mut m = LeakyReLU::new(0.01);
+        assert_zero_param_module::<LeakyReLU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // ELU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_elu_forward() {
+        let m = ELU::new(1.0);
+        let x = t(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        // For x > 0, ELU(x) = x.
+        assert!((d[3] - 1.0).abs() < 1e-7);
+        assert!((d[4] - 2.0).abs() < 1e-7);
+
+        // For x = 0, ELU(0) = 0.
+        assert!((d[2] - 0.0).abs() < 1e-7);
+
+        // For x < 0, ELU(x) = alpha * (exp(x) - 1) < 0.
+        let expected_m1 = 1.0 * ((-1.0_f64).exp() - 1.0);
+        assert!(
+            (d[1] - expected_m1).abs() < 1e-7,
+            "ELU(-1) expected {}, got {}",
+            expected_m1,
+            d[1]
+        );
+
+        let expected_m2 = 1.0 * ((-2.0_f64).exp() - 1.0);
+        assert!(
+            (d[0] - expected_m2).abs() < 1e-7,
+            "ELU(-2) expected {}, got {}",
+            expected_m2,
+            d[0]
+        );
+
+        // ELU approaches -alpha from below for very negative x.
+        let x = t(&[-100.0]);
+        let y = m.forward(&x).unwrap();
+        assert!((y.data().unwrap()[0] + 1.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_elu_custom_alpha() {
+        let m = ELU::new(2.0);
+        let x = t(&[-1.0, 1.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        let expected = 2.0 * ((-1.0_f64).exp() - 1.0);
+        assert!((d[0] - expected).abs() < 1e-7);
+        assert!((d[1] - 1.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_elu_module_trait() {
+        let mut m = ELU::new(1.0);
+        assert_zero_param_module::<ELU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mish
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mish_forward() {
+        let m = Mish::new();
+        // mish(0) = 0 * tanh(softplus(0)) = 0 * tanh(ln(2)) = 0
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        assert!(y.data().unwrap()[0].abs() < 1e-7, "mish(0) should be 0");
+
+        // For large positive x, mish(x) -> x (softplus(x) -> x, tanh(x) -> 1).
+        let x = t(&[20.0]);
+        let y = m.forward(&x).unwrap();
+        assert!(
+            (y.data().unwrap()[0] - 20.0).abs() < 0.01,
+            "mish(20) should be ~20"
+        );
+
+        // mish is slightly negative for negative inputs.
+        let x = t(&[-1.0]);
+        let y = m.forward(&x).unwrap();
+        let val = y.data().unwrap()[0];
+        let softplus = (1.0 + (-1.0_f64).exp()).ln();
+        let expected = -1.0 * softplus.tanh();
+        assert!(
+            (val - expected).abs() < 1e-7,
+            "mish(-1) expected {}, got {}",
+            expected,
+            val
+        );
+    }
+
+    #[test]
+    fn test_mish_module_trait() {
+        let mut m = Mish::new();
+        assert_zero_param_module::<Mish, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default constructors
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // PReLU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prelu_forward_default() {
+        let m = PReLU::<f64>::new(0.25).unwrap();
+        let x = t(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        // For x > 0: output = x. For x < 0: output = 0.25 * x.
+        assert!((d[0] - (-0.5)).abs() < 1e-6, "PReLU(-2) = {}", d[0]);
+        assert!((d[1] - (-0.25)).abs() < 1e-6, "PReLU(-1) = {}", d[1]);
+        assert!((d[2] - 0.0).abs() < 1e-6, "PReLU(0) = {}", d[2]);
+        assert!((d[3] - 1.0).abs() < 1e-6, "PReLU(1) = {}", d[3]);
+        assert!((d[4] - 2.0).abs() < 1e-6, "PReLU(2) = {}", d[4]);
+    }
+
+    #[test]
+    fn test_prelu_has_parameter() {
+        let m = PReLU::<f64>::new(0.25).unwrap();
+        assert_eq!(m.parameters().len(), 1, "PReLU should have 1 parameter");
+        let named = m.named_parameters();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].0, "alpha");
+    }
+
+    #[test]
+    fn test_prelu_module_trait() {
+        let mut m = PReLU::<f64>::new(0.25).unwrap();
+        assert_eq!(m.parameters().len(), 1);
+        assert!(m.is_training());
+        m.eval();
+        assert!(!m.is_training());
+        m.train();
+        assert!(m.is_training());
+    }
+
+    // -----------------------------------------------------------------------
+    // CELU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_celu_forward() {
+        let m = CELU::new(1.0);
+        let x = t(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        // For x > 0: CELU(x) = x
+        assert!((d[3] - 1.0).abs() < 1e-7);
+        assert!((d[4] - 2.0).abs() < 1e-7);
+        assert!((d[2] - 0.0).abs() < 1e-7);
+
+        // For x < 0: CELU(x) = alpha * (exp(x/alpha) - 1)
+        let expected_m1 = 1.0 * ((-1.0_f64).exp() - 1.0);
+        assert!((d[1] - expected_m1).abs() < 1e-7, "CELU(-1) = {}", d[1]);
+    }
+
+    #[test]
+    fn test_celu_module_trait() {
+        let mut m = CELU::new(1.0);
+        assert_zero_param_module::<CELU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // SELU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_selu_forward() {
+        let m = SELU::new();
+        let x = t(&[-1.0, 0.0, 1.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+
+        // For x > 0: SELU(x) = lambda * x
+        let lambda = 1.0507009873554805_f64;
+        let alpha = 1.6732632423543772_f64;
+        assert!((d[2] - lambda * 1.0).abs() < 1e-7, "SELU(1) = {}", d[2]);
+        assert!((d[1] - 0.0).abs() < 1e-7, "SELU(0) = {}", d[1]);
+
+        // For x < 0: SELU(x) = lambda * alpha * (exp(x) - 1)
+        let expected_m1 = lambda * alpha * ((-1.0_f64).exp() - 1.0);
+        assert!((d[0] - expected_m1).abs() < 1e-7, "SELU(-1) = {}", d[0]);
+    }
+
+    #[test]
+    fn test_selu_module_trait() {
+        let mut m = SELU::new();
+        assert_zero_param_module::<SELU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // HardSigmoid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hard_sigmoid_forward() {
+        let m = HardSigmoid::new();
+        // clamp((x+3)/6, 0, 1)
+        // x = -4: (−4+3)/6 = −1/6 < 0 -> 0
+        // x = -3: (-3+3)/6 = 0
+        // x = 0: (0+3)/6 = 0.5
+        // x = 3: (3+3)/6 = 1.0
+        // x = 5: (5+3)/6 > 1 -> 1
+        let x = t(&[-4.0, -3.0, 0.0, 3.0, 5.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] - 0.0).abs() < 1e-7, "HardSigmoid(-4) = {}", d[0]);
+        assert!((d[1] - 0.0).abs() < 1e-7, "HardSigmoid(-3) = {}", d[1]);
+        assert!((d[2] - 0.5).abs() < 1e-7, "HardSigmoid(0) = {}", d[2]);
+        assert!((d[3] - 1.0).abs() < 1e-7, "HardSigmoid(3) = {}", d[3]);
+        assert!((d[4] - 1.0).abs() < 1e-7, "HardSigmoid(5) = {}", d[4]);
+    }
+
+    #[test]
+    fn test_hard_sigmoid_module_trait() {
+        let mut m = HardSigmoid::new();
+        assert_zero_param_module::<HardSigmoid, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // HardSwish
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hard_swish_forward() {
+        let m = HardSwish::new();
+        // HardSwish(x) = x * clamp((x+3)/6, 0, 1)
+        // x = -4: -4 * 0 = 0
+        // x = 0: 0 * 0.5 = 0
+        // x = 3: 3 * 1.0 = 3
+        // x = 5: 5 * 1.0 = 5
+        // x = -1: -1 * ((-1+3)/6) = -1 * (1/3) = -1/3
+        let x = t(&[-4.0, 0.0, 3.0, 5.0, -1.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] - 0.0).abs() < 1e-7, "HardSwish(-4) = {}", d[0]);
+        assert!((d[1] - 0.0).abs() < 1e-7, "HardSwish(0) = {}", d[1]);
+        assert!((d[2] - 3.0).abs() < 1e-7, "HardSwish(3) = {}", d[2]);
+        assert!((d[3] - 5.0).abs() < 1e-7, "HardSwish(5) = {}", d[3]);
+        assert!((d[4] - (-1.0 / 3.0)).abs() < 1e-7, "HardSwish(-1) = {}", d[4]);
+    }
+
+    #[test]
+    fn test_hard_swish_module_trait() {
+        let mut m = HardSwish::new();
+        assert_zero_param_module::<HardSwish, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Softplus
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_softplus_forward() {
+        let m = Softplus::new(1.0);
+        // softplus(0) = ln(1 + 1) = ln(2)
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] - 2.0_f64.ln()).abs() < 1e-7, "Softplus(0) = {}", d[0]);
+
+        // For large x, softplus(x) -> x (threshold mode).
+        let x = t(&[25.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] - 25.0).abs() < 1e-5, "Softplus(25) = {}", d[0]);
+
+        // softplus(1) = ln(1 + e) ~ 1.3133
+        let x = t(&[1.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        let expected = (1.0 + 1.0_f64.exp()).ln();
+        assert!((d[0] - expected).abs() < 1e-7, "Softplus(1) = {}", d[0]);
+    }
+
+    #[test]
+    fn test_softplus_custom_beta() {
+        let m = Softplus::new(2.0);
+        // softplus(x, beta=2) = ln(1 + exp(2*x)) / 2
+        let x = t(&[0.0]);
+        let y = m.forward(&x).unwrap();
+        let d = y.data().unwrap();
+        let expected = 2.0_f64.ln() / 2.0;
+        assert!((d[0] - expected).abs() < 1e-7, "Softplus(0, beta=2) = {}", d[0]);
+    }
+
+    #[test]
+    fn test_softplus_module_trait() {
+        let mut m = Softplus::new(1.0);
+        assert_zero_param_module::<Softplus, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // GLU
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_glu_forward_1d() {
+        let m = GLU::new();
+        // input = [1.0, 0.0, 2.0, 0.0]  (last dim = 4, split into [1,0] and [2,0])
+        // a = [1.0, 0.0], b = [2.0, 0.0]
+        // output = a * sigmoid(b) = [1.0 * sigmoid(2.0), 0.0 * sigmoid(0.0)]
+        let x = t(&[1.0, 0.0, 2.0, 0.0]);
+        let y = m.forward(&x).unwrap();
+        assert_eq!(y.shape(), &[2]);
+        let d = y.data().unwrap();
+        let sig_2 = 1.0 / (1.0 + (-2.0_f64).exp());
+        assert!((d[0] - sig_2).abs() < 1e-7, "GLU[0] = {}", d[0]);
+        assert!((d[1] - 0.0).abs() < 1e-7, "GLU[1] = {}", d[1]);
+    }
+
+    #[test]
+    fn test_glu_forward_2d() {
+        let m = GLU::new();
+        // [[1.0, 0.0, 2.0, 0.0]] -> shape [1, 4], splits last dim
+        let x = t2d(&[1.0, 0.0, 2.0, 0.0], 1, 4);
+        let y = m.forward(&x).unwrap();
+        assert_eq!(y.shape(), &[1, 2]);
+        let d = y.data().unwrap();
+        let sig_2 = 1.0 / (1.0 + (-2.0_f64).exp());
+        assert!((d[0] - sig_2).abs() < 1e-7);
+        assert!((d[1] - 0.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_glu_odd_dim_error() {
+        let m = GLU::new();
+        let x = t(&[1.0, 2.0, 3.0]); // last dim = 3 (odd)
+        assert!(m.forward(&x).is_err());
+    }
+
+    #[test]
+    fn test_glu_module_trait() {
+        let mut m = GLU::new();
+        assert_zero_param_module::<GLU, f64>(&mut m);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default constructors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_defaults() {
+        let _relu = ReLU::default();
+        let _gelu = GELU::default();
+        let _silu = SiLU::default();
+        let _sigmoid = Sigmoid::default();
+        let _tanh = Tanh::default();
+        let _softmax = Softmax::default();
+        let _log_softmax = LogSoftmax::default();
+
+        let lrelu = LeakyReLU::default();
+        assert!((lrelu.negative_slope - 0.01).abs() < f64::EPSILON);
+
+        let elu = ELU::default();
+        assert!((elu.alpha - 1.0).abs() < f64::EPSILON);
+
+        let _mish = Mish::default();
+
+        let celu = CELU::default();
+        assert!((celu.alpha - 1.0).abs() < f64::EPSILON);
+
+        let _selu = SELU::default();
+        let _hard_sigmoid = HardSigmoid::default();
+        let _hard_swish = HardSwish::default();
+
+        let softplus = Softplus::default();
+        assert!((softplus.beta - 1.0).abs() < f64::EPSILON);
+
+        let _glu = GLU::default();
+    }
+
+    // -----------------------------------------------------------------------
+    // Send + Sync
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ReLU>();
+        assert_send_sync::<GELU>();
+        assert_send_sync::<SiLU>();
+        assert_send_sync::<Sigmoid>();
+        assert_send_sync::<Tanh>();
+        assert_send_sync::<Softmax>();
+        assert_send_sync::<LogSoftmax>();
+        assert_send_sync::<LeakyReLU>();
+        assert_send_sync::<ELU>();
+        assert_send_sync::<Mish>();
+        assert_send_sync::<PReLU<f64>>();
+        assert_send_sync::<CELU>();
+        assert_send_sync::<SELU>();
+        assert_send_sync::<HardSigmoid>();
+        assert_send_sync::<HardSwish>();
+        assert_send_sync::<Softplus>();
+        assert_send_sync::<GLU>();
+    }
+
+    // -----------------------------------------------------------------------
+    // State dict round-trip (empty for all activations)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_dict_empty() {
+        let m = ReLU::new();
+        let sd = Module::<f64>::state_dict(&m);
+        assert!(sd.is_empty());
+    }
+}

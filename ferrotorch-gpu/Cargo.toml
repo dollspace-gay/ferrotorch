@@ -1,0 +1,18 @@
+[package]
+name = "ferrotorch-gpu"
+description = "CUDA GPU backend for ferrotorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+cudarc = { workspace = true, optional = true }
+num-traits = { workspace = true }
