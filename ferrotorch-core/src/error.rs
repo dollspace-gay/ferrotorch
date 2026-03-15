@@ -32,6 +32,12 @@ pub enum FerrotorchError {
     #[error("internal lock poisoned: {message}")]
     LockPoisoned { message: String },
 
+    #[error("no GPU backend available -- install ferrotorch-gpu and call init()")]
+    DeviceUnavailable,
+
+    #[error("cannot access GPU tensor data as CPU slice -- call .cpu() first")]
+    GpuTensorNotAccessible,
+
     #[error(transparent)]
     Ferray(#[from] ferray_core::FerrayError),
 }

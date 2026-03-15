@@ -6,6 +6,7 @@ pub mod dtype;
 pub mod einsum;
 pub mod error;
 pub mod fft;
+pub mod gpu_dispatch;
 pub mod grad_fns;
 pub mod linalg;
 pub mod ops;
