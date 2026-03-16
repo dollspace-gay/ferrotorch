@@ -93,6 +93,88 @@ def main():
         optimizer.step()
     results["cpu_train_step_b32"] = bench("training step B=32", training_step, iters=50)
 
+    # ========== New Benchmarks (Waves 1-5) ==========
+
+    # 7. Transcendental ops
+    print("\n--- Transcendental Ops ---")
+    t = torch.rand(1000, 1000)
+    results["cpu_exp_1000x1000"] = bench("exp [1000,1000]", lambda: torch.exp(t))
+    results["cpu_log_1000x1000"] = bench("log [1000,1000]", lambda: torch.log(t.abs() + 1e-6))
+    results["cpu_sin_1000x1000"] = bench("sin [1000,1000]", lambda: torch.sin(t))
+    results["cpu_cos_1000x1000"] = bench("cos [1000,1000]", lambda: torch.cos(t))
+    results["cpu_tanh_1000x1000"] = bench("tanh [1000,1000]", lambda: torch.tanh(t))
+
+    # 8. Reduction ops with axis
+    print("\n--- Reduction Ops (with axis) ---")
+    r = torch.rand(1000, 1000)
+    results["cpu_sum_all_1000x1000"] = bench("sum_all [1000,1000]", lambda: r.sum())
+    results["cpu_sum_dim0_1000x1000"] = bench("sum dim=0 [1000,1000]", lambda: r.sum(dim=0))
+    results["cpu_mean_dim1_1000x1000"] = bench("mean dim=1 [1000,1000]", lambda: r.mean(dim=1))
+
+    # 9. Tensor manipulation ops
+    print("\n--- Tensor Manipulation ---")
+    m = torch.rand(1000, 1000)
+    results["cpu_permute_1000x1000"] = bench("permute [1000,1000]", lambda: m.permute(1, 0).contiguous())
+    results["cpu_chunk_1000x1000"] = bench("chunk [1000,1000] into 4", lambda: m.chunk(4, dim=0))
+    chunks = m.chunk(4, dim=0)
+    results["cpu_cat_4x250x1000"] = bench("cat [4x 250,1000]", lambda: torch.cat(chunks, dim=0))
+
+    # 10. GRU forward pass
+    print("\n--- GRU Forward ---")
+    gru = nn.GRU(128, 256, batch_first=True)
+    x_gru = torch.rand(16, 32, 128)
+    results["cpu_gru_fwd"] = bench("GRU forward (128->256, seq=32, B=16)", lambda: gru(x_gru), iters=50)
+
+    # 11. Larger MLP (784->512->256->10, B=128)
+    print("\n--- Larger MLP (784->512->256->10, B=128) ---")
+    mlp_large = nn.Sequential(
+        nn.Linear(784, 512),
+        nn.ReLU(),
+        nn.Linear(512, 256),
+        nn.ReLU(),
+        nn.Linear(256, 10),
+    )
+    x_large = torch.rand(128, 784)
+    results["cpu_mlp_large_fwd_b128"] = bench("MLP forward B=128 (784->512->256->10)", lambda: mlp_large(x_large), iters=50)
+    def mlp_large_backward():
+        x = torch.rand(128, 784, requires_grad=True)
+        out = mlp_large(x)
+        loss = out.sum()
+        loss.backward()
+    results["cpu_mlp_large_bwd_b128"] = bench("MLP backward B=128", mlp_large_backward, iters=30)
+    opt_large = torch.optim.Adam(mlp_large.parameters())
+    loss_fn_large = nn.CrossEntropyLoss()
+    def training_step_large():
+        x = torch.rand(128, 784)
+        target = torch.randint(0, 10, (128,))
+        opt_large.zero_grad()
+        out = mlp_large(x)
+        loss = loss_fn_large(out, target)
+        loss.backward()
+        opt_large.step()
+    results["cpu_train_step_b128"] = bench("training step B=128", training_step_large, iters=30)
+
+    # 12. Conv2d forward
+    print("\n--- Conv2d Forward ---")
+    conv = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=0)
+    x_conv = torch.rand(32, 3, 32, 32)
+    results["cpu_conv2d_fwd"] = bench("Conv2d forward [32,3,32,32]->[32,16,30,30]", lambda: conv(x_conv), iters=50)
+
+    # 13. Broadcast operations
+    print("\n--- Broadcast Ops ---")
+    a_bc = torch.rand(1000, 1)
+    b_bc = torch.rand(1, 1000)
+    results["cpu_broadcast_add"] = bench("broadcast add [1000,1]+[1,1000]", lambda: a_bc + b_bc)
+    a_bc3 = torch.rand(64, 1, 256)
+    b_bc3 = torch.rand(1, 128, 1)
+    results["cpu_broadcast_mul"] = bench("broadcast mul [64,1,256]*[1,128,1]", lambda: a_bc3 * b_bc3)
+
+    # 14. Creation ops (like)
+    print("\n--- Creation Ops (like) ---")
+    tpl = torch.rand(1000, 1000)
+    results["cpu_zeros_like_1000x1000"] = bench("zeros_like [1000,1000]", lambda: torch.zeros_like(tpl))
+    results["cpu_randn_like_1000x1000"] = bench("randn_like [1000,1000]", lambda: torch.randn_like(tpl))
+
     # ========== GPU Benchmarks ==========
     if device_gpu:
         print("\n" + "=" * 60)
