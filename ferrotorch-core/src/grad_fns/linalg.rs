@@ -460,13 +460,17 @@ impl<T: Float> GradFn<T> for MatmulBackward<T> {
 
                 Ok(vec![grad_a, grad_b])
             }
-            _ => Err(crate::error::FerrotorchError::InvalidArgument {
-                message: format!(
-                    "MatmulBackward: unsupported shapes {:?} and {:?}",
-                    self.a.shape(),
-                    self.b.shape()
-                ),
-            }),
+            _ => {
+                // Batched broadcast matmul backward.
+                // For C = matmul(A, B) where shapes may broadcast:
+                //   dA = matmul(grad_C, B^T)  — then sum-reduce broadcast dims
+                //   dB = matmul(A^T, grad_C)  — then sum-reduce broadcast dims
+                //
+                // "Transpose" here means swapping the last two dims.
+                // After computing the full broadcast gradient, we sum over
+                // any dimensions that were broadcast (size-1 in original).
+                broadcast_matmul_backward(&self.a, &self.b, grad_output)
+            }
         }
     }
 
@@ -477,6 +481,124 @@ impl<T: Float> GradFn<T> for MatmulBackward<T> {
     fn name(&self) -> &'static str {
         "MatmulBackward"
     }
+}
+
+/// Backward pass for batched broadcast matmul.
+///
+/// Given forward: `C = matmul(A, B)` where A and B may have broadcast
+/// batch dimensions, computes:
+/// - `grad_A = matmul(grad_C, B_transposed)` summed over broadcast dims
+/// - `grad_B = matmul(A_transposed, grad_C)` summed over broadcast dims
+fn broadcast_matmul_backward<T: Float>(
+    a: &Tensor<T>,
+    b: &Tensor<T>,
+    grad_output: &Tensor<T>,
+) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+    // Transpose last two dims of a tensor (swap matrix dims in batched tensor).
+    let swap_last_two = |t: &Tensor<T>| -> FerrotorchResult<Tensor<T>> {
+        let shape = t.shape();
+        let nd = shape.len();
+        if nd < 2 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "Cannot transpose last two dims of tensor with ndim < 2".into(),
+            });
+        }
+        let data = t.data()?;
+        let rows = shape[nd - 2];
+        let cols = shape[nd - 1];
+        let mat_size = rows * cols;
+        let n_mats: usize = shape[..nd - 2].iter().product::<usize>().max(1);
+        let mut out = vec![<T as num_traits::Zero>::zero(); data.len()];
+        for m in 0..n_mats {
+            let off = m * mat_size;
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[off + j * rows + i] = data[off + i * cols + j];
+                }
+            }
+        }
+        let mut out_shape = shape.to_vec();
+        out_shape[nd - 2] = cols;
+        out_shape[nd - 1] = rows;
+        Tensor::from_storage(TensorStorage::cpu(out), out_shape, false)
+    };
+
+    // Sum-reduce grad to match the original shape. This handles the case
+    // where a dimension was size-1 (broadcast) in the original but expanded
+    // in the gradient. We need to sum over those expanded dimensions.
+    let reduce_to_shape = |grad: Tensor<T>, target: &[usize]| -> FerrotorchResult<Tensor<T>> {
+        let grad_shape = grad.shape().to_vec();
+        if grad_shape == target {
+            return Ok(grad);
+        }
+
+        let grad_nd = grad_shape.len();
+        let target_nd = target.len();
+        let offset = grad_nd - target_nd;
+        let grad_data = grad.data()?;
+
+        // Compute target total size.
+        let target_size: usize = target.iter().product::<usize>().max(1);
+        let mut result = vec![<T as num_traits::Zero>::zero(); target_size];
+
+        let grad_total: usize = grad_shape.iter().product::<usize>().max(1);
+
+        // For each element in the gradient, compute which element in the
+        // target it maps to, and accumulate.
+        // Build stride tables for both shapes.
+        let mut grad_strides = vec![1usize; grad_nd];
+        for i in (0..grad_nd.saturating_sub(1)).rev() {
+            grad_strides[i] = grad_strides[i + 1] * grad_shape[i + 1];
+        }
+
+        let mut target_strides = vec![1usize; target_nd];
+        if target_nd > 0 {
+            for i in (0..target_nd.saturating_sub(1)).rev() {
+                target_strides[i] = target_strides[i + 1] * target[i + 1];
+            }
+        }
+
+        for flat in 0..grad_total {
+            // Decompose flat index into grad multi-index.
+            let mut remaining = flat;
+            let mut target_flat = 0usize;
+            for d in (0..grad_nd).rev() {
+                let coord = remaining % grad_shape[d];
+                remaining /= grad_shape[d];
+
+                // Map to target dimension.
+                if d >= offset {
+                    let td = d - offset;
+                    let target_coord = if target[td] == 1 { 0 } else { coord };
+                    target_flat += target_coord * target_strides[td];
+                }
+                // If d < offset, this dimension doesn't exist in target — summed out.
+            }
+            result[target_flat] = result[target_flat] + grad_data[flat];
+        }
+
+        Tensor::from_storage(TensorStorage::cpu(result), target.to_vec(), false)
+    };
+
+    let grad_a = if a.requires_grad() {
+        // grad_A = matmul(grad_C, B^T) reduced to A's shape.
+        let bt = swap_last_two(b)?;
+        let full_grad = linalg::matmul(grad_output, &bt)?;
+        Some(reduce_to_shape(full_grad, a.shape())?)
+    } else {
+        None
+    };
+
+    let grad_b = if b.requires_grad() {
+        // grad_B = matmul(A^T, grad_C) reduced to B's shape.
+        let at = swap_last_two(a)?;
+        let full_grad = linalg::matmul(&at, grad_output)?;
+        Some(reduce_to_shape(full_grad, b.shape())?)
+    } else {
+        None
+    };
+
+    Ok(vec![grad_a, grad_b])
 }
 
 // ---------------------------------------------------------------------------
@@ -978,7 +1100,8 @@ pub fn bmm_differentiable<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchR
 }
 
 /// Differentiable general matmul dispatcher. Attaches `MatmulBackward`
-/// when needed.
+/// when needed. Supports all rank combinations including batched broadcast
+/// matmul for ≥3D tensors.
 pub fn matmul_differentiable<T: Float>(
     a: &Tensor<T>,
     b: &Tensor<T>,
@@ -1537,6 +1660,188 @@ mod tests {
 
         // Should have no grad_fn because we were inside no_grad.
         assert!(s.grad_fn().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // broadcast matmul backward
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matmul_backward_3d_3d_numerical() {
+        // Numerical gradient check for (2,2,3) @ (2,3,2).
+        let eps = 1e-3f32;
+
+        let a_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 + 0.1).collect();
+        let b_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 + 0.5).collect();
+
+        // Forward + backward.
+        let a = leaf(&a_data, &[2, 2, 3]);
+        let b = leaf(&b_data, &[2, 3, 2]);
+        let c = matmul_differentiable(&a, &b).unwrap();
+        let loss = crate::grad_fns::reduction::sum(&c).unwrap();
+        loss.backward().unwrap();
+
+        let analytic_a = a.grad().unwrap().unwrap().data().unwrap().to_vec();
+        let analytic_b = b.grad().unwrap().unwrap().data().unwrap().to_vec();
+
+        // Check each element of A numerically.
+        for idx in 0..a_data.len() {
+            let mut a_plus = a_data.clone();
+            a_plus[idx] += eps;
+            let mut a_minus = a_data.clone();
+            a_minus[idx] -= eps;
+
+            let loss_plus = crate::autograd::no_grad::no_grad(|| {
+                let ap = no_grad_leaf(&a_plus, &[2, 2, 3]);
+                let bp = no_grad_leaf(&b_data, &[2, 3, 2]);
+                let c = linalg::matmul(&ap, &bp).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+            let loss_minus = crate::autograd::no_grad::no_grad(|| {
+                let am = no_grad_leaf(&a_minus, &[2, 2, 3]);
+                let bm = no_grad_leaf(&b_data, &[2, 3, 2]);
+                let c = linalg::matmul(&am, &bm).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            assert!(
+                (numerical - analytic_a[idx]).abs() < 5e-2,
+                "grad_a[{idx}]: numerical={numerical}, analytic={}, diff={}",
+                analytic_a[idx],
+                (numerical - analytic_a[idx]).abs()
+            );
+        }
+
+        // Check each element of B numerically.
+        for idx in 0..b_data.len() {
+            let mut b_plus = b_data.clone();
+            b_plus[idx] += eps;
+            let mut b_minus = b_data.clone();
+            b_minus[idx] -= eps;
+
+            let loss_plus = crate::autograd::no_grad::no_grad(|| {
+                let ap = no_grad_leaf(&a_data, &[2, 2, 3]);
+                let bp = no_grad_leaf(&b_plus, &[2, 3, 2]);
+                let c = linalg::matmul(&ap, &bp).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+            let loss_minus = crate::autograd::no_grad::no_grad(|| {
+                let am = no_grad_leaf(&a_data, &[2, 2, 3]);
+                let bm = no_grad_leaf(&b_minus, &[2, 3, 2]);
+                let c = linalg::matmul(&am, &bm).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            assert!(
+                (numerical - analytic_b[idx]).abs() < 5e-2,
+                "grad_b[{idx}]: numerical={numerical}, analytic={}, diff={}",
+                analytic_b[idx],
+                (numerical - analytic_b[idx]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_backward_3d_2d_broadcast_numerical() {
+        // (2,3,4) @ (4,2) — B broadcasts over batch dim.
+        // Gradient for B must sum over the batch dimension.
+        let eps = 1e-4f32;
+
+        let a_data: Vec<f32> = (0..24).map(|i| (i as f32) * 0.05 + 0.1).collect();
+        let b_data: Vec<f32> = (0..8).map(|i| (i as f32) * 0.1 + 0.2).collect();
+
+        let a = leaf(&a_data, &[2, 3, 4]);
+        let b = leaf(&b_data, &[4, 2]);
+        let c = matmul_differentiable(&a, &b).unwrap();
+        let loss = crate::grad_fns::reduction::sum(&c).unwrap();
+        loss.backward().unwrap();
+
+        let analytic_a = a.grad().unwrap().unwrap().data().unwrap().to_vec();
+        let analytic_b = b.grad().unwrap().unwrap().data().unwrap().to_vec();
+
+        // Grad shapes should match input shapes.
+        assert_eq!(a.grad().unwrap().unwrap().shape(), &[2, 3, 4]);
+        assert_eq!(b.grad().unwrap().unwrap().shape(), &[4, 2]);
+
+        // Numerical check for B (the broadcast operand — most important).
+        for idx in 0..b_data.len() {
+            let mut b_plus = b_data.clone();
+            b_plus[idx] += eps;
+            let mut b_minus = b_data.clone();
+            b_minus[idx] -= eps;
+
+            let loss_plus = crate::autograd::no_grad::no_grad(|| {
+                let ap = no_grad_leaf(&a_data, &[2, 3, 4]);
+                let bp = no_grad_leaf(&b_plus, &[4, 2]);
+                let c = linalg::matmul(&ap, &bp).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+            let loss_minus = crate::autograd::no_grad::no_grad(|| {
+                let am = no_grad_leaf(&a_data, &[2, 3, 4]);
+                let bm = no_grad_leaf(&b_minus, &[4, 2]);
+                let c = linalg::matmul(&am, &bm).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            assert!(
+                (numerical - analytic_b[idx]).abs() < 1e-2,
+                "grad_b[{idx}]: numerical={numerical}, analytic={}, diff={}",
+                analytic_b[idx],
+                (numerical - analytic_b[idx]).abs()
+            );
+        }
+
+        // Spot-check A gradient too.
+        for idx in 0..4 {
+            let mut a_plus = a_data.clone();
+            a_plus[idx] += eps;
+            let mut a_minus = a_data.clone();
+            a_minus[idx] -= eps;
+
+            let loss_plus = crate::autograd::no_grad::no_grad(|| {
+                let ap = no_grad_leaf(&a_plus, &[2, 3, 4]);
+                let bp = no_grad_leaf(&b_data, &[4, 2]);
+                let c = linalg::matmul(&ap, &bp).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+            let loss_minus = crate::autograd::no_grad::no_grad(|| {
+                let am = no_grad_leaf(&a_minus, &[2, 3, 4]);
+                let bm = no_grad_leaf(&b_data, &[4, 2]);
+                let c = linalg::matmul(&am, &bm).unwrap();
+                crate::grad_fns::reduction::sum(&c).unwrap().item().unwrap()
+            });
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            assert!(
+                (numerical - analytic_a[idx]).abs() < 1e-2,
+                "grad_a[{idx}]: numerical={numerical}, analytic={}, diff={}",
+                analytic_a[idx],
+                (numerical - analytic_a[idx]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_backward_batch_broadcast_1_vs_n() {
+        // (1,2,3) @ (2,3,2) — batch dim 1 broadcasts to 2.
+        // grad_a must sum over the broadcast batch dimension.
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data: Vec<f32> = (0..12).map(|i| (i as f32) + 1.0).collect();
+
+        let a = leaf(&a_data, &[1, 2, 3]);
+        let b = leaf(&b_data, &[2, 3, 2]);
+        let c = matmul_differentiable(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 2, 2]);
+
+        let loss = crate::grad_fns::reduction::sum(&c).unwrap();
+        loss.backward().unwrap();
+
+        // Grad shapes must match original shapes, not broadcast shapes.
+        assert_eq!(a.grad().unwrap().unwrap().shape(), &[1, 2, 3]);
+        assert_eq!(b.grad().unwrap().unwrap().shape(), &[2, 3, 2]);
     }
 }
 

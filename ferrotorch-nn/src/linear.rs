@@ -15,6 +15,7 @@
 //! - `grad_input` is accumulated through `MmBackward`
 
 use ferrotorch_core::grad_fns::linalg::linear_fused;
+use ferrotorch_core::grad_fns::shape::reshape;
 use ferrotorch_core::{Float, FerrotorchError, FerrotorchResult, Tensor};
 
 use crate::init::{kaiming_uniform, NonLinearity};
@@ -118,47 +119,69 @@ impl<T: Float> Module<T> for Linear<T> {
     ///
     /// # Input shape
     ///
+    /// Accepts any input with shape `(*batch, in_features)`:
+    /// - 1D: `[in_features]` — single sample, no batch dim.
     /// - 2D: `[batch, in_features]` — standard batched forward.
+    /// - 3D: `[batch, seq_len, in_features]` — e.g. transformer inputs.
+    /// - ND: `[d0, d1, ..., in_features]` — arbitrary leading dimensions.
     ///
     /// # Output shape
     ///
-    /// - 2D input: `[batch, out_features]`.
+    /// - `(*batch, out_features)` — same leading dimensions as input.
     ///
     /// # Autograd
     ///
     /// When gradient tracking is enabled, the returned tensor participates
     /// in the computation graph through the composed differentiable
-    /// operations (`mm_differentiable` + `add`). Calling `.backward()` on
-    /// a downstream scalar loss will propagate gradients to `weight` and
-    /// `bias` automatically.
+    /// operations (`mm_differentiable` + `add` + `reshape`). Calling
+    /// `.backward()` on a downstream scalar loss will propagate gradients
+    /// to `weight` and `bias` automatically.
     fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-        // Validate input shape.
-        if input.ndim() != 2 {
+        if input.ndim() == 0 {
             return Err(FerrotorchError::ShapeMismatch {
-                message: format!(
-                    "Linear expects 2D input [batch, in_features], got shape {:?}",
-                    input.shape()
-                ),
+                message: "Linear: scalar input not supported".into(),
             });
         }
 
-        if input.shape()[1] != self.in_features {
+        // Validate the last dimension is in_features.
+        let last_dim = input.shape()[input.ndim() - 1];
+        if last_dim != self.in_features {
             return Err(FerrotorchError::ShapeMismatch {
                 message: format!(
                     "Linear: input has {} features but layer expects {}",
-                    input.shape()[1],
-                    self.in_features
+                    last_dim, self.in_features
                 ),
             });
         }
 
+        // For inputs with ndim != 2, flatten leading dims to get [N, in_features],
+        // apply the fused linear transform, then reshape back to (*batch, out_features).
+        let input_shape = input.shape().to_vec();
+        let batch_shape = &input_shape[..input_shape.len() - 1];
+        let n: usize = batch_shape.iter().product::<usize>().max(1);
+        let needs_reshape = input.ndim() != 2;
+
+        let input_2d = if needs_reshape {
+            reshape(input, &[n as isize, self.in_features as isize])?
+        } else {
+            input.clone()
+        };
+
         // Fused linear: input @ weight^T + bias in a single operation.
-        // Creates one tensor instead of three (mm_bt result, reshaped bias, add result).
-        linear_fused(
-            input,
+        let output_2d = linear_fused(
+            &input_2d,
             self.weight.tensor(),
             self.bias.as_ref().map(|b| b.tensor()),
-        )
+        )?;
+
+        // Reshape back to (*batch, out_features).
+        if needs_reshape {
+            let mut out_shape: Vec<isize> = batch_shape.iter().map(|&d| d as isize).collect();
+            out_shape.push(self.out_features as isize);
+            reshape(&output_2d, &out_shape)
+        } else {
+            Ok(output_2d)
+        }
     }
 
     fn parameters(&self) -> Vec<&Parameter<T>> {
@@ -317,10 +340,65 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_1d_input_rejected() {
+    fn test_forward_1d_input_accepted() {
+        // PyTorch accepts 1D input: (in_features,) -> (out_features,).
+        let mut layer = Linear::<f32>::new(3, 2, false).unwrap();
+        layer.weight = Parameter::from_slice(
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[2, 3],
+        )
+        .unwrap();
+        let input = leaf(&[1.0, 2.0, 3.0], &[3], false);
+        let output = layer.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[2]);
+        assert_close(output.data().unwrap(), &[1.0, 2.0], 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward shape — multi-dimensional inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_forward_3d_input_shape() {
+        // (batch, seq_len, in_features) -> (batch, seq_len, out_features)
         let layer = Linear::<f32>::new(4, 3, true).unwrap();
-        let input = leaf(&[1.0, 2.0, 3.0, 4.0], &[4], false);
-        assert!(layer.forward(&input).is_err());
+        let input = leaf(&[0.0; 2 * 5 * 4], &[2, 5, 4], false);
+        let output = layer.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[2, 5, 3]);
+    }
+
+    #[test]
+    fn test_forward_4d_input_shape() {
+        // (batch, x, y, features) -> (batch, x, y, out_features)
+        let layer = Linear::<f32>::new(8, 4, false).unwrap();
+        let input = leaf(&[0.0; 2 * 3 * 4 * 8], &[2, 3, 4, 8], false);
+        let output = layer.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[2, 3, 4, 4]);
+    }
+
+    #[test]
+    fn test_forward_3d_correctness() {
+        // Verify 3D gives same results as manually flattening to 2D.
+        let mut layer = Linear::<f32>::new(3, 2, false).unwrap();
+        layer.weight = Parameter::from_slice(
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[2, 3],
+        )
+        .unwrap();
+
+        // 3D input: (2, 2, 3)
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let input_3d = leaf(&data, &[2, 2, 3], false);
+        let out_3d = layer.forward(&input_3d).unwrap();
+        assert_eq!(out_3d.shape(), &[2, 2, 2]);
+
+        // Equivalent 2D input.
+        let input_2d = leaf(&data, &[4, 3], false);
+        let out_2d = layer.forward(&input_2d).unwrap();
+        assert_eq!(out_2d.shape(), &[4, 2]);
+
+        // Data should be identical.
+        assert_close(out_3d.data().unwrap(), out_2d.data().unwrap(), 1e-6);
     }
 
     // -----------------------------------------------------------------------

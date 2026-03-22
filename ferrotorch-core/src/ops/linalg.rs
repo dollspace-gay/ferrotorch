@@ -10,25 +10,201 @@ use crate::tensor::Tensor;
 
 /// Matrix multiplication: C = A @ B.
 ///
-/// Supports:
-/// - 2D x 2D: standard matrix multiply (M,K) @ (K,N) -> (M,N)
+/// Follows PyTorch `torch.matmul` semantics exactly:
+///
 /// - 1D x 1D: dot product -> scalar
 /// - 2D x 1D: matrix-vector multiply (M,K) @ (K,) -> (M,)
 /// - 1D x 2D: vector-matrix multiply (K,) @ (K,N) -> (N,)
+/// - 2D x 2D: standard matrix multiply (M,K) @ (K,N) -> (M,N)
+/// - ≥3D: batched matmul with NumPy-style broadcasting over leading dims.
+///   If one input is 1D, it is promoted (prepend dim for LHS, append dim for RHS)
+///   and the added dimension is squeezed from the output.
 pub fn matmul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     match (a.ndim(), b.ndim()) {
-        (1, 1) => dot(a, b),
-        (2, 1) => mv(a, b),
-        (1, 2) => vm(a, b),
-        (2, 2) => mm(a, b),
-        _ => Err(FerrotorchError::InvalidArgument {
+        (0, _) | (_, 0) => Err(FerrotorchError::InvalidArgument {
             message: format!(
-                "matmul not supported for shapes {:?} and {:?} (batch matmul not yet implemented)",
+                "matmul: scalar operands not supported, got shapes {:?} and {:?}",
                 a.shape(),
                 b.shape()
             ),
         }),
+        (1, 1) => dot(a, b),
+        (2, 1) => mv(a, b),
+        (1, 2) => vm(a, b),
+        (2, 2) => mm(a, b),
+        _ => broadcast_matmul(a, b),
     }
+}
+
+/// Broadcast leading dimensions of two shapes according to NumPy rules.
+/// Returns the broadcasted batch shape.
+fn broadcast_batch_shapes(a: &[usize], b: &[usize]) -> FerrotorchResult<Vec<usize>> {
+    let max_len = a.len().max(b.len());
+    let mut result = Vec::with_capacity(max_len);
+    for i in 0..max_len {
+        let da = if i < max_len - a.len() { 1 } else { a[i - (max_len - a.len())] };
+        let db = if i < max_len - b.len() { 1 } else { b[i - (max_len - b.len())] };
+        if da == db {
+            result.push(da);
+        } else if da == 1 {
+            result.push(db);
+        } else if db == 1 {
+            result.push(da);
+        } else {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "matmul: batch dimensions cannot be broadcast: {:?} vs {:?}",
+                    a, b
+                ),
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Batched matrix multiply with NumPy-style broadcast over leading dimensions.
+///
+/// Handles all cases where at least one operand has ndim ≥ 3 (and the other
+/// is at least 1D). 1D operands are promoted before dispatch and the added
+/// dimension is squeezed from the output, matching `torch.matmul`.
+fn broadcast_matmul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    // --- 1D promotion ------------------------------------------------
+    // If a is 1D (K,) → treat as (1, K) and squeeze row from output.
+    // If b is 1D (K,) → treat as (K, 1) and squeeze col from output.
+    let squeeze_row = a.ndim() == 1;
+    let squeeze_col = b.ndim() == 1;
+
+    let a_shape: Vec<usize> = if squeeze_row {
+        let mut s = vec![1];
+        s.extend_from_slice(a.shape());
+        s
+    } else {
+        a.shape().to_vec()
+    };
+    let b_shape: Vec<usize> = if squeeze_col {
+        let mut s = b.shape().to_vec();
+        s.push(1);
+        s
+    } else {
+        b.shape().to_vec()
+    };
+
+    let a_nd = a_shape.len();
+    let b_nd = b_shape.len();
+
+    // Matrix dims (last two of each).
+    let m = a_shape[a_nd - 2];
+    let k_a = a_shape[a_nd - 1];
+    let k_b = b_shape[b_nd - 2];
+    let n = b_shape[b_nd - 1];
+
+    if k_a != k_b {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "matmul: inner dimensions mismatch: {:?} @ {:?}",
+                a.shape(),
+                b.shape()
+            ),
+        });
+    }
+    let k = k_a;
+
+    // Batch dimensions.
+    let a_batch = &a_shape[..a_nd - 2];
+    let b_batch = &b_shape[..b_nd - 2];
+    let batch_shape = broadcast_batch_shapes(a_batch, b_batch)?;
+    let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
+
+    // Compute strides for broadcasting iteration.
+    let a_batch_strides = broadcast_strides(a_batch, &batch_shape);
+    let b_batch_strides = broadcast_strides(b_batch, &batch_shape);
+
+    let a_mat_size = m * k;
+    let b_mat_size = k * n;
+    let c_mat_size = m * n;
+
+    let a_data = a.data()?;
+    let b_data = b.data()?;
+    let mut result = vec![<T as num_traits::Zero>::zero(); batch_size * c_mat_size];
+
+    for bi in 0..batch_size {
+        // Map flat batch index to a/b offsets using broadcast strides.
+        let a_off = batch_linear_index(bi, &a_batch_strides, &batch_shape) * a_mat_size;
+        let b_off = batch_linear_index(bi, &b_batch_strides, &batch_shape) * b_mat_size;
+        let c_off = bi * c_mat_size;
+
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = <T as num_traits::Zero>::zero();
+                for p in 0..k {
+                    acc = acc + a_data[a_off + i * k + p] * b_data[b_off + p * n + j];
+                }
+                result[c_off + i * n + j] = acc;
+            }
+        }
+    }
+
+    // Output shape = batch_shape + [m, n], then squeeze promoted dims.
+    let mut out_shape = batch_shape;
+    out_shape.push(m);
+    out_shape.push(n);
+
+    if squeeze_row {
+        // Remove the m=1 dimension (second-to-last).
+        let pos = out_shape.len() - 2;
+        out_shape.remove(pos);
+    }
+    if squeeze_col {
+        // Remove the n=1 dimension (last).
+        out_shape.pop();
+    }
+
+    Tensor::from_storage(TensorStorage::cpu(result), out_shape, false)
+}
+
+/// Compute the strides needed to map a flat index in the broadcast shape
+/// back to a flat index in the (possibly smaller) source batch shape.
+fn broadcast_strides(src: &[usize], broadcast: &[usize]) -> Vec<usize> {
+    let offset = broadcast.len() - src.len();
+    let mut strides = vec![0usize; broadcast.len()];
+
+    // Compute row-major strides for the source shape.
+    if !src.is_empty() {
+        let mut src_strides = vec![1usize; src.len()];
+        for i in (0..src.len() - 1).rev() {
+            src_strides[i] = src_strides[i + 1] * src[i + 1];
+        }
+
+        for i in 0..broadcast.len() {
+            if i < offset {
+                // Dimension doesn't exist in source — broadcast (stride 0).
+                strides[i] = 0;
+            } else {
+                let si = i - offset;
+                if src[si] == 1 {
+                    // Size-1 dimension — broadcast (stride 0).
+                    strides[i] = 0;
+                } else {
+                    strides[i] = src_strides[si];
+                }
+            }
+        }
+    }
+
+    strides
+}
+
+/// Convert a flat batch index into a flat source index using broadcast strides.
+fn batch_linear_index(flat: usize, strides: &[usize], shape: &[usize]) -> usize {
+    let mut idx = 0;
+    let mut remaining = flat;
+    // Decompose flat index into multi-index, then dot with strides.
+    for i in (0..shape.len()).rev() {
+        let coord = remaining % shape[i];
+        remaining /= shape[i];
+        idx += coord * strides[i];
+    }
+    idx
 }
 
 /// Dot product of two 1-D tensors -> scalar.
@@ -488,6 +664,114 @@ mod tests {
         let b = t(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 2]);
+    }
+
+    // -------------------------------------------------------------------
+    // broadcast_matmul tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_matmul_3d_3d_same_batch() {
+        // (2, 2, 3) @ (2, 3, 2) -> (2, 2, 2)
+        // Batch 0: [[1,2,3],[4,5,6]] @ [[1,0],[0,1],[1,0]] = [[4,2],[10,5]]
+        // Batch 1: identity-like
+        #[rustfmt::skip]
+        let a = t(&[
+            1.0, 2.0, 3.0,  4.0, 5.0, 6.0,   // batch 0
+            1.0, 0.0, 0.0,  0.0, 1.0, 0.0,   // batch 1
+        ], &[2, 2, 3]);
+        #[rustfmt::skip]
+        let b = t(&[
+            1.0, 0.0,  0.0, 1.0,  1.0, 0.0,  // batch 0
+            1.0, 2.0,  3.0, 4.0,  5.0, 6.0,  // batch 1
+        ], &[2, 3, 2]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 2, 2]);
+        let d = c.data().unwrap();
+        // Batch 0: [[1*1+2*0+3*1, 1*0+2*1+3*0], [4*1+5*0+6*1, 4*0+5*1+6*0]]
+        //        = [[4, 2], [10, 5]]
+        assert!((d[0] - 4.0).abs() < 1e-6);
+        assert!((d[1] - 2.0).abs() < 1e-6);
+        assert!((d[2] - 10.0).abs() < 1e-6);
+        assert!((d[3] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_matmul_3d_2d_broadcast() {
+        // (2, 3, 4) @ (4, 2) -> (2, 3, 2)
+        // The 2D right operand broadcasts over the batch dim.
+        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&vec![1.0; 4 * 2], &[4, 2]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 3, 2]);
+        // Each element = sum of 4 ones = 4.0
+        for &v in c.data().unwrap().iter() {
+            assert!((v - 4.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_matmul_2d_3d_broadcast() {
+        // (3, 4) @ (2, 4, 2) -> (2, 3, 2)
+        let a = t(&vec![1.0; 3 * 4], &[3, 4]);
+        let b = t(&vec![1.0; 2 * 4 * 2], &[2, 4, 2]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 3, 2]);
+    }
+
+    #[test]
+    fn test_matmul_batch_broadcast_1_vs_n() {
+        // (1, 2, 3) @ (4, 3, 2) -> (4, 2, 2) — batch dim 1 broadcasts to 4
+        let a = t(&vec![1.0; 1 * 2 * 3], &[1, 2, 3]);
+        let b = t(&vec![1.0; 4 * 3 * 2], &[4, 3, 2]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[4, 2, 2]);
+    }
+
+    #[test]
+    fn test_matmul_4d() {
+        // (2, 3, 2, 4) @ (2, 3, 4, 5) -> (2, 3, 2, 5)
+        let a = t(&vec![1.0; 2 * 3 * 2 * 4], &[2, 3, 2, 4]);
+        let b = t(&vec![1.0; 2 * 3 * 4 * 5], &[2, 3, 4, 5]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 3, 2, 5]);
+    }
+
+    #[test]
+    fn test_matmul_3d_1d() {
+        // (2, 3, 4) @ (4,) -> (2, 3) — 1D promoted to (4,1), col squeezed
+        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&vec![1.0; 4], &[4]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 3]);
+        for &v in c.data().unwrap().iter() {
+            assert!((v - 4.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_matmul_1d_3d() {
+        // (4,) @ (2, 4, 3) -> (2, 3) — 1D promoted to (1,4), row squeezed
+        let a = t(&vec![1.0; 4], &[4]);
+        let b = t(&vec![1.0; 2 * 4 * 3], &[2, 4, 3]);
+        let c = matmul(&a, &b).unwrap();
+        assert_eq!(c.shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_matmul_broadcast_mismatch() {
+        // (2, 3, 4) @ (3, 4, 2) — batch dims 2 vs 3, not broadcastable
+        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&vec![1.0; 3 * 4 * 2], &[3, 4, 2]);
+        assert!(matmul(&a, &b).is_err());
+    }
+
+    #[test]
+    fn test_matmul_inner_dim_mismatch() {
+        // (2, 3, 4) @ (2, 5, 2) — inner dims 4 vs 5
+        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&vec![1.0; 2 * 5 * 2], &[2, 5, 2]);
+        assert!(matmul(&a, &b).is_err());
     }
 
     #[test]
