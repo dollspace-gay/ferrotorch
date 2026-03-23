@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use ferrotorch_core::{Float, FerrotorchResult, Tensor, TensorStorage, no_grad};
+use ferrotorch_core::{Float, FerrotorchResult, no_grad};
 use ferrotorch_nn::Parameter;
 
 use crate::optimizer::{Optimizer, OptimizerState, ParamGroup};
@@ -149,9 +149,8 @@ impl<T: Float> Optimizer<T> for Sgd<T> {
                     None => continue,
                 };
 
-                let param_data = param.data()?.to_vec();
-                let mut grad_data = grad_tensor.data()?.to_vec();
-                let shape = param.shape().to_vec();
+                let param_data = param.data_vec()?;
+                let mut grad_data = grad_tensor.data_vec()?;
 
                 // Weight decay: grad = grad + weight_decay * param
                 let wd = group_wd;
@@ -209,12 +208,12 @@ impl<T: Float> Optimizer<T> for Sgd<T> {
                     .map(|(&p, &g)| p - lr_t * g)
                     .collect();
 
-                // Create a new parameter with the updated data.
-                let new_storage = TensorStorage::cpu(new_data);
-                let new_tensor =
-                    no_grad(|| Tensor::from_storage(new_storage, shape, true))?;
-                let new_param = Parameter::new(new_tensor);
-                self.param_groups[gi].params[pi] = new_param;
+                // Write updated values back (works on CPU and GPU).
+                no_grad(|| {
+                    // SAFETY: Optimizer step runs inside no_grad() with exclusive
+                    // access to parameters, so no aliasing references exist.
+                    unsafe { param.tensor().update_data(&new_data) }
+                })?;
             }
         }
 
@@ -295,7 +294,7 @@ impl<T: Float> Optimizer<T> for Sgd<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrotorch_core::TensorStorage;
+    use ferrotorch_core::{Tensor, TensorStorage};
     use ferrotorch_nn::{Linear, MSELoss, Module, Reduction};
 
     /// Create a leaf tensor with given data and shape, optionally with grad.

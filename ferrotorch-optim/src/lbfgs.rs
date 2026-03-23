@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use ferrotorch_core::{no_grad, Float, FerrotorchError, FerrotorchResult, Tensor, TensorStorage};
+use ferrotorch_core::{no_grad, Float, FerrotorchError, FerrotorchResult};
 use ferrotorch_nn::Parameter;
 
 use crate::optimizer::{Optimizer, OptimizerState, ParamGroup};
@@ -148,7 +148,7 @@ impl<T: Float> Lbfgs<T> {
         for group in &self.param_groups {
             for param in &group.params {
                 let tensor = param.tensor();
-                let data = tensor.data()?;
+                let data = tensor.data_vec()?;
                 shapes.push(tensor.shape().to_vec());
                 flat.extend(data.iter().map(|&v| v.to_f64().unwrap()));
             }
@@ -164,12 +164,12 @@ impl<T: Float> Lbfgs<T> {
                 let tensor = param.tensor();
                 match tensor.grad()? {
                     Some(g) => {
-                        let g_data = g.data()?;
+                        let g_data = g.data_vec()?;
                         flat.extend(g_data.iter().map(|&v| v.to_f64().unwrap()));
                     }
                     None => {
                         // No gradient: treat as zero.
-                        let numel = tensor.data()?.len();
+                        let numel = tensor.numel();
                         flat.extend(std::iter::repeat(0.0).take(numel));
                     }
                 }
@@ -200,16 +200,15 @@ impl<T: Float> Lbfgs<T> {
                 let slice = &flat[offset..offset + numel];
                 let new_data: Vec<T> = slice.iter().map(|&v| T::from(v).unwrap()).collect();
 
-                let shape_clone = shape.clone();
-                let new_tensor = no_grad(|| {
-                    Tensor::from_storage(
-                        TensorStorage::cpu(new_data),
-                        shape_clone,
-                        true,
-                    )
+                no_grad(|| {
+                    // SAFETY: Optimizer step runs inside no_grad() with exclusive
+                    // access to parameters, so no aliasing references exist.
+                    unsafe {
+                        self.param_groups[gi].params[pi]
+                            .tensor()
+                            .update_data(&new_data)
+                    }
                 })?;
-
-                self.param_groups[gi].params[pi] = Parameter::new(new_tensor);
 
                 offset += numel;
                 shape_idx += 1;
@@ -728,6 +727,7 @@ impl<T: Float> Optimizer<T> for Lbfgs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrotorch_core::{Tensor, TensorStorage};
     use ferrotorch_core::grad_fns::arithmetic::{add, mul, pow, sub};
 
     /// Create a scalar parameter from a single f64 value.

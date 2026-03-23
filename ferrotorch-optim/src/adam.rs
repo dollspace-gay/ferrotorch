@@ -121,13 +121,14 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                 let key = Self::param_key(gi, pi);
 
                 // Read parameter data and gradient data into f64 workspace.
+                // data_vec() handles GPU→CPU transfer transparently.
                 let param_data: Vec<f64> = tensor
-                    .data()?
+                    .data_vec()?
                     .iter()
                     .map(|&v| v.to_f64().unwrap())
                     .collect();
                 let mut grad_data: Vec<f64> = grad_tensor
-                    .data()?
+                    .data_vec()?
                     .iter()
                     .map(|&v| v.to_f64().unwrap())
                     .collect();
@@ -169,29 +170,35 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                 let bc1 = 1.0 - beta1.powi(step as i32);
                 let bc2 = 1.0 - beta2.powi(step as i32);
 
-                // Apply update to parameter data in-place via data_mut.
+                // Compute updated parameter values.
+                if config.amsgrad {
+                    let max_sq = state.max_exp_avg_sq.as_mut().unwrap();
+                    for i in 0..numel {
+                        if state.exp_avg_sq[i] > max_sq[i] {
+                            max_sq[i] = state.exp_avg_sq[i];
+                        }
+                    }
+                }
+
+                let new_values: Vec<T> = (0..numel)
+                    .map(|i| {
+                        let corrected_avg = state.exp_avg[i] / bc1;
+                        let denom = if config.amsgrad {
+                            let max_sq = state.max_exp_avg_sq.as_ref().unwrap();
+                            (max_sq[i] / bc2).sqrt() + config.eps
+                        } else {
+                            let corrected_sq = state.exp_avg_sq[i] / bc2;
+                            corrected_sq.sqrt() + config.eps
+                        };
+                        let updated = param_data[i] - group_lr * corrected_avg / denom;
+                        T::from(updated).unwrap()
+                    })
+                    .collect();
+
                 no_grad(|| {
                     // SAFETY: Optimizer step runs inside no_grad() with exclusive
                     // access to parameters, so no aliasing references exist.
-                    let param_slice = unsafe { param.tensor().data_mut()? };
-                    for i in 0..numel {
-                        let corrected_avg = state.exp_avg[i] / bc1;
-                        let corrected_sq = state.exp_avg_sq[i] / bc2;
-
-                        let denom = if config.amsgrad {
-                            let max_sq = state.max_exp_avg_sq.as_mut().unwrap();
-                            if state.exp_avg_sq[i] > max_sq[i] {
-                                max_sq[i] = state.exp_avg_sq[i];
-                            }
-                            (max_sq[i] / bc2).sqrt() + config.eps
-                        } else {
-                            corrected_sq.sqrt() + config.eps
-                        };
-
-                        let updated = param_data[i] - group_lr * corrected_avg / denom;
-                        param_slice[i] = T::from(updated).unwrap();
-                    }
-                    Ok::<(), FerrotorchError>(())
+                    unsafe { param.tensor().update_data(&new_values) }
                 })?;
             }
         }

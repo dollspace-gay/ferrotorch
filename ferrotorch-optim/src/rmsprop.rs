@@ -148,8 +148,8 @@ impl<T: Float> Optimizer<T> for Rmsprop<T> {
                         None => continue,
                     };
 
-                    let param_data = param.data()?;
-                    let grad_data = grad_tensor.data()?;
+                    let param_data = param.data_vec()?;
+                    let grad_data = grad_tensor.data_vec()?;
                     let n = param_data.len();
 
                     // Materialise gradient (applying weight decay if needed).
@@ -203,22 +203,24 @@ impl<T: Float> Optimizer<T> for Rmsprop<T> {
                             .collect()
                     };
 
-                    // Apply update to parameter data (in-place via data_mut).
+                    // Compute updated parameter values.
+                    let new_values: Vec<T> = if momentum > 0.0 {
+                        let buf = state.momentum_buf.as_mut().unwrap();
+                        (0..n)
+                            .map(|i| {
+                                buf[i] = momentum_t * buf[i] + grad[i] / avg[i];
+                                param_data[i] - lr_t * buf[i]
+                            })
+                            .collect()
+                    } else {
+                        (0..n)
+                            .map(|i| param_data[i] - lr_t * grad[i] / avg[i])
+                            .collect()
+                    };
+
                     // SAFETY: Optimizer step runs inside no_grad() with exclusive
                     // access to parameters, so no aliasing references exist.
-                    let param_slice = unsafe { param.data_mut()? };
-
-                    if momentum > 0.0 {
-                        let buf = state.momentum_buf.as_mut().unwrap();
-                        for i in 0..n {
-                            buf[i] = momentum_t * buf[i] + grad[i] / avg[i];
-                            param_slice[i] = param_slice[i] - lr_t * buf[i];
-                        }
-                    } else {
-                        for i in 0..n {
-                            param_slice[i] = param_slice[i] - lr_t * grad[i] / avg[i];
-                        }
-                    }
+                    unsafe { param.tensor().update_data(&new_values)? };
                 }
             }
 

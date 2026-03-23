@@ -147,10 +147,9 @@ impl<T: Float> Optimizer<T> for Adagrad<T> {
                     Some(g) => g,
                     None => continue,
                 };
-                let grad_vec: Vec<T> = grad_tensor.data()?.to_vec();
+                let grad_vec: Vec<T> = grad_tensor.data_vec()?;
                 let param_vec: Vec<T> = self.param_groups[group_idx].params[param_idx]
-                    .data()?
-                    .to_vec();
+                    .data_vec()?;
 
                 self.ensure_state(group_idx, param_idx, &shape)?;
 
@@ -160,7 +159,7 @@ impl<T: Float> Optimizer<T> for Adagrad<T> {
                 // Effective learning rate with decay.
                 let clr = lr / (1.0 + (state.step_count as f64 - 1.0) * lr_decay);
 
-                let sum_vec: Vec<T> = state.sum.data()?.to_vec();
+                let sum_vec: Vec<T> = state.sum.data_vec()?;
                 let numel = param_vec.len();
 
                 // Compute updated values inside no_grad to prevent graph tracking.
@@ -194,20 +193,17 @@ impl<T: Float> Optimizer<T> for Adagrad<T> {
                 });
 
                 // Write back the updated sum accumulator.
-                state.sum = Tensor::from_storage(
-                    TensorStorage::cpu(new_sum_data),
-                    shape.clone(),
-                    false,
-                )?;
+                // SAFETY: Optimizer owns the state tensors exclusively.
+                unsafe { state.sum.update_data(&new_sum_data)? };
 
-                // Write back the updated parameter tensor.
-                let new_tensor = Tensor::from_storage(
-                    TensorStorage::cpu(new_param_data),
-                    shape.clone(),
-                    true,
-                )?;
-                self.param_groups[group_idx].params[param_idx] =
-                    Parameter::new(new_tensor);
+                // Write back the updated parameter tensor (works on CPU and GPU).
+                // SAFETY: Optimizer step runs inside no_grad() with exclusive
+                // access to parameters, so no aliasing references exist.
+                unsafe {
+                    self.param_groups[group_idx].params[param_idx]
+                        .tensor()
+                        .update_data(&new_param_data)?;
+                };
             }
         }
 

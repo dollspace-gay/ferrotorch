@@ -547,6 +547,60 @@ impl<T: Float> Tensor<T> {
         Ok(&mut slice[self.inner.offset..end])
     }
 
+    /// Write `new_data` into this tensor's storage, preserving tensor identity.
+    ///
+    /// - **CPU**: copies data into the existing storage Vec.
+    /// - **GPU**: uploads data to GPU and replaces the storage buffer.
+    ///
+    /// This is the device-transparent alternative to `data_mut()` for
+    /// optimizer step implementations.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as `data_mut()` — caller must ensure exclusive
+    /// access. No concurrent reads or writes to this tensor's storage may
+    /// exist. Optimizer `step()` methods satisfy this by running inside
+    /// `no_grad()` with `&mut self`.
+    pub unsafe fn update_data(&self, new_data: &[T]) -> FerrotorchResult<()> {
+        let numel = self.numel();
+        if new_data.len() != numel {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "update_data: new data has {} elements but tensor has {}",
+                    new_data.len(),
+                    numel,
+                ),
+            });
+        }
+
+        let storage_ptr = Arc::as_ptr(&self.inner.storage) as *mut TensorStorage<T>;
+        // SAFETY: Caller guarantees exclusive access (optimizer step inside no_grad).
+        let storage = unsafe { &mut *storage_ptr };
+
+        if storage.is_gpu() {
+            let backend = crate::gpu_dispatch::gpu_backend()
+                .ok_or(FerrotorchError::DeviceUnavailable)?;
+            let ordinal = match storage.device() {
+                Device::Cuda(o) => o,
+                _ => unreachable!(),
+            };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    new_data.as_ptr() as *const u8,
+                    new_data.len() * std::mem::size_of::<T>(),
+                )
+            };
+            let new_handle = backend.cpu_to_gpu(bytes, std::mem::size_of::<T>(), ordinal)?;
+            storage.data = crate::storage::StorageBuffer::Gpu(new_handle);
+        } else {
+            let slice = storage.as_mut_slice();
+            let offset = self.inner.offset;
+            slice[offset..offset + numel].copy_from_slice(new_data);
+        }
+
+        Ok(())
+    }
+
     /// Detach this tensor from the computation graph, returning a new
     /// tensor that shares storage but has no grad_fn.
     pub fn detach(&self) -> Self {

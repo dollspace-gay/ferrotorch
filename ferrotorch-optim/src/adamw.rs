@@ -142,13 +142,14 @@ impl<T: Float> Optimizer<T> for AdamW<T> {
                 let key = Self::param_key(gi, pi);
 
                 // Read parameter data and gradient data into f64 workspace.
+                // data_vec() handles GPU→CPU transfer transparently.
                 let param_data: Vec<f64> = tensor
-                    .data()?
+                    .data_vec()?
                     .iter()
                     .map(|&v| v.to_f64().unwrap())
                     .collect();
                 let grad_data: Vec<f64> = grad_tensor
-                    .data()?
+                    .data_vec()?
                     .iter()
                     .map(|&v| v.to_f64().unwrap())
                     .collect();
@@ -191,19 +192,20 @@ impl<T: Float> Optimizer<T> for AdamW<T> {
                 let bc1 = 1.0 - beta1.powi(step as i32);
                 let bc2 = 1.0 - beta2.powi(step as i32);
 
+                let new_values: Vec<T> = (0..numel)
+                    .map(|i| {
+                        let m_hat = state.exp_avg[i] / bc1;
+                        let v_hat = state.exp_avg_sq[i] / bc2;
+                        let decayed = param_data[i] * decay_factor;
+                        let updated = decayed - group_lr * m_hat / (v_hat.sqrt() + config.eps);
+                        T::from(updated).unwrap()
+                    })
+                    .collect();
+
                 no_grad(|| {
                     // SAFETY: Optimizer step runs inside no_grad() with exclusive
                     // access to parameters, so no aliasing references exist.
-                    let param_slice = unsafe { param.tensor().data_mut()? };
-                    for i in 0..numel {
-                        let m_hat = state.exp_avg[i] / bc1;
-                        let v_hat = state.exp_avg_sq[i] / bc2;
-                        // Apply decoupled weight decay then Adam update.
-                        let decayed = param_data[i] * decay_factor;
-                        let updated = decayed - group_lr * m_hat / (v_hat.sqrt() + config.eps);
-                        param_slice[i] = T::from(updated).unwrap();
-                    }
-                    Ok::<(), FerrotorchError>(())
+                    unsafe { param.tensor().update_data(&new_values) }
                 })?;
             }
         }
