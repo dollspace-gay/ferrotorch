@@ -1,4 +1,5 @@
 pub mod autograd;
+pub mod cpu_pool;
 pub mod creation;
 pub mod device;
 mod display;

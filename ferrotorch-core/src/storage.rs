@@ -123,6 +123,20 @@ impl<T: Element> Clone for TensorStorage<T> {
     }
 }
 
+impl<T: Element> Drop for TensorStorage<T> {
+    fn drop(&mut self) {
+        // Return CPU buffers to the pool for reuse.
+        if let StorageBuffer::Cpu(ref mut v) = self.data {
+            if !v.is_empty() {
+                // Take the Vec out, replacing with an empty one (no alloc).
+                let buf = std::mem::take(v);
+                crate::cpu_pool::pool_return_cpu(buf);
+            }
+        }
+        // GPU buffers are dropped normally (returned to GPU pool by CudaBuffer's Drop).
+    }
+}
+
 impl<T: Element> std::fmt::Debug for StorageBuffer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

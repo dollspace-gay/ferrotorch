@@ -6,6 +6,7 @@
 //! For tensors above `PARALLEL_THRESHOLD` elements, work is split across
 //! rayon worker threads so each chunk is still processed by the SIMD kernel.
 
+use crate::cpu_pool::{pool_alloc_cpu_uninit_f32, pool_alloc_cpu_uninit_f64};
 use crate::dtype::Float;
 use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::shape::broadcast_shapes;
@@ -122,7 +123,7 @@ pub fn fast_add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
         if std::mem::size_of::<T>() == 4 {
             let a_f32: &[f32] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f32, n) };
             let b_f32: &[f32] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f32, n) };
-            let mut out = vec![0.0f32; n];
+            let mut out = pool_alloc_cpu_uninit_f32(n);
             if n >= PARALLEL_THRESHOLD {
                 let chunk_size = (n / rayon::current_num_threads()).max(4096);
                 out.par_chunks_mut(chunk_size)
@@ -144,7 +145,7 @@ pub fn fast_add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
         } else if std::mem::size_of::<T>() == 8 {
             let a_f64: &[f64] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f64, n) };
             let b_f64: &[f64] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f64, n) };
-            let mut out = vec![0.0f64; n];
+            let mut out = pool_alloc_cpu_uninit_f64(n);
             if n >= PARALLEL_THRESHOLD {
                 let chunk_size = (n / rayon::current_num_threads()).max(4096);
                 out.par_chunks_mut(chunk_size)
@@ -177,7 +178,7 @@ pub fn fast_mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
         if std::mem::size_of::<T>() == 4 {
             let a_f32: &[f32] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f32, n) };
             let b_f32: &[f32] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f32, n) };
-            let mut out = vec![0.0f32; n];
+            let mut out = pool_alloc_cpu_uninit_f32(n);
             if n >= PARALLEL_THRESHOLD {
                 let chunk_size = (n / rayon::current_num_threads()).max(4096);
                 out.par_chunks_mut(chunk_size)
@@ -199,7 +200,7 @@ pub fn fast_mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
         } else if std::mem::size_of::<T>() == 8 {
             let a_f64: &[f64] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f64, n) };
             let b_f64: &[f64] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f64, n) };
-            let mut out = vec![0.0f64; n];
+            let mut out = pool_alloc_cpu_uninit_f64(n);
             if n >= PARALLEL_THRESHOLD {
                 let chunk_size = (n / rayon::current_num_threads()).max(4096);
                 out.par_chunks_mut(chunk_size)
@@ -229,7 +230,7 @@ pub fn fast_exp<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let n = data.len();
     if std::mem::size_of::<T>() == 4 {
         let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-        let mut out = vec![0.0f32; n];
+        let mut out = pool_alloc_cpu_uninit_f32(n);
         if n >= PARALLEL_THRESHOLD {
             let chunk_size = (n / rayon::current_num_threads()).max(4096);
             out.par_chunks_mut(chunk_size)
@@ -249,7 +250,7 @@ pub fn fast_exp<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         return Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false);
     } else if std::mem::size_of::<T>() == 8 {
         let inp: &[f64] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n) };
-        let mut out = vec![0.0f64; n];
+        let mut out = pool_alloc_cpu_uninit_f64(n);
         if n >= PARALLEL_THRESHOLD {
             let chunk_size = (n / rayon::current_num_threads()).max(4096);
             out.par_chunks_mut(chunk_size)
@@ -280,7 +281,7 @@ pub fn fast_sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> 
     let n = data.len();
     if std::mem::size_of::<T>() == 4 {
         let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-        let mut out = vec![0.0f32; n];
+        let mut out = pool_alloc_cpu_uninit_f32(n);
         if n >= PARALLEL_THRESHOLD {
             let chunk_size = (n / rayon::current_num_threads()).max(4096);
             out.par_chunks_mut(chunk_size)
@@ -303,7 +304,7 @@ pub fn fast_sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> 
         } else {
             // Single-threaded path: negate, SIMD exp, reciprocal.
             let neg: Vec<f32> = inp.iter().map(|&x| -x).collect();
-            let mut exp_out = vec![0.0f32; n];
+            let mut exp_out = pool_alloc_cpu_uninit_f32(n);
             ferray_ufunc::kernels::simd_f32::exp_f32(&neg, &mut exp_out);
             for i in 0..n {
                 out[i] = 1.0 / (1.0 + exp_out[i]);
@@ -325,7 +326,7 @@ pub fn fast_tanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let n = data.len();
     if std::mem::size_of::<T>() == 4 {
         let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-        let mut out = vec![0.0f32; n];
+        let mut out = pool_alloc_cpu_uninit_f32(n);
         if n >= PARALLEL_THRESHOLD {
             let chunk_size = (n / rayon::current_num_threads()).max(4096);
             out.par_chunks_mut(chunk_size)
@@ -349,7 +350,7 @@ pub fn fast_tanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         } else {
             // Single-threaded path.
             let two_x: Vec<f32> = inp.iter().map(|&x| 2.0 * x).collect();
-            let mut exp_out = vec![0.0f32; n];
+            let mut exp_out = pool_alloc_cpu_uninit_f32(n);
             ferray_ufunc::kernels::simd_f32::exp_f32(&two_x, &mut exp_out);
             for i in 0..n {
                 let e2x = exp_out[i];
