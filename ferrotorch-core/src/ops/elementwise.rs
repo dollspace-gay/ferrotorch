@@ -2,12 +2,22 @@
 //!
 //! Uses ferray-ufunc SIMD kernels for f32/f64 fast paths and falls back
 //! to scalar loops for generic/broadcasting operations.
+//!
+//! For tensors above `PARALLEL_THRESHOLD` elements, work is split across
+//! rayon worker threads so each chunk is still processed by the SIMD kernel.
 
 use crate::dtype::Float;
 use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::shape::broadcast_shapes;
 use crate::storage::TensorStorage;
 use crate::tensor::Tensor;
+use rayon::prelude::*;
+
+/// Minimum number of elements before switching to rayon parallelism.
+/// 1M f32s = 4 MiB — below this the per-element SIMD kernel is fast enough
+/// that rayon's work-stealing overhead dominates. At 1M+ elements the memory
+/// bandwidth saturates a single core and parallelism helps.
+const PARALLEL_THRESHOLD: usize = 2_000_000;
 
 // --- SIMD-accelerated specializations for f32 ---
 
@@ -101,6 +111,9 @@ unsafe fn transmute_vec_f64_to_t<T: Float>(v: Vec<f64>) -> Vec<T> {
 
 /// SIMD-accelerated add: dispatches to f32/f64 SIMD for same-shape tensors,
 /// falls back to generic binary_map with broadcasting.
+///
+/// For tensors >= `PARALLEL_THRESHOLD` elements the work is split across
+/// rayon threads, each chunk processed by the SIMD kernel.
 pub fn fast_add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if a.shape() == b.shape() {
         let a_data = a.data()?;
@@ -110,14 +123,44 @@ pub fn fast_add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
             let a_f32: &[f32] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f32, n) };
             let b_f32: &[f32] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f32, n) };
             let mut out = vec![0.0f32; n];
-            ferray_ufunc::kernels::simd_f32::add_f32(a_f32, b_f32, &mut out);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        ferray_ufunc::kernels::simd_f32::add_f32(
+                            &a_f32[offset..offset + len],
+                            &b_f32[offset..offset + len],
+                            chunk,
+                        );
+                    });
+            } else {
+                ferray_ufunc::kernels::simd_f32::add_f32(a_f32, b_f32, &mut out);
+            }
             let result = unsafe { transmute_vec_f32_to_t(out) };
             return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
         } else if std::mem::size_of::<T>() == 8 {
             let a_f64: &[f64] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f64, n) };
             let b_f64: &[f64] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f64, n) };
             let mut out = vec![0.0f64; n];
-            ferray_ufunc::kernels::simd_f64::add_f64(a_f64, b_f64, &mut out);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        ferray_ufunc::kernels::simd_f64::add_f64(
+                            &a_f64[offset..offset + len],
+                            &b_f64[offset..offset + len],
+                            chunk,
+                        );
+                    });
+            } else {
+                ferray_ufunc::kernels::simd_f64::add_f64(a_f64, b_f64, &mut out);
+            }
             let result = unsafe { transmute_vec_f64_to_t(out) };
             return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
         }
@@ -125,7 +168,7 @@ pub fn fast_add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
     binary_map(a, b, |x, y| x + y)
 }
 
-/// SIMD-accelerated mul.
+/// SIMD-accelerated mul with rayon parallelism for large tensors.
 pub fn fast_mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if a.shape() == b.shape() {
         let a_data = a.data()?;
@@ -135,14 +178,44 @@ pub fn fast_mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
             let a_f32: &[f32] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f32, n) };
             let b_f32: &[f32] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f32, n) };
             let mut out = vec![0.0f32; n];
-            ferray_ufunc::kernels::simd_f32::mul_f32(a_f32, b_f32, &mut out);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        ferray_ufunc::kernels::simd_f32::mul_f32(
+                            &a_f32[offset..offset + len],
+                            &b_f32[offset..offset + len],
+                            chunk,
+                        );
+                    });
+            } else {
+                ferray_ufunc::kernels::simd_f32::mul_f32(a_f32, b_f32, &mut out);
+            }
             let result = unsafe { transmute_vec_f32_to_t(out) };
             return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
         } else if std::mem::size_of::<T>() == 8 {
             let a_f64: &[f64] = unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f64, n) };
             let b_f64: &[f64] = unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f64, n) };
             let mut out = vec![0.0f64; n];
-            ferray_ufunc::kernels::simd_f64::mul_f64(a_f64, b_f64, &mut out);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        ferray_ufunc::kernels::simd_f64::mul_f64(
+                            &a_f64[offset..offset + len],
+                            &b_f64[offset..offset + len],
+                            chunk,
+                        );
+                    });
+            } else {
+                ferray_ufunc::kernels::simd_f64::mul_f64(a_f64, b_f64, &mut out);
+            }
             let result = unsafe { transmute_vec_f64_to_t(out) };
             return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
         }
@@ -150,24 +223,144 @@ pub fn fast_mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
     binary_map(a, b, |x, y| x * y)
 }
 
-/// SIMD-accelerated exp.
+/// SIMD-accelerated exp with rayon parallelism for large tensors.
 pub fn fast_exp<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let data = input.data()?;
     let n = data.len();
     if std::mem::size_of::<T>() == 4 {
         let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
         let mut out = vec![0.0f32; n];
-        ferray_ufunc::kernels::simd_f32::exp_f32(inp, &mut out);
-        let result: Vec<T> = out.iter().map(|&v| T::from(v).unwrap()).collect();
+        if n >= PARALLEL_THRESHOLD {
+            let chunk_size = (n / rayon::current_num_threads()).max(4096);
+            out.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let offset = ci * chunk_size;
+                    let len = chunk.len();
+                    ferray_ufunc::kernels::simd_f32::exp_f32(
+                        &inp[offset..offset + len],
+                        chunk,
+                    );
+                });
+        } else {
+            ferray_ufunc::kernels::simd_f32::exp_f32(inp, &mut out);
+        }
+        let result = unsafe { transmute_vec_f32_to_t(out) };
         return Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false);
     } else if std::mem::size_of::<T>() == 8 {
         let inp: &[f64] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n) };
         let mut out = vec![0.0f64; n];
-        ferray_ufunc::kernels::simd_f64::exp_f64(inp, &mut out);
-        let result: Vec<T> = out.iter().map(|&v| T::from(v).unwrap()).collect();
+        if n >= PARALLEL_THRESHOLD {
+            let chunk_size = (n / rayon::current_num_threads()).max(4096);
+            out.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let offset = ci * chunk_size;
+                    let len = chunk.len();
+                    ferray_ufunc::kernels::simd_f64::exp_f64(
+                        &inp[offset..offset + len],
+                        chunk,
+                    );
+                });
+        } else {
+            ferray_ufunc::kernels::simd_f64::exp_f64(inp, &mut out);
+        }
+        let result = unsafe { transmute_vec_f64_to_t(out) };
         return Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false);
     }
     unary_map(input, |x| x.exp())
+}
+
+/// SIMD-accelerated sigmoid: `1 / (1 + exp(-x))`.
+///
+/// For f32 tensors the negation, SIMD exp, and reciprocal are fused into a
+/// single parallel pass.  Falls back to scalar `unary_map` for other types.
+pub fn fast_sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let data = input.data()?;
+    let n = data.len();
+    if std::mem::size_of::<T>() == 4 {
+        let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
+        let mut out = vec![0.0f32; n];
+        if n >= PARALLEL_THRESHOLD {
+            let chunk_size = (n / rayon::current_num_threads()).max(4096);
+            out.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let offset = ci * chunk_size;
+                    let len = chunk.len();
+                    let slice = &inp[offset..offset + len];
+                    // Negate into local buffer, SIMD exp, then reciprocal.
+                    let mut neg_buf = vec![0.0f32; len];
+                    for i in 0..len {
+                        neg_buf[i] = -slice[i];
+                    }
+                    let mut exp_buf = vec![0.0f32; len];
+                    ferray_ufunc::kernels::simd_f32::exp_f32(&neg_buf, &mut exp_buf);
+                    for i in 0..len {
+                        chunk[i] = 1.0 / (1.0 + exp_buf[i]);
+                    }
+                });
+        } else {
+            // Single-threaded path: negate, SIMD exp, reciprocal.
+            let neg: Vec<f32> = inp.iter().map(|&x| -x).collect();
+            let mut exp_out = vec![0.0f32; n];
+            ferray_ufunc::kernels::simd_f32::exp_f32(&neg, &mut exp_out);
+            for i in 0..n {
+                out[i] = 1.0 / (1.0 + exp_out[i]);
+            }
+        }
+        let result = unsafe { transmute_vec_f32_to_t(out) };
+        return Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false);
+    }
+    // Generic scalar fallback.
+    let one = <T as num_traits::One>::one();
+    unary_map(input, move |x| one / (one + (-x).exp()))
+}
+
+/// SIMD-accelerated tanh: `(exp(2x) - 1) / (exp(2x) + 1)`.
+///
+/// Uses the SIMD exp kernel for `exp(2x)` with rayon parallelism.
+pub fn fast_tanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let data = input.data()?;
+    let n = data.len();
+    if std::mem::size_of::<T>() == 4 {
+        let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
+        let mut out = vec![0.0f32; n];
+        if n >= PARALLEL_THRESHOLD {
+            let chunk_size = (n / rayon::current_num_threads()).max(4096);
+            out.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let offset = ci * chunk_size;
+                    let len = chunk.len();
+                    let slice = &inp[offset..offset + len];
+                    // Compute 2x, SIMD exp, then (e2x - 1) / (e2x + 1).
+                    let mut two_x = vec![0.0f32; len];
+                    for i in 0..len {
+                        two_x[i] = 2.0 * slice[i];
+                    }
+                    let mut exp_buf = vec![0.0f32; len];
+                    ferray_ufunc::kernels::simd_f32::exp_f32(&two_x, &mut exp_buf);
+                    for i in 0..len {
+                        let e2x = exp_buf[i];
+                        chunk[i] = (e2x - 1.0) / (e2x + 1.0);
+                    }
+                });
+        } else {
+            // Single-threaded path.
+            let two_x: Vec<f32> = inp.iter().map(|&x| 2.0 * x).collect();
+            let mut exp_out = vec![0.0f32; n];
+            ferray_ufunc::kernels::simd_f32::exp_f32(&two_x, &mut exp_out);
+            for i in 0..n {
+                let e2x = exp_out[i];
+                out[i] = (e2x - 1.0) / (e2x + 1.0);
+            }
+        }
+        let result = unsafe { transmute_vec_f32_to_t(out) };
+        return Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false);
+    }
+    // Generic scalar fallback.
+    unary_map(input, |x| x.tanh())
 }
 
 // --- Generic fallback operations ---
@@ -207,17 +400,26 @@ pub fn binary_map<T: Float>(
         return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
     }
 
-    // Broadcasting path.
+    // Broadcasting path with precomputed strides.
     let out_shape = broadcast_shapes(a.shape(), b.shape())?;
     let out_numel: usize = out_shape.iter().product();
+    let strides = precompute_broadcast_strides(a.shape(), b.shape(), &out_shape);
     let mut result = Vec::with_capacity(out_numel);
 
     let a_data = a.data()?;
     let b_data = b.data()?;
 
     for i in 0..out_numel {
-        let a_idx = broadcast_index(i, &out_shape, a.shape());
-        let b_idx = broadcast_index(i, &out_shape, b.shape());
+        let mut a_idx = 0usize;
+        let mut b_idx = 0usize;
+        let mut rem = i;
+        // Walk dimensions from innermost to outermost (strides stored reversed).
+        for &(a_stride, b_stride, out_dim) in strides.iter().rev() {
+            let coord = rem % out_dim;
+            rem /= out_dim;
+            a_idx += coord * a_stride;
+            b_idx += coord * b_stride;
+        }
         result.push(f(a_data[a_idx], b_data[b_idx]));
     }
 
@@ -242,31 +444,44 @@ pub fn scalar_map<T: Float>(
     if device.is_cuda() { out.to(device) } else { Ok(out) }
 }
 
-/// Map a flat linear index in the output shape to a flat index in an input
-/// shape, handling broadcasting (size-1 dimensions map to index 0).
-fn broadcast_index(flat_idx: usize, out_shape: &[usize], in_shape: &[usize]) -> usize {
-    let out_ndim = out_shape.len();
-    let in_ndim = in_shape.len();
-    let mut idx = 0;
-    let mut in_stride = 1;
-    let mut out_stride = 1;
+/// Precompute per-dimension `(a_stride, b_stride, out_dim)` triples for a
+/// broadcast between shapes `a` and `b` into `out_shape`.
+///
+/// For each dimension, the stride is 0 when the input has size 1 (broadcast),
+/// otherwise it is the product of all trailing dimensions of that input.
+/// The returned vector is in outermost-first order so the caller can iterate
+/// from the innermost end with `.iter().rev()`.
+fn precompute_broadcast_strides(
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+) -> Vec<(usize, usize, usize)> {
+    let ndim = out_shape.len();
+    let a_ndim = a_shape.len();
+    let b_ndim = b_shape.len();
 
-    for i in 0..in_ndim {
-        let out_axis = out_ndim - 1 - i;
-        let in_axis = in_ndim - 1 - i;
+    let mut strides = Vec::with_capacity(ndim);
+    let mut a_stride: usize = 1;
+    let mut b_stride: usize = 1;
 
-        let out_dim = out_shape[out_axis];
-        let in_dim = in_shape[in_axis];
+    // Build from innermost to outermost, then reverse.
+    for i in 0..ndim {
+        let out_dim = out_shape[ndim - 1 - i];
 
-        let out_coord = (flat_idx / out_stride) % out_dim;
-        let in_coord = if in_dim == 1 { 0 } else { out_coord };
+        let a_dim = if i < a_ndim { a_shape[a_ndim - 1 - i] } else { 1 };
+        let b_dim = if i < b_ndim { b_shape[b_ndim - 1 - i] } else { 1 };
 
-        idx += in_coord * in_stride;
-        in_stride *= in_dim;
-        out_stride *= out_dim;
+        let a_s = if a_dim == 1 { 0 } else { a_stride };
+        let b_s = if b_dim == 1 { 0 } else { b_stride };
+
+        strides.push((a_s, b_s, out_dim));
+
+        a_stride *= a_dim;
+        b_stride *= b_dim;
     }
 
-    idx
+    strides.reverse();
+    strides
 }
 
 // --- Reduction operations ---
@@ -426,5 +641,144 @@ mod tests {
         let a = t(&[2.0, 4.0, 6.0, 8.0], &[4]);
         let m = mean(&a).unwrap();
         assert!((m.item().unwrap() - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fast_sigmoid_small() {
+        let a = t(&[0.0, 1.0, -1.0, 5.0, -5.0], &[5]);
+        let s = fast_sigmoid(&a).unwrap();
+        let d = s.data().unwrap();
+        // sigmoid(0) = 0.5
+        assert!((d[0] - 0.5).abs() < 1e-5, "sigmoid(0) = {}", d[0]);
+        // sigmoid(1) ≈ 0.7311
+        assert!((d[1] - 0.7310586).abs() < 1e-5, "sigmoid(1) = {}", d[1]);
+        // sigmoid(-1) ≈ 0.2689
+        assert!((d[2] - 0.26894143).abs() < 1e-5, "sigmoid(-1) = {}", d[2]);
+        // sigmoid(5) ≈ 0.9933
+        assert!((d[3] - 0.9933072).abs() < 1e-5, "sigmoid(5) = {}", d[3]);
+        // sigmoid(-5) ≈ 0.0067
+        assert!((d[4] - 0.006692851).abs() < 1e-5, "sigmoid(-5) = {}", d[4]);
+    }
+
+    #[test]
+    fn test_fast_sigmoid_large() {
+        // Above PARALLEL_THRESHOLD to exercise the rayon path.
+        let n = PARALLEL_THRESHOLD + 1024;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 / n as f32) * 10.0 - 5.0).collect();
+        let a = t(&data, &[n]);
+        let s = fast_sigmoid(&a).unwrap();
+        let d = s.data().unwrap();
+        for (i, &x) in data.iter().enumerate() {
+            let expected = 1.0 / (1.0 + (-x).exp());
+            assert!(
+                (d[i] - expected).abs() < 1e-4,
+                "sigmoid({}) = {}, expected {}",
+                x, d[i], expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_tanh_small() {
+        let a = t(&[0.0, 1.0, -1.0, 3.0, -3.0], &[5]);
+        let s = fast_tanh(&a).unwrap();
+        let d = s.data().unwrap();
+        assert!((d[0] - 0.0).abs() < 1e-5, "tanh(0) = {}", d[0]);
+        assert!((d[1] - 1.0f32.tanh()).abs() < 1e-5, "tanh(1) = {}", d[1]);
+        assert!((d[2] - (-1.0f32).tanh()).abs() < 1e-5, "tanh(-1) = {}", d[2]);
+        assert!((d[3] - 3.0f32.tanh()).abs() < 1e-5, "tanh(3) = {}", d[3]);
+        assert!((d[4] - (-3.0f32).tanh()).abs() < 1e-5, "tanh(-3) = {}", d[4]);
+    }
+
+    #[test]
+    fn test_fast_tanh_large() {
+        let n = PARALLEL_THRESHOLD + 1024;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 / n as f32) * 6.0 - 3.0).collect();
+        let a = t(&data, &[n]);
+        let s = fast_tanh(&a).unwrap();
+        let d = s.data().unwrap();
+        for (i, &x) in data.iter().enumerate() {
+            let expected = x.tanh();
+            assert!(
+                (d[i] - expected).abs() < 1e-4,
+                "tanh({}) = {}, expected {}",
+                x, d[i], expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_add_parallel() {
+        let n = PARALLEL_THRESHOLD + 1024;
+        let a_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let b_data: Vec<f32> = (0..n).map(|i| (i * 2) as f32).collect();
+        let a = t(&a_data, &[n]);
+        let b = t(&b_data, &[n]);
+        let c = fast_add(&a, &b).unwrap();
+        let d = c.data().unwrap();
+        for i in 0..n {
+            assert_eq!(d[i], a_data[i] + b_data[i], "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_fast_mul_parallel() {
+        let n = PARALLEL_THRESHOLD + 1024;
+        let a_data: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+        let b_data: Vec<f32> = (0..n).map(|i| (i + 1) as f32 * 0.01).collect();
+        let a = t(&a_data, &[n]);
+        let b = t(&b_data, &[n]);
+        let c = fast_mul(&a, &b).unwrap();
+        let d = c.data().unwrap();
+        for i in 0..n {
+            assert!(
+                (d[i] - a_data[i] * b_data[i]).abs() < 1e-4,
+                "mismatch at index {i}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_exp_parallel() {
+        let n = PARALLEL_THRESHOLD + 1024;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 / n as f32) * 10.0 - 5.0).collect();
+        let a = t(&data, &[n]);
+        let c = fast_exp(&a).unwrap();
+        let d = c.data().unwrap();
+        for i in 0..n {
+            let expected = data[i].exp();
+            assert!(
+                (d[i] - expected).abs() / expected.max(1e-10) < 1e-4,
+                "exp({}) = {}, expected {}",
+                data[i], d[i], expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_broadcast_strides_2d() {
+        // [2,3] + [1,3] -> [2,3]
+        let a = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let b = t(&[10.0, 20.0, 30.0], &[1, 3]);
+        let c = binary_map(&a, &b, |x, y| x + y).unwrap();
+        assert_eq!(c.shape(), &[2, 3]);
+        assert_eq!(c.data().unwrap(), &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+    }
+
+    #[test]
+    fn test_broadcast_strides_3d() {
+        // [2,1,3] + [1,2,1] -> [2,2,3]
+        let a = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 1, 3]);
+        let b = t(&[10.0, 100.0], &[1, 2, 1]);
+        let c = binary_map(&a, &b, |x, y| x + y).unwrap();
+        assert_eq!(c.shape(), &[2, 2, 3]);
+        let d = c.data().unwrap();
+        // row 0 + 10: [11, 12, 13], row 0 + 100: [101, 102, 103]
+        // row 1 + 10: [14, 15, 16], row 1 + 100: [104, 105, 106]
+        assert_eq!(
+            d,
+            &[11.0, 12.0, 13.0, 101.0, 102.0, 103.0,
+              14.0, 15.0, 16.0, 104.0, 105.0, 106.0],
+        );
     }
 }
