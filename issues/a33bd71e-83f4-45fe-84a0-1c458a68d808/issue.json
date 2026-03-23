@@ -2,11 +2,12 @@
   "uuid": "a33bd71e-83f4-45fe-84a0-1c458a68d808",
   "display_id": 215,
   "title": "Fix optimizer step on GPU parameters — add in-place GPU write path",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-23T18:40:58.284220288Z",
-  "updated_at": "2026-03-23T18:41:00.059285139Z",
+  "updated_at": "2026-03-23T18:48:38.496880990Z",
+  "closed_at": "2026-03-23T18:48:38.496880990Z",
   "labels": [
     "bug"
   ]
