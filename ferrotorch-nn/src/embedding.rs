@@ -51,8 +51,7 @@ impl<T: Float> GradFn<T> for EmbeddingBackward<T> {
             return Ok(vec![None]);
         }
 
-        let cpu_go = if grad_output.is_cuda() { grad_output.cpu()? } else { grad_output.clone() };
-        let go_data = cpu_go.data()?;
+        let go_data = grad_output.data_vec()?;
         let dim = self.embedding_dim;
 
         // Allocate a full-size gradient for the weight matrix, initialized to zero.
@@ -83,7 +82,13 @@ impl<T: Float> GradFn<T> for EmbeddingBackward<T> {
             false,
         )?;
 
-        Ok(vec![Some(grad_tensor)])
+        // Return gradient on the same device as the weight.
+        let device = self.weight.device();
+        if device.is_cuda() {
+            Ok(vec![Some(grad_tensor.to(device)?)])
+        } else {
+            Ok(vec![Some(grad_tensor)])
+        }
     }
 
     fn inputs(&self) -> Vec<&Tensor<T>> {
@@ -294,7 +299,28 @@ impl<T: Float> Module<T> for Embedding<T> {
         // Output device matches the weight's device (GPU if model is on GPU).
         let device = self.weight.tensor().device();
 
-        let result = if self.weight.requires_grad() && is_grad_enabled() {
+        // Build storage on the target device first, then attach grad_fn.
+        // This avoids to() stripping the grad_fn by creating a leaf tensor.
+        let storage = if device.is_cuda() {
+            let backend = ferrotorch_core::gpu_dispatch::gpu_backend()
+                .ok_or(FerrotorchError::DeviceUnavailable)?;
+            let ordinal = match device {
+                ferrotorch_core::device::Device::Cuda(o) => o,
+                _ => unreachable!(),
+            };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    output_data.as_ptr() as *const u8,
+                    output_data.len() * std::mem::size_of::<T>(),
+                )
+            };
+            let handle = backend.cpu_to_gpu(bytes, std::mem::size_of::<T>(), ordinal)?;
+            TensorStorage::gpu(handle)
+        } else {
+            TensorStorage::cpu(output_data)
+        };
+
+        if self.weight.requires_grad() && is_grad_enabled() {
             let grad_fn = Arc::new(EmbeddingBackward {
                 weight: self.weight.tensor().clone(),
                 indices,
@@ -302,15 +328,9 @@ impl<T: Float> Module<T> for Embedding<T> {
                 embedding_dim: dim,
                 padding_idx: self.padding_idx,
             });
-            Tensor::from_operation(TensorStorage::cpu(output_data), output_shape, grad_fn)?
+            Tensor::from_operation(storage, output_shape, grad_fn)
         } else {
-            Tensor::from_storage(TensorStorage::cpu(output_data), output_shape, false)?
-        };
-
-        if device.is_cuda() {
-            result.to(device)
-        } else {
-            Ok(result)
+            Tensor::from_storage(storage, output_shape, false)
         }
     }
 
