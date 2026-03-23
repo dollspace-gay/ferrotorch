@@ -10,7 +10,7 @@ use crate::autograd::no_grad::is_grad_enabled;
 use crate::dtype::Float;
 use crate::error::{FerrotorchError, FerrotorchResult};
 use crate::gpu_dispatch::gpu_backend;
-use crate::ops::elementwise::unary_map;
+use crate::ops::elementwise::{unary_map, fast_sigmoid, fast_tanh};
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
 
@@ -595,24 +595,8 @@ pub fn sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
             Tensor::from_storage(storage, shape, false)
         }
     } else {
-        // SIMD-accelerated sigmoid: compute exp(-x) via SIMD, then 1/(1+exp(-x))
-        let output = if std::mem::size_of::<T>() == 4 {
-            let cpu_input = if input.is_cuda() { input.cpu()? } else { input.clone() };
-            let data = cpu_input.data()?;
-            let n = data.len();
-            let inp: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            // Negate
-            let neg: Vec<f32> = inp.iter().map(|&x| -x).collect();
-            // SIMD exp
-            let mut exp_out = vec![0.0f32; n];
-            ferray_ufunc::kernels::simd_f32::exp_f32(&neg, &mut exp_out);
-            // 1 / (1 + exp(-x))
-            let result: Vec<T> = exp_out.iter().map(|&e| T::from(1.0f32 / (1.0 + e)).unwrap()).collect();
-            Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false)?
-        } else {
-            let one = <T as num_traits::One>::one();
-            unary_map(input, |x| one / (one + (-x).exp()))?
-        };
+        // SIMD-accelerated sigmoid with rayon parallelism for large tensors.
+        let output = fast_sigmoid(input)?;
 
         let device = input.device();
         if is_grad_enabled() && input.requires_grad() {
@@ -646,7 +630,8 @@ pub fn tanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
             Tensor::from_storage(storage, shape, false)
         }
     } else {
-        let output = unary_map(input, |x| x.tanh())?;
+        // SIMD-accelerated tanh with rayon parallelism for large tensors.
+        let output = fast_tanh(input)?;
 
         let device = input.device();
         if is_grad_enabled() && input.requires_grad() {
