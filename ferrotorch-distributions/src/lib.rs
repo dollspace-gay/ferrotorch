@@ -16,14 +16,27 @@
 //! | [`Uniform`] | `low`, `high` | Yes |
 //! | [`Bernoulli`] | `probs` | No (discrete) |
 //! | [`Categorical`] | `probs` | No (discrete) |
+//! | [`Beta`] | `concentration1`, `concentration0` | Yes |
+//! | [`Gamma`] | `concentration`, `rate` | Yes |
+//! | [`Exponential`] | `rate` | Yes |
+//! | [`Laplace`] | `loc`, `scale` | Yes |
 
 mod bernoulli;
+mod beta;
 mod categorical;
+mod exponential;
+mod gamma;
+mod laplace;
 mod normal;
+pub(crate) mod special_fns;
 mod uniform;
 
 pub use bernoulli::Bernoulli;
+pub use beta::Beta;
 pub use categorical::Categorical;
+pub use exponential::Exponential;
+pub use gamma::Gamma;
+pub use laplace::Laplace;
 pub use normal::Normal;
 pub use uniform::Uniform;
 
