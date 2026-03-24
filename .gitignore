@@ -53,3 +53,4 @@ Thumbs.db
 # === End crosslink managed ===
 __pycache__/
 .crosslink/
+.claude/worktrees/
