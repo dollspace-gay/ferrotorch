@@ -1,0 +1,8 @@
+{
+  "uuid": "745d97f3-e808-4a84-a26c-e48c679ef1a7",
+  "issue_uuid": "3007876e-82d5-48d3-a089-346f548858b5",
+  "author": "anon-a7c6025f",
+  "content": "Plan: Send 5 agents at a time into the worktrees. Each agent will: (1) review the uncommitted code, (2) run cargo test for the affected crate, (3) fix any issues, (4) commit if tests pass. Starting with the 3 confirmed-complete + 2 most-substantial partial ones.",
+  "created_at": "2026-03-24T16:36:42.514021306Z",
+  "kind": "plan"
+}
