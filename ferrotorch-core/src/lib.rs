@@ -35,7 +35,9 @@ pub use error::{FerrotorchError, FerrotorchResult};
 pub use shape::{broadcast_shapes, normalize_axis};
 pub use quantize::{
     dequantize, quantize, quantize_named_tensors, quantized_matmul, QuantDtype, QuantScheme,
-    QuantizedTensor,
+    QuantizedTensor, QParams, FakeQuantize, QatModel, QatLayer, prepare_qat,
+    Observer, MinMaxObserver, PerChannelMinMaxObserver, HistogramObserver,
+    cuda_rng,
 };
 pub use storage::{StorageBuffer, TensorStorage};
 pub use sparse::SparseTensor;
