@@ -490,6 +490,691 @@ pub fn quantize_named_tensors<T: Float>(
     Ok(result)
 }
 
+// ===========================================================================
+// QParams — quantization parameters
+// ===========================================================================
+
+/// Computed quantization parameters (scale and zero_point).
+#[derive(Debug, Clone)]
+pub struct QParams {
+    /// Per-tensor or per-channel scales.
+    pub scale: Vec<f32>,
+    /// Per-tensor or per-channel zero points.
+    pub zero_point: Vec<i32>,
+}
+
+impl QParams {
+    /// Compute symmetric quantization parameters.
+    ///
+    /// For symmetric quantization the range is `[-max_abs, max_abs]` and:
+    /// - INT8: `zero_point = 0`, `scale = max_abs / 127`
+    /// - INT4: `zero_point = 0`, `scale = max_abs / 7`
+    /// - UINT8: `zero_point = 128`, `scale = max_abs / 128`
+    pub fn symmetric(max_abs: f32, dtype: QuantDtype) -> Self {
+        let max_abs = max_abs.max(f32::EPSILON);
+        match dtype {
+            QuantDtype::Int8 => QParams {
+                scale: vec![max_abs / 127.0],
+                zero_point: vec![0],
+            },
+            QuantDtype::Int4 => QParams {
+                scale: vec![max_abs / 7.0],
+                zero_point: vec![0],
+            },
+            QuantDtype::Uint8 => QParams {
+                scale: vec![max_abs / 128.0],
+                zero_point: vec![128],
+            },
+        }
+    }
+
+    /// Compute asymmetric quantization parameters from observed min/max.
+    pub fn asymmetric(min_val: f32, max_val: f32, dtype: QuantDtype) -> Self {
+        let (scale, zp) = compute_scale_zp(min_val, max_val, dtype);
+        QParams {
+            scale: vec![scale],
+            zero_point: vec![zp],
+        }
+    }
+}
+
+// ===========================================================================
+// Observers — collect statistics for quantization calibration
+// ===========================================================================
+
+/// Trait for quantization observers that collect data statistics.
+pub trait Observer {
+    /// Update the observer with a batch of floating-point values.
+    fn observe(&mut self, data: &[f32]);
+    /// Calculate quantization parameters from collected statistics.
+    fn calculate_qparams(&self, dtype: QuantDtype) -> QParams;
+    /// Reset the observer state.
+    fn reset(&mut self);
+}
+
+// ---------------------------------------------------------------------------
+// MinMaxObserver
+// ---------------------------------------------------------------------------
+
+/// Tracks the running min/max of observed values.
+///
+/// Filters out NaN and Inf values before updating min/max.
+#[derive(Debug, Clone)]
+pub struct MinMaxObserver {
+    min_val: f32,
+    max_val: f32,
+}
+
+impl MinMaxObserver {
+    pub fn new() -> Self {
+        Self {
+            min_val: f32::INFINITY,
+            max_val: f32::NEG_INFINITY,
+        }
+    }
+}
+
+impl Default for MinMaxObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Observer for MinMaxObserver {
+    fn observe(&mut self, data: &[f32]) {
+        for &x in data {
+            if !x.is_finite() {
+                continue;
+            }
+            if x < self.min_val {
+                self.min_val = x;
+            }
+            if x > self.max_val {
+                self.max_val = x;
+            }
+        }
+    }
+
+    fn calculate_qparams(&self, dtype: QuantDtype) -> QParams {
+        QParams::asymmetric(self.min_val, self.max_val, dtype)
+    }
+
+    fn reset(&mut self) {
+        self.min_val = f32::INFINITY;
+        self.max_val = f32::NEG_INFINITY;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PerChannelMinMaxObserver
+// ---------------------------------------------------------------------------
+
+/// Tracks per-channel running min/max of observed values.
+///
+/// Filters out NaN and Inf values before updating min/max.
+/// Logs a warning and returns an error when the channel count of incoming
+/// data doesn't match the configured number of channels.
+#[derive(Debug, Clone)]
+pub struct PerChannelMinMaxObserver {
+    num_channels: usize,
+    axis: usize,
+    min_vals: Vec<f32>,
+    max_vals: Vec<f32>,
+}
+
+impl PerChannelMinMaxObserver {
+    /// Create a new per-channel observer.
+    ///
+    /// * `num_channels` — expected number of channels.
+    /// * `axis` — the axis along which channels are sliced.
+    pub fn new(num_channels: usize, axis: usize) -> Self {
+        Self {
+            num_channels,
+            axis,
+            min_vals: vec![f32::INFINITY; num_channels],
+            max_vals: vec![f32::NEG_INFINITY; num_channels],
+        }
+    }
+
+    /// Observe a tensor's data with the given shape.
+    ///
+    /// Returns `Err` if the channel count along `self.axis` doesn't match.
+    pub fn observe_with_shape(
+        &mut self,
+        data: &[f32],
+        shape: &[usize],
+    ) -> FerrotorchResult<()> {
+        if self.axis >= shape.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "PerChannelMinMaxObserver axis {} out of range for {}-d tensor",
+                    self.axis,
+                    shape.len()
+                ),
+            });
+        }
+        let actual_channels = shape[self.axis];
+        if actual_channels != self.num_channels {
+            eprintln!(
+                "WARNING: PerChannelMinMaxObserver expected {} channels on axis {}, got {}",
+                self.num_channels, self.axis, actual_channels
+            );
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "PerChannelMinMaxObserver expected {} channels on axis {}, got {}",
+                    self.num_channels, self.axis, actual_channels
+                ),
+            });
+        }
+
+        for (i, &x) in data.iter().enumerate() {
+            if !x.is_finite() {
+                continue;
+            }
+            let ch = channel_index(i, shape, self.axis);
+            if x < self.min_vals[ch] {
+                self.min_vals[ch] = x;
+            }
+            if x > self.max_vals[ch] {
+                self.max_vals[ch] = x;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Observer for PerChannelMinMaxObserver {
+    fn observe(&mut self, data: &[f32]) {
+        // Without shape info, we treat data as [num_channels, N] where N = len / num_channels.
+        if data.len() % self.num_channels != 0 {
+            eprintln!(
+                "WARNING: PerChannelMinMaxObserver data length {} not divisible by {} channels",
+                data.len(),
+                self.num_channels
+            );
+            return;
+        }
+        let per_channel = data.len() / self.num_channels;
+        for (i, &x) in data.iter().enumerate() {
+            if !x.is_finite() {
+                continue;
+            }
+            let ch = i / per_channel;
+            if ch >= self.num_channels {
+                continue;
+            }
+            if x < self.min_vals[ch] {
+                self.min_vals[ch] = x;
+            }
+            if x > self.max_vals[ch] {
+                self.max_vals[ch] = x;
+            }
+        }
+    }
+
+    fn calculate_qparams(&self, dtype: QuantDtype) -> QParams {
+        let params: Vec<(f32, i32)> = self
+            .min_vals
+            .iter()
+            .zip(self.max_vals.iter())
+            .map(|(&mn, &mx)| compute_scale_zp(mn, mx, dtype))
+            .collect();
+        QParams {
+            scale: params.iter().map(|&(s, _)| s).collect(),
+            zero_point: params.iter().map(|&(_, z)| z).collect(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.min_vals.fill(f32::INFINITY);
+        self.max_vals.fill(f32::NEG_INFINITY);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HistogramObserver
+// ---------------------------------------------------------------------------
+
+/// Histogram-based observer that collects a distribution of values.
+///
+/// When the observed range expands, existing bin counts are redistributed
+/// into the new bin layout via linear interpolation rather than being zeroed.
+#[derive(Debug, Clone)]
+pub struct HistogramObserver {
+    num_bins: usize,
+    bins: Vec<u64>,
+    min_val: f32,
+    max_val: f32,
+    /// Whether we've seen any data yet.
+    initialized: bool,
+}
+
+impl HistogramObserver {
+    pub fn new(num_bins: usize) -> Self {
+        Self {
+            num_bins,
+            bins: vec![0u64; num_bins],
+            min_val: f32::INFINITY,
+            max_val: f32::NEG_INFINITY,
+            initialized: false,
+        }
+    }
+
+    /// Redistribute old bins into a new range via linear interpolation.
+    fn redistribute(&mut self, new_min: f32, new_max: f32) {
+        if !self.initialized || self.bins.iter().all(|&c| c == 0) {
+            self.min_val = new_min;
+            self.max_val = new_max;
+            return;
+        }
+
+        let old_min = self.min_val;
+        let old_max = self.max_val;
+        let old_range = old_max - old_min;
+        let new_range = new_max - new_min;
+
+        if old_range <= 0.0 || new_range <= 0.0 {
+            self.min_val = new_min;
+            self.max_val = new_max;
+            return;
+        }
+
+        let n = self.num_bins;
+        let old_bins = self.bins.clone();
+        self.bins.fill(0);
+
+        let old_bin_width = old_range / n as f32;
+        let new_bin_width = new_range / n as f32;
+
+        for old_idx in 0..n {
+            if old_bins[old_idx] == 0 {
+                continue;
+            }
+            // Center of the old bin in value space.
+            let old_center = old_min + (old_idx as f32 + 0.5) * old_bin_width;
+            // Map to new bin index.
+            let new_frac = (old_center - new_min) / new_bin_width;
+            let new_idx = (new_frac as usize).min(n - 1);
+            self.bins[new_idx] += old_bins[old_idx];
+        }
+
+        self.min_val = new_min;
+        self.max_val = new_max;
+    }
+}
+
+impl Observer for HistogramObserver {
+    fn observe(&mut self, data: &[f32]) {
+        // First pass: find min/max of new data, filtering NaN/Inf.
+        let mut batch_min = f32::INFINITY;
+        let mut batch_max = f32::NEG_INFINITY;
+        for &x in data {
+            if !x.is_finite() {
+                continue;
+            }
+            if x < batch_min {
+                batch_min = x;
+            }
+            if x > batch_max {
+                batch_max = x;
+            }
+        }
+
+        if batch_min > batch_max {
+            // No finite values in this batch.
+            return;
+        }
+
+        // Check if range needs expanding.
+        let new_min = if self.initialized {
+            self.min_val.min(batch_min)
+        } else {
+            batch_min
+        };
+        let new_max = if self.initialized {
+            self.max_val.max(batch_max)
+        } else {
+            batch_max
+        };
+
+        if self.initialized && (new_min < self.min_val || new_max > self.max_val) {
+            // Range expanded — redistribute existing counts into new layout.
+            self.redistribute(new_min, new_max);
+        } else if !self.initialized {
+            self.min_val = new_min;
+            self.max_val = new_max;
+            self.initialized = true;
+        }
+
+        // Insert new data into bins.
+        let range = (self.max_val - self.min_val).max(f32::EPSILON);
+        let n = self.num_bins;
+        for &x in data {
+            if !x.is_finite() {
+                continue;
+            }
+            let frac = (x - self.min_val) / range;
+            let idx = ((frac * n as f32) as usize).min(n - 1);
+            self.bins[idx] += 1;
+        }
+    }
+
+    fn calculate_qparams(&self, dtype: QuantDtype) -> QParams {
+        QParams::asymmetric(self.min_val, self.max_val, dtype)
+    }
+
+    fn reset(&mut self) {
+        self.bins.fill(0);
+        self.min_val = f32::INFINITY;
+        self.max_val = f32::NEG_INFINITY;
+        self.initialized = false;
+    }
+}
+
+// ===========================================================================
+// FakeQuantize — differentiable quantize/dequantize for QAT
+// ===========================================================================
+
+/// Simulates quantization during training by quantizing and immediately
+/// dequantizing values, while allowing gradients to flow through via the
+/// straight-through estimator (STE).
+///
+/// Implements clipped STE: gradients are passed through unchanged for
+/// values within the quantization range `[dequantize(qmin), dequantize(qmax)]`,
+/// and zeroed for out-of-range values.
+#[derive(Debug, Clone)]
+pub struct FakeQuantize {
+    /// Target quantized dtype.
+    pub dtype: QuantDtype,
+    /// Cached quantization parameters.
+    pub qparams: Option<QParams>,
+    /// Whether the observer is enabled (collects statistics).
+    pub observer_enabled: bool,
+    /// Whether fake quantization is enabled.
+    pub fake_quant_enabled: bool,
+    /// The observer used to compute qparams.
+    observer: MinMaxObserver,
+}
+
+impl FakeQuantize {
+    /// Create a new FakeQuantize module.
+    pub fn new(dtype: QuantDtype) -> Self {
+        Self {
+            dtype,
+            qparams: None,
+            observer_enabled: true,
+            fake_quant_enabled: true,
+            observer: MinMaxObserver::new(),
+        }
+    }
+
+    /// Forward pass: observe data, fake-quantize, and return the result.
+    ///
+    /// Returns the fake-quantized data and a gradient mask for clipped STE.
+    /// The mask is 1.0 for in-range values and 0.0 for out-of-range values.
+    pub fn forward(&mut self, data: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        if !self.fake_quant_enabled {
+            let ones = vec![1.0f32; data.len()];
+            return (data.to_vec(), ones);
+        }
+
+        // Observe if enabled.
+        if self.observer_enabled {
+            self.observer.observe(data);
+        }
+
+        // Calculate or use cached qparams.
+        // When observer is disabled and we have cached params, skip recalculation.
+        let qparams = if !self.observer_enabled && self.qparams.is_some() {
+            self.qparams.as_ref().unwrap().clone()
+        } else {
+            let qp = self.observer.calculate_qparams(self.dtype);
+            self.qparams = Some(qp.clone());
+            qp
+        };
+
+        let scale = qparams.scale[0];
+        let zp = qparams.zero_point[0];
+        let qmin = self.dtype.qmin();
+        let qmax = self.dtype.qmax();
+        let is_unsigned = self.dtype == QuantDtype::Uint8;
+
+        // Compute the dequantized range boundaries for clipped STE.
+        let range_min = if is_unsigned {
+            (qmin as f32 - zp as f32) * scale
+        } else {
+            (qmin as f32 - zp as f32) * scale
+        };
+        let range_max = (qmax as f32 - zp as f32) * scale;
+
+        let mut output = Vec::with_capacity(data.len());
+        let mut grad_mask = Vec::with_capacity(data.len());
+
+        for &x in data {
+            // Fake quantize: quantize then dequantize.
+            let q = (x / scale + zp as f32).round().clamp(qmin as f32, qmax as f32);
+            let dq = (q - zp as f32) * scale;
+            output.push(dq);
+
+            // Clipped STE: zero gradient for out-of-range inputs.
+            if x >= range_min && x <= range_max {
+                grad_mask.push(1.0);
+            } else {
+                grad_mask.push(0.0);
+            }
+        }
+
+        (output, grad_mask)
+    }
+}
+
+// ===========================================================================
+// QatModel — quantization-aware training wrapper
+// ===========================================================================
+
+/// A layer with associated FakeQuantize modules for QAT.
+#[derive(Debug, Clone)]
+pub struct QatLayer {
+    /// FakeQuantize for this layer's weights.
+    pub weight_fq: FakeQuantize,
+    /// FakeQuantize for this layer's activations (applied after forward).
+    pub activation_fq: FakeQuantize,
+}
+
+/// Wraps a collection of named weight tensors for quantization-aware training.
+///
+/// Applies `FakeQuantize` to weights before forward and to activations after
+/// each layer's forward pass. Original weights are saved before fake-quantization
+/// and restored after forward to preserve full-precision values for gradient
+/// updates.
+#[derive(Debug)]
+pub struct QatModel {
+    /// Per-layer FakeQuantize state, keyed by layer name.
+    pub layers: HashMap<String, QatLayer>,
+    /// Target quantized dtype.
+    pub dtype: QuantDtype,
+}
+
+impl QatModel {
+    /// Create a new QAT model wrapper.
+    pub fn new(dtype: QuantDtype) -> Self {
+        Self {
+            layers: HashMap::new(),
+            dtype,
+        }
+    }
+
+    /// Register a layer for QAT.
+    pub fn register_layer(&mut self, name: &str) {
+        self.layers.insert(
+            name.to_string(),
+            QatLayer {
+                weight_fq: FakeQuantize::new(self.dtype),
+                activation_fq: FakeQuantize::new(self.dtype),
+            },
+        );
+    }
+
+    /// Fake-quantize weights for a named layer.
+    ///
+    /// Returns `(fake_quantized_weights, original_weights)` so the caller
+    /// can restore originals after the forward pass.
+    pub fn fake_quantize_weights(
+        &mut self,
+        layer_name: &str,
+        weights: &[f32],
+    ) -> FerrotorchResult<(Vec<f32>, Vec<f32>)> {
+        let layer = self.layers.get_mut(layer_name).ok_or_else(|| {
+            FerrotorchError::InvalidArgument {
+                message: format!("layer '{layer_name}' not registered for QAT"),
+            }
+        })?;
+
+        // Save original weights.
+        let originals = weights.to_vec();
+
+        // Fake-quantize (gradient mask is used during backward, not here).
+        let (fq_weights, _mask) = layer.weight_fq.forward(weights);
+
+        Ok((fq_weights, originals))
+    }
+
+    /// Fake-quantize activations for a named layer.
+    ///
+    /// Applied after each layer's forward output, not just the last layer.
+    pub fn fake_quantize_activations(
+        &mut self,
+        layer_name: &str,
+        activations: &[f32],
+    ) -> FerrotorchResult<(Vec<f32>, Vec<f32>)> {
+        let layer = self.layers.get_mut(layer_name).ok_or_else(|| {
+            FerrotorchError::InvalidArgument {
+                message: format!("layer '{layer_name}' not registered for QAT"),
+            }
+        })?;
+
+        let (fq_activations, grad_mask) = layer.activation_fq.forward(activations);
+        Ok((fq_activations, grad_mask))
+    }
+}
+
+/// Prepare a set of named parameters for quantization-aware training.
+///
+/// Creates a `QatModel` and registers layers. Only parameters whose name
+/// contains "weight" get weight FakeQuantize; bias parameters are skipped.
+pub fn prepare_qat(
+    param_names: &[&str],
+    dtype: QuantDtype,
+) -> QatModel {
+    let mut model = QatModel::new(dtype);
+
+    for &name in param_names {
+        // Extract the layer name (everything before the last `.weight` or `.bias`).
+        let layer_name = if let Some(prefix) = name.strip_suffix(".weight") {
+            prefix
+        } else if let Some(prefix) = name.strip_suffix(".bias") {
+            // Only register the layer if not already registered — don't apply
+            // weight FakeQuantize to bias parameters.
+            if !model.layers.contains_key(prefix) {
+                model.register_layer(prefix);
+            }
+            continue;
+        } else {
+            name
+        };
+
+        model.register_layer(layer_name);
+    }
+
+    model
+}
+
+// ===========================================================================
+// CUDA RNG — fork/join for reproducible GPU random state
+// ===========================================================================
+
+/// Thread-safe GPU RNG state for fork/join semantics.
+///
+/// Uses `Mutex` with graceful poisoning recovery to avoid panics
+/// when a thread panics while holding the lock.
+pub mod cuda_rng {
+    use std::sync::Mutex;
+
+    /// Global RNG state — a simple seed counter.
+    static RNG_STATE: Mutex<u64> = Mutex::new(0xdeadbeef_cafebabe);
+
+    /// Saved RNG states for fork/join.
+    static RNG_STACK: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    /// Get the current RNG state, recovering gracefully from mutex poisoning.
+    pub fn get_state() -> u64 {
+        let guard = RNG_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+
+    /// Set the RNG state.
+    pub fn set_state(state: u64) {
+        let mut guard = RNG_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = state;
+    }
+
+    /// Save the current RNG state to a stack and set a new state.
+    ///
+    /// Uses `unwrap_or_else(|e| e.into_inner())` to handle poisoned mutexes
+    /// gracefully instead of panicking.
+    pub fn fork_rng(new_seed: u64) {
+        let current = {
+            let guard = RNG_STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard
+        };
+
+        {
+            let mut stack = RNG_STACK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stack.push(current);
+        }
+
+        set_state(new_seed);
+    }
+
+    /// Restore the previously saved RNG state from the stack.
+    ///
+    /// Uses `unwrap_or_else(|e| e.into_inner())` to handle poisoned mutexes
+    /// gracefully instead of panicking.
+    pub fn join_rng() {
+        let saved = {
+            let mut stack = RNG_STACK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stack.pop()
+        };
+
+        if let Some(state) = saved {
+            set_state(state);
+        }
+    }
+
+    /// Advance the RNG state and return the new value.
+    pub fn next_seed() -> u64 {
+        let mut guard = RNG_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Simple splitmix64 step.
+        *guard = guard.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = *guard;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -786,5 +1471,274 @@ mod tests {
         assert_eq!(qt.zero_point().len(), 1);
         assert_eq!(qt.scheme(), QuantScheme::PerTensor);
         assert_eq!(qt.qdtype(), QuantDtype::Int8);
+    }
+
+    // ----- QParams -----
+
+    #[test]
+    fn test_qparams_symmetric_int8() {
+        let qp = QParams::symmetric(5.0, QuantDtype::Int8);
+        assert_eq!(qp.zero_point, vec![0]);
+        assert!((qp.scale[0] - 5.0 / 127.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_qparams_symmetric_uint8() {
+        let qp = QParams::symmetric(5.0, QuantDtype::Uint8);
+        assert_eq!(qp.zero_point, vec![128]);
+        assert!((qp.scale[0] - 5.0 / 128.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_qparams_symmetric_int4() {
+        let qp = QParams::symmetric(7.0, QuantDtype::Int4);
+        assert_eq!(qp.zero_point, vec![0]);
+        assert!((qp.scale[0] - 1.0).abs() < 1e-7);
+    }
+
+    // ----- MinMaxObserver -----
+
+    #[test]
+    fn test_minmax_observer() {
+        let mut obs = MinMaxObserver::new();
+        obs.observe(&[1.0, 2.0, 3.0]);
+        obs.observe(&[-1.0, 5.0]);
+        let qp = obs.calculate_qparams(QuantDtype::Int8);
+        // Range includes zero: min=-1, max=5.
+        assert_eq!(qp.scale.len(), 1);
+        assert_eq!(qp.zero_point.len(), 1);
+    }
+
+    #[test]
+    fn test_minmax_observer_filters_nan_inf() {
+        let mut obs = MinMaxObserver::new();
+        obs.observe(&[1.0, f32::NAN, 2.0, f32::INFINITY, -1.0, f32::NEG_INFINITY]);
+        let qp = obs.calculate_qparams(QuantDtype::Int8);
+        // Should only see range [-1, 2], NaN/Inf filtered.
+        let expected_range = 2.0 - (-1.0); // = 3.0
+        let expected_scale = expected_range / 255.0;
+        assert!((qp.scale[0] - expected_scale).abs() < 1e-5);
+    }
+
+    // ----- PerChannelMinMaxObserver -----
+
+    #[test]
+    fn test_per_channel_observer_with_shape() {
+        let mut obs = PerChannelMinMaxObserver::new(2, 0);
+        // Shape [2, 3]: channel 0 = [0, 1, 2], channel 1 = [10, 20, 30]
+        obs.observe_with_shape(&[0.0, 1.0, 2.0, 10.0, 20.0, 30.0], &[2, 3]).unwrap();
+        let qp = obs.calculate_qparams(QuantDtype::Int8);
+        assert_eq!(qp.scale.len(), 2);
+        assert_eq!(qp.zero_point.len(), 2);
+    }
+
+    #[test]
+    fn test_per_channel_observer_shape_mismatch() {
+        let mut obs = PerChannelMinMaxObserver::new(3, 0);
+        // Shape [2, 3] has 2 channels on axis 0, but observer expects 3.
+        let result = obs.observe_with_shape(&[1.0; 6], &[2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_per_channel_observer_axis() {
+        let mut obs = PerChannelMinMaxObserver::new(3, 1);
+        // Shape [2, 3]: axis 1 has 3 channels.
+        obs.observe_with_shape(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+        let qp = obs.calculate_qparams(QuantDtype::Int8);
+        assert_eq!(qp.scale.len(), 3);
+    }
+
+    #[test]
+    fn test_per_channel_observer_filters_nan_inf() {
+        let mut obs = PerChannelMinMaxObserver::new(2, 0);
+        obs.observe_with_shape(
+            &[f32::NAN, 1.0, 2.0, 10.0, f32::INFINITY, 30.0],
+            &[2, 3],
+        ).unwrap();
+        // Channel 0 should only see [1, 2], channel 1 should only see [10, 30].
+        let qp = obs.calculate_qparams(QuantDtype::Int8);
+        assert_eq!(qp.scale.len(), 2);
+    }
+
+    // ----- HistogramObserver -----
+
+    #[test]
+    fn test_histogram_observer_basic() {
+        let mut obs = HistogramObserver::new(100);
+        obs.observe(&[0.0, 0.5, 1.0]);
+        let qp = obs.calculate_qparams(QuantDtype::Int8);
+        assert_eq!(qp.scale.len(), 1);
+    }
+
+    #[test]
+    fn test_histogram_observer_range_expansion() {
+        let mut obs = HistogramObserver::new(100);
+        obs.observe(&[0.0, 1.0]);
+        // Initial range is [0, 1].
+        let bins_after_first = obs.bins.clone();
+        let total_first: u64 = bins_after_first.iter().sum();
+        assert_eq!(total_first, 2);
+
+        obs.observe(&[-1.0, 2.0]);
+        // Range expanded to [-1, 2]. Old counts should be redistributed, not zeroed.
+        let total_second: u64 = obs.bins.iter().sum();
+        // Should have 4 total counts (2 original redistributed + 2 new).
+        assert_eq!(total_second, 4);
+    }
+
+    #[test]
+    fn test_histogram_observer_filters_nan_inf() {
+        let mut obs = HistogramObserver::new(50);
+        obs.observe(&[f32::NAN, 1.0, f32::INFINITY, 2.0]);
+        let total: u64 = obs.bins.iter().sum();
+        // Only 2 finite values should be counted.
+        assert_eq!(total, 2);
+    }
+
+    // ----- FakeQuantize -----
+
+    #[test]
+    fn test_fake_quantize_roundtrip() {
+        let mut fq = FakeQuantize::new(QuantDtype::Int8);
+        let data = vec![0.0, 0.5, 1.0, 1.5, 2.0];
+        let (output, mask) = fq.forward(&data);
+        assert_eq!(output.len(), 5);
+        assert_eq!(mask.len(), 5);
+
+        // Output should be close to input (quantize then dequantize).
+        for (i, (&o, &d)) in output.iter().zip(data.iter()).enumerate() {
+            assert!(
+                (o - d).abs() < 0.1,
+                "element {i}: output={o}, data={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fake_quantize_ste_clipping() {
+        let mut fq = FakeQuantize::new(QuantDtype::Int8);
+        // First, observe a range [0, 2].
+        let (_, _) = fq.forward(&[0.0, 1.0, 2.0]);
+
+        // Disable observer so range stays locked at [0, 2].
+        fq.observer_enabled = false;
+
+        // Now forward with values outside the observed range.
+        let (_, mask) = fq.forward(&[0.5, 1.0, 100.0, -100.0]);
+        // In-range values should have mask = 1.0.
+        assert_eq!(mask[0], 1.0);
+        assert_eq!(mask[1], 1.0);
+        // Out-of-range values should have mask = 0.0.
+        assert_eq!(mask[2], 0.0);
+        assert_eq!(mask[3], 0.0);
+    }
+
+    #[test]
+    fn test_fake_quantize_observer_disabled_uses_cached() {
+        let mut fq = FakeQuantize::new(QuantDtype::Int8);
+        // Observe initial range.
+        let (_, _) = fq.forward(&[0.0, 10.0]);
+        let cached_scale = fq.qparams.as_ref().unwrap().scale[0];
+
+        // Disable observer.
+        fq.observer_enabled = false;
+
+        // Forward with a much larger range — should NOT update qparams.
+        let (_, _) = fq.forward(&[0.0, 1000.0]);
+        let scale_after = fq.qparams.as_ref().unwrap().scale[0];
+        assert!(
+            (scale_after - cached_scale).abs() < 1e-10,
+            "scale should not change when observer is disabled"
+        );
+    }
+
+    #[test]
+    fn test_fake_quantize_disabled_is_identity() {
+        let mut fq = FakeQuantize::new(QuantDtype::Int8);
+        fq.fake_quant_enabled = false;
+        let data = vec![1.234, 5.678, -9.012];
+        let (output, mask) = fq.forward(&data);
+        assert_eq!(output, data);
+        assert!(mask.iter().all(|&m| m == 1.0));
+    }
+
+    // ----- QatModel -----
+
+    #[test]
+    fn test_qat_model_register_and_fq_weights() {
+        let mut model = QatModel::new(QuantDtype::Int8);
+        model.register_layer("fc1");
+
+        let weights = vec![0.1, 0.2, 0.3, 0.4];
+        let (fq_weights, originals) = model.fake_quantize_weights("fc1", &weights).unwrap();
+
+        // Originals should be exact copies.
+        assert_eq!(originals, weights);
+        // Fake-quantized weights should be close to originals.
+        for (i, (&fq, &orig)) in fq_weights.iter().zip(weights.iter()).enumerate() {
+            assert!(
+                (fq - orig).abs() < 0.1,
+                "weight {i}: fq={fq}, orig={orig}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_qat_model_activation_fq_per_layer() {
+        let mut model = QatModel::new(QuantDtype::Int8);
+        model.register_layer("layer1");
+        model.register_layer("layer2");
+
+        // Both layers should have independent activation FakeQuantize.
+        let (act1, _) = model.fake_quantize_activations("layer1", &[1.0, 2.0]).unwrap();
+        let (act2, _) = model.fake_quantize_activations("layer2", &[10.0, 20.0]).unwrap();
+        assert_eq!(act1.len(), 2);
+        assert_eq!(act2.len(), 2);
+    }
+
+    #[test]
+    fn test_qat_model_unregistered_layer_errors() {
+        let mut model = QatModel::new(QuantDtype::Int8);
+        let result = model.fake_quantize_weights("nonexistent", &[1.0]);
+        assert!(result.is_err());
+    }
+
+    // ----- prepare_qat -----
+
+    #[test]
+    fn test_prepare_qat_skips_bias() {
+        let names = &["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"];
+        let model = prepare_qat(names, QuantDtype::Int8);
+
+        assert!(model.layers.contains_key("fc1"));
+        assert!(model.layers.contains_key("fc2"));
+        assert_eq!(model.layers.len(), 2);
+    }
+
+    #[test]
+    fn test_prepare_qat_bias_only_still_registers() {
+        let names = &["fc1.bias"];
+        let model = prepare_qat(names, QuantDtype::Int8);
+        // Even bias-only parameters should get a layer registered.
+        assert!(model.layers.contains_key("fc1"));
+    }
+
+    // ----- cuda_rng -----
+
+    #[test]
+    fn test_cuda_rng_fork_join() {
+        let initial = cuda_rng::get_state();
+        cuda_rng::fork_rng(0x12345678);
+        assert_eq!(cuda_rng::get_state(), 0x12345678);
+        cuda_rng::join_rng();
+        assert_eq!(cuda_rng::get_state(), initial);
+    }
+
+    #[test]
+    fn test_cuda_rng_next_seed() {
+        let s1 = cuda_rng::next_seed();
+        let s2 = cuda_rng::next_seed();
+        assert_ne!(s1, s2, "consecutive seeds should differ");
     }
 }
