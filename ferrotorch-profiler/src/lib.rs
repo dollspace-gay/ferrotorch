@@ -23,7 +23,9 @@
 mod event;
 mod profiler;
 mod report;
+pub mod schedule;
 
 pub use event::ProfileEvent;
 pub use profiler::{ProfileConfig, Profiler, with_profiler};
 pub use report::{OpSummary, ProfileReport};
+pub use schedule::{ProfileSchedule, SchedulePhase};
