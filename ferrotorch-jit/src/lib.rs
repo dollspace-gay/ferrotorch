@@ -1,5 +1,6 @@
 pub mod codegen;
 pub mod error;
+pub mod export;
 pub mod fusion;
 pub mod graph;
 pub mod graph_break;
@@ -12,6 +13,10 @@ pub mod trace;
 
 pub use codegen::{Codegen, CompiledGraph, InterpreterBackend, NativeBackend};
 pub use error::JitError;
+pub use export::{
+    ConstraintRelation, DType, DimSpec, DynamicShapeSpec, ExportError, ExportMetadata,
+    ExportedProgram, InputSpec, OutputSpec, ShapeConstraint, export, export_function,
+};
 pub use fusion::{apply_fused, is_fusion_enabled, with_fusion, FusedChain, FusedOp};
 pub use graph_break::{GraphSegment, SegmentedModule, TraceResult, trace_with_breaks};
 pub use interpreter::interpret;

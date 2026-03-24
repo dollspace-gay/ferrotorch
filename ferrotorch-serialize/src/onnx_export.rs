@@ -240,6 +240,7 @@ const SHAPE_DIM: u32 = 1;
 
 // TensorShapeProto.Dimension
 const DIM_VALUE: u32 = 1;
+const DIM_PARAM: u32 = 2;
 
 // ===========================================================================
 // ONNX message builders
@@ -269,6 +270,57 @@ fn encode_shape(dims: &[usize]) -> Vec<u8> {
         let dim_bytes = encode_dim(d as u64);
         w.write_message(SHAPE_DIM, &dim_bytes);
     }
+    w.into_bytes()
+}
+
+/// Encode a `TensorShapeProto.Dimension` with a symbolic dim_param (string).
+fn encode_dim_param(param: &str) -> Vec<u8> {
+    let mut w = ProtobufWriter::new();
+    w.write_string(DIM_PARAM, param);
+    w.into_bytes()
+}
+
+/// Specification for a single ONNX dimension — either static or dynamic.
+enum OnnxDimSpec {
+    Static(usize),
+    Dynamic(String),
+}
+
+/// Encode a `TensorShapeProto` with a mix of static and dynamic dimensions.
+fn encode_shape_with_dynamic(dims: &[OnnxDimSpec]) -> Vec<u8> {
+    let mut w = ProtobufWriter::new();
+    for dim in dims {
+        let dim_bytes = match dim {
+            OnnxDimSpec::Static(value) => encode_dim(*value as u64),
+            OnnxDimSpec::Dynamic(name) => encode_dim_param(name),
+        };
+        w.write_message(SHAPE_DIM, &dim_bytes);
+    }
+    w.into_bytes()
+}
+
+/// Encode a `ValueInfoProto` with support for dynamic dimensions.
+fn encode_value_info_dynamic(
+    name: &str,
+    elem_type: i32,
+    dims: &[OnnxDimSpec],
+) -> Vec<u8> {
+    let mut w = ProtobufWriter::new();
+    w.write_string(VALUE_INFO_NAME, name);
+
+    // TypeProto.Tensor
+    let mut tt = ProtobufWriter::new();
+    tt.write_int32(TENSOR_TYPE_ELEM_TYPE, elem_type);
+    let shape_bytes = encode_shape_with_dynamic(dims);
+    tt.write_message(TENSOR_TYPE_SHAPE, &shape_bytes);
+    let tensor_type_bytes = tt.into_bytes();
+
+    // TypeProto
+    let mut tp = ProtobufWriter::new();
+    tp.write_message(TYPE_TENSOR, &tensor_type_bytes);
+    let type_bytes = tp.into_bytes();
+
+    w.write_message(VALUE_INFO_TYPE, &type_bytes);
     w.into_bytes()
 }
 
@@ -868,6 +920,191 @@ pub fn export_ir_graph_to_onnx(
 }
 
 // ===========================================================================
+// ExportedProgram -> ONNX
+// ===========================================================================
+
+/// Export an [`ExportedProgram`] as an ONNX model file.
+///
+/// This is the preferred path for ONNX export: the `ExportedProgram` already
+/// contains the traced graph, input/output specs, and dynamic shape
+/// information. Converting from an `ExportedProgram` preserves dynamic axes
+/// as ONNX `dim_param` (symbolic dimension) entries.
+///
+/// # Arguments
+///
+/// * `program` — The exported program to convert.
+/// * `path` — Output file path (conventionally `*.onnx`).
+///
+/// # Errors
+///
+/// Returns an error if the graph contains operations that cannot be mapped to
+/// ONNX, or if the file cannot be written.
+pub fn export_from_program(
+    program: &ferrotorch_jit::export::ExportedProgram,
+    path: &Path,
+) -> FerrotorchResult<()> {
+    let config = OnnxExportConfig::default();
+
+    if config.opset_version < 17 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: format!(
+                "ONNX opset version must be >= 17, got {}",
+                config.opset_version
+            ),
+        });
+    }
+
+    let elem_type = ONNX_FLOAT; // ExportedProgram is currently f32-only
+
+    let graph = program.graph();
+    let topo = graph.topological_order();
+
+    let value_name = |id: IrValueId| -> String { format!("val_{}", id.0) };
+
+    let node_map: HashMap<IrNodeId, &_> = graph.nodes.iter().map(|n| (n.id, n)).collect();
+    let value_map: HashMap<IrValueId, &_> = graph.values.iter().map(|v| (v.id, v)).collect();
+
+    let mut onnx_nodes: Vec<Vec<u8>> = Vec::new();
+    let mut onnx_initializers: Vec<Vec<u8>> = Vec::new();
+    let mut onnx_inputs: Vec<Vec<u8>> = Vec::new();
+    let mut declared_inputs: Vec<String> = Vec::new();
+
+    // Track which graph inputs we've processed so we can map to input specs.
+    let mut graph_input_index = 0usize;
+
+    for &nid in &topo {
+        let node = node_map[&nid];
+
+        match &node.op {
+            IrOpKind::Input { .. } => {
+                let out_id = node.outputs[0];
+                let shape = &value_map[&out_id].shape;
+                let name = value_name(out_id);
+
+                // Check if this input has a corresponding InputSpec with
+                // dynamic dimensions.
+                let input_specs = program.input_specs();
+                if graph_input_index < input_specs.len() {
+                    let spec = &input_specs[graph_input_index];
+                    let onnx_dims: Vec<OnnxDimSpec> = spec
+                        .shape
+                        .iter()
+                        .enumerate()
+                        .map(|(d, dim_spec)| match dim_spec {
+                            ferrotorch_jit::export::DimSpec::Static(_) => {
+                                OnnxDimSpec::Static(if d < shape.len() { shape[d] } else { 1 })
+                            }
+                            ferrotorch_jit::export::DimSpec::Dynamic {
+                                name: dim_name, ..
+                            } => OnnxDimSpec::Dynamic(dim_name.clone()),
+                        })
+                        .collect();
+
+                    let vi = encode_value_info_dynamic(&name, elem_type, &onnx_dims);
+                    onnx_inputs.push(vi);
+                } else {
+                    // Fall back to static shape for extra inputs (e.g., captured
+                    // parameters that became graph inputs during tracing).
+                    let vi = encode_value_info(&name, elem_type, shape);
+                    onnx_inputs.push(vi);
+                }
+
+                declared_inputs.push(name);
+                graph_input_index += 1;
+            }
+
+            IrOpKind::Constant { data, shape } => {
+                let out_id = node.outputs[0];
+                let name = value_name(out_id);
+
+                let raw: Vec<u8> = if elem_type == ONNX_FLOAT {
+                    data.iter()
+                        .flat_map(|&v| (v as f32).to_le_bytes())
+                        .collect()
+                } else {
+                    data.iter().flat_map(|&v| v.to_le_bytes()).collect()
+                };
+
+                let tp = encode_tensor_proto(&name, elem_type, shape, &raw);
+                onnx_initializers.push(tp);
+
+                let vi = encode_value_info(&name, elem_type, shape);
+                onnx_inputs.push(vi);
+                declared_inputs.push(name);
+            }
+
+            IrOpKind::Output => {}
+
+            op => {
+                let node_name = format!("node_{}", nid.0);
+                let mapping = map_ir_op(op, &node_name, elem_type)?;
+
+                let input_names: Vec<String> =
+                    node.inputs.iter().map(|&id| value_name(id)).collect();
+                let mut all_input_names = input_names;
+
+                if let Some((aux_name, raw, dims)) = &mapping.aux_initializer {
+                    let aux_dtype = match mapping.op_type {
+                        "Reshape" | "Squeeze" | "Unsqueeze" => 7, // INT64
+                        _ => elem_type,
+                    };
+                    let tp = encode_tensor_proto(aux_name, aux_dtype, dims, &raw);
+                    onnx_initializers.push(tp);
+
+                    let vi = encode_value_info(aux_name, aux_dtype, dims);
+                    onnx_inputs.push(vi);
+                    declared_inputs.push(aux_name.clone());
+
+                    all_input_names.push(aux_name.clone());
+                }
+
+                let output_names: Vec<String> =
+                    node.outputs.iter().map(|&id| value_name(id)).collect();
+
+                let input_refs: Vec<&str> = all_input_names.iter().map(|s| s.as_str()).collect();
+                let output_refs: Vec<&str> = output_names.iter().map(|s| s.as_str()).collect();
+
+                let encoded = encode_node(
+                    &node_name,
+                    mapping.op_type,
+                    &input_refs,
+                    &output_refs,
+                    &mapping.attributes,
+                );
+                onnx_nodes.push(encoded);
+            }
+        }
+    }
+
+    // Graph outputs — use output specs to determine shape.
+    let onnx_outputs: Vec<Vec<u8>> = graph
+        .output_values
+        .iter()
+        .map(|&id| {
+            let shape = &value_map[&id].shape;
+            encode_value_info(&value_name(id), elem_type, shape)
+        })
+        .collect();
+
+    let graph_bytes = encode_graph(
+        &config.model_name,
+        &onnx_nodes,
+        &onnx_inputs,
+        &onnx_outputs,
+        &onnx_initializers,
+    );
+
+    let opset = encode_opset("", config.opset_version as u64);
+    let model_bytes = encode_model(8, &[opset], &graph_bytes);
+
+    std::fs::write(path, &model_bytes).map_err(|e| FerrotorchError::InvalidArgument {
+        message: format!("failed to write ONNX file {}: {e}", path.display()),
+    })?;
+
+    Ok(())
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1386,6 +1623,131 @@ mod tests {
 
         let result = export_ir_graph_to_onnx(&graph, &path, config, ONNX_FLOAT);
         assert!(result.is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: export_from_program with static shapes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_export_from_program_static() {
+        use ferrotorch_jit::export::{
+            DType, DimSpec, ExportMetadata, ExportedProgram, InputSpec, OutputSpec,
+        };
+
+        // Build a simple program: y = a + b
+        let mut g = IrGraph::new();
+        let a = g.add_input(vec![2, 3]);
+        let b = g.add_input(vec![2, 3]);
+        let (_, outs) = g.add_node(IrOpKind::Add, vec![a, b], vec![vec![2, 3]]);
+        g.set_outputs(vec![outs[0]]);
+
+        let program = ExportedProgram::from_parts(
+            g,
+            vec![
+                InputSpec {
+                    name: "a".into(),
+                    shape: vec![DimSpec::Static(2), DimSpec::Static(3)],
+                    dtype: DType::Float32,
+                },
+                InputSpec {
+                    name: "b".into(),
+                    shape: vec![DimSpec::Static(2), DimSpec::Static(3)],
+                    dtype: DType::Float32,
+                },
+            ],
+            vec![OutputSpec {
+                name: "out".into(),
+                shape: vec![2, 3],
+                dtype: DType::Float32,
+            }],
+            std::collections::HashMap::new(),
+            Vec::new(),
+            ExportMetadata::default(),
+        );
+
+        let dir = std::env::temp_dir().join("ferrotorch_test_onnx_from_prog");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("from_program.onnx");
+
+        export_from_program(&program, &path).unwrap();
+        assert!(path.exists());
+
+        let bytes = std::fs::read(&path).unwrap();
+        let as_str = String::from_utf8_lossy(&bytes);
+        assert!(as_str.contains("Add"), "should contain Add op");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: export_from_program preserves dynamic dims as dim_param
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_export_from_program_dynamic_dims() {
+        use ferrotorch_jit::export::{
+            DType, DimSpec, ExportMetadata, ExportedProgram, InputSpec, OutputSpec,
+        };
+
+        let mut g = IrGraph::new();
+        let a = g.add_input(vec![4, 3]);
+        let b = g.add_input(vec![4, 3]);
+        let (_, outs) = g.add_node(IrOpKind::Add, vec![a, b], vec![vec![4, 3]]);
+        g.set_outputs(vec![outs[0]]);
+
+        let program = ExportedProgram::from_parts(
+            g,
+            vec![
+                InputSpec {
+                    name: "a".into(),
+                    shape: vec![
+                        DimSpec::Dynamic {
+                            name: "batch".into(),
+                            min: 1,
+                            max: 64,
+                        },
+                        DimSpec::Static(3),
+                    ],
+                    dtype: DType::Float32,
+                },
+                InputSpec {
+                    name: "b".into(),
+                    shape: vec![
+                        DimSpec::Dynamic {
+                            name: "batch".into(),
+                            min: 1,
+                            max: 64,
+                        },
+                        DimSpec::Static(3),
+                    ],
+                    dtype: DType::Float32,
+                },
+            ],
+            vec![OutputSpec {
+                name: "out".into(),
+                shape: vec![4, 3],
+                dtype: DType::Float32,
+            }],
+            std::collections::HashMap::new(),
+            Vec::new(),
+            ExportMetadata::default(),
+        );
+
+        let dir = std::env::temp_dir().join("ferrotorch_test_onnx_from_prog_dyn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dynamic.onnx");
+
+        export_from_program(&program, &path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        // The dynamic dim name "batch" should appear in the output.
+        assert!(
+            bytes.windows(5).any(|w| w == b"batch"),
+            "should contain dynamic dim name 'batch'"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
