@@ -11,14 +11,14 @@ pub mod fft;
 pub mod gpu_dispatch;
 pub mod grad_fns;
 pub mod linalg;
-pub mod nested;
 pub mod ops;
 mod inplace;
 mod methods;
 mod ops_trait;
-pub mod pruning;
 pub mod quantize;
 pub mod shape;
+pub mod nested;
+pub mod pruning;
 pub mod sparse;
 pub mod special;
 pub mod storage;
@@ -36,14 +36,13 @@ pub use dtype::{DType, Element, Float};
 pub use error::{FerrotorchError, FerrotorchResult};
 pub use shape::{broadcast_shapes, normalize_axis};
 pub use quantize::{
-    dequantize, quantize, quantize_named_tensors, quantize_per_tensor, quantized_matmul,
-    FakeQuantize, HistogramObserver, MinMaxObserver, MovingAverageMinMaxObserver, Observer,
-    PerChannelMinMaxObserver, QParams, QuantDtype, QuantScheme, QuantizedTensor,
+    dequantize, quantize, quantize_named_tensors, quantized_matmul, QuantDtype, QuantScheme,
+    QuantizedTensor,
 };
 pub use storage::{StorageBuffer, TensorStorage};
 pub use nested::{NestedTensor, nested_scaled_dot_product_attention};
-pub use sparse::{SparseTensor, CsrTensor, CooTensor, SemiStructuredTensor};
-pub use pruning::{magnitude_prune_2_4, create_2_4_mask, apply_2_4_mask, GradualPruner};
+pub use pruning::{apply_2_4_mask, magnitude_prune, sparsity_ratio};
+pub use sparse::{CooTensor, CsrTensor, SparseTensor};
 pub use tensor::{GradFn, Tensor, TensorId};
 pub use einops::{rearrange, rearrange_with, repeat, reduce, EinopsReduction};
 pub use einsum::{einsum, einsum_differentiable};
@@ -56,4 +55,3 @@ pub use vmap::{select, stack, vmap, vmap2};
 pub use special::{digamma, erf, erfc, erfinv, expm1, lgamma, log1p, sinc, xlogy};
 pub use grad_fns::transcendental::{exp, log, sin, cos, clamp};
 pub use grad_fns::activation::{sigmoid, tanh, gelu, gelu_with, GeluApproximate};
-pub use ops::higher_order::{cond, scan, validate_cond_branches};
