@@ -58,6 +58,27 @@ pub enum IrOpKind {
     Unsqueeze { axis: usize },
     Cat { axis: usize },
 
+    // Higher-order ops
+    /// Conditional execution: evaluate `true_subgraph` or `false_subgraph`
+    /// depending on a boolean predicate input.
+    ///
+    /// The first input is the predicate (scalar). Remaining inputs are
+    /// operands passed to the selected subgraph. The subgraph ops
+    /// reference operands by `Input { index }` nodes within each subgraph.
+    Cond {
+        true_subgraph: Vec<IrOpKind>,
+        false_subgraph: Vec<IrOpKind>,
+    },
+    /// Sequential scan (fold with outputs): iterate a body subgraph over
+    /// a sequence of inputs, threading a carry state through each step.
+    ///
+    /// `num_carry` specifies how many of the body's inputs/outputs are
+    /// carry values (the rest are per-step inputs/outputs).
+    Scan {
+        body_subgraph: Vec<IrOpKind>,
+        num_carry: usize,
+    },
+
     // Fused (created by optimization)
     FusedElementwise { ops: Vec<IrOpKind> },
 }

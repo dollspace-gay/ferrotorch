@@ -51,3 +51,4 @@ pub use vmap::{select, stack, vmap, vmap2};
 pub use special::{digamma, erf, erfc, erfinv, expm1, lgamma, log1p, sinc, xlogy};
 pub use grad_fns::transcendental::{exp, log, sin, cos, clamp};
 pub use grad_fns::activation::{sigmoid, tanh, gelu, gelu_with, GeluApproximate};
+pub use ops::higher_order::{cond, scan, validate_cond_branches};

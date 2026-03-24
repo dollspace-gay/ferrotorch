@@ -6,6 +6,7 @@ extern crate self as ferrotorch_nn;
 pub mod activation;
 pub mod attention;
 pub mod flash_attention;
+pub mod flex_attention;
 pub mod container;
 pub mod conv;
 pub mod dropout;
@@ -33,6 +34,9 @@ pub use activation::{
 };
 pub use attention::MultiheadAttention;
 pub use flash_attention::{flash_attention, standard_attention};
+pub use flex_attention::{
+    flex_attention, BlockMask, alibi_score_mod, causal_score_mod, relative_position_bias_score_mod,
+};
 pub use container::{ModuleDict, ModuleList, Sequential};
 pub use conv::{Conv1d, Conv2d, ConvTranspose2d};
 pub use dropout::{Dropout, Dropout2d};
