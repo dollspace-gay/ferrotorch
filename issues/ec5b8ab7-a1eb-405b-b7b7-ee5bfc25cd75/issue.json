@@ -1,0 +1,10 @@
+{
+  "uuid": "ec5b8ab7-a1eb-405b-b7b7-ee5bfc25cd75",
+  "display_id": 391,
+  "title": "Add RNNCell, LSTMCell, GRUCell — single-timestep manual loop control",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "anon-a7c6025f",
+  "created_at": "2026-03-24T19:56:51.072827752Z",
+  "updated_at": "2026-03-24T19:56:51.072827752Z"
+}
