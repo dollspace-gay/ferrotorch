@@ -2,11 +2,12 @@
   "uuid": "14b1dbfd-abac-437b-bceb-40f8f2c988c0",
   "display_id": 319,
   "title": "Add RAdam, NAdam, Adamax, Adadelta, Rprop, ASGD optimizers",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-24T12:01:11.783515847Z",
-  "updated_at": "2026-03-24T12:01:13.319721936Z",
+  "updated_at": "2026-03-24T12:08:25.081547034Z",
+  "closed_at": "2026-03-24T12:08:25.081547034Z",
   "labels": [
     "feature"
   ]
