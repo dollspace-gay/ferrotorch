@@ -1,3 +1,4 @@
+pub mod anomaly;
 pub mod autocast;
 pub mod autocast_ops;
 pub mod checkpoint;
@@ -7,6 +8,7 @@ pub mod forward_ad;
 pub mod grad_penalty;
 pub mod graph;
 pub mod higher_order;
+pub mod hooks;
 pub mod no_grad;
 
 pub use autocast::{

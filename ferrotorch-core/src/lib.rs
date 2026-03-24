@@ -62,3 +62,6 @@ pub use vmap::{select, stack, vmap, vmap2};
 pub use special::{digamma, erf, erfc, erfinv, expm1, lgamma, log1p, sinc, xlogy};
 pub use grad_fns::transcendental::{exp, log, sin, cos, clamp};
 pub use grad_fns::activation::{sigmoid, tanh, gelu, gelu_with, GeluApproximate};
+pub use autograd::anomaly::{AnomalyMode, ForwardBacktrace, check_gradient_anomaly, detect_anomaly};
+pub use autograd::hooks::HookHandle;
+pub use ops::indexing::{gather, scatter, scatter_add, where_cond};
