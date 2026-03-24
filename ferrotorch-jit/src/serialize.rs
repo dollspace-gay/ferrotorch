@@ -75,6 +75,9 @@ const TAG_CAT: u8 = 54;
 
 const TAG_FUSED_ELEMENTWISE: u8 = 60;
 
+const TAG_COND: u8 = 70;
+const TAG_SCAN: u8 = 71;
+
 // ---------------------------------------------------------------------------
 // Writer helpers
 // ---------------------------------------------------------------------------
@@ -259,6 +262,33 @@ fn write_op_kind(w: &mut Writer, op: &IrOpKind) {
             w.write_usize_as_u32(*axis);
         }
 
+        IrOpKind::Cond {
+            true_subgraph,
+            false_subgraph,
+        } => {
+            w.write_u8(TAG_COND);
+            w.write_usize_as_u32(true_subgraph.len());
+            for op in true_subgraph {
+                write_op_kind(w, op);
+            }
+            w.write_usize_as_u32(false_subgraph.len());
+            for op in false_subgraph {
+                write_op_kind(w, op);
+            }
+        }
+
+        IrOpKind::Scan {
+            body_subgraph,
+            num_carry,
+        } => {
+            w.write_u8(TAG_SCAN);
+            w.write_usize_as_u32(*num_carry);
+            w.write_usize_as_u32(body_subgraph.len());
+            for op in body_subgraph {
+                write_op_kind(w, op);
+            }
+        }
+
         IrOpKind::FusedElementwise { ops } => {
             w.write_u8(TAG_FUSED_ELEMENTWISE);
             w.write_usize_as_u32(ops.len());
@@ -344,6 +374,36 @@ fn read_op_kind(r: &mut Reader<'_>) -> FerrotorchResult<IrOpKind> {
         TAG_CAT => {
             let axis = r.read_u32_as_usize()?;
             Ok(IrOpKind::Cat { axis })
+        }
+
+        TAG_COND => {
+            let true_count = r.read_u32_as_usize()?;
+            let mut true_subgraph = Vec::with_capacity(true_count);
+            for _ in 0..true_count {
+                true_subgraph.push(read_op_kind(r)?);
+            }
+            let false_count = r.read_u32_as_usize()?;
+            let mut false_subgraph = Vec::with_capacity(false_count);
+            for _ in 0..false_count {
+                false_subgraph.push(read_op_kind(r)?);
+            }
+            Ok(IrOpKind::Cond {
+                true_subgraph,
+                false_subgraph,
+            })
+        }
+
+        TAG_SCAN => {
+            let num_carry = r.read_u32_as_usize()?;
+            let body_count = r.read_u32_as_usize()?;
+            let mut body_subgraph = Vec::with_capacity(body_count);
+            for _ in 0..body_count {
+                body_subgraph.push(read_op_kind(r)?);
+            }
+            Ok(IrOpKind::Scan {
+                body_subgraph,
+                num_carry,
+            })
         }
 
         TAG_FUSED_ELEMENTWISE => {
