@@ -1,0 +1,10 @@
+{
+  "uuid": "474560c0-ba5a-4ace-a215-74f6151ad944",
+  "display_id": 318,
+  "title": "Add trunc_normal, orthogonal, sparse init and weight/spectral norm",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "anon-a7c6025f",
+  "created_at": "2026-03-24T12:01:03.840284565Z",
+  "updated_at": "2026-03-24T12:01:03.840284565Z"
+}
