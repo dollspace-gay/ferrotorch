@@ -1,0 +1,8 @@
+{
+  "uuid": "98f1a448-0d65-4cbe-9a89-de9bd923adf3",
+  "issue_uuid": "5667062e-044a-4d86-ab32-5e0f1407fd0e",
+  "author": "anon-a7c6025f",
+  "content": "Decision: Rather than writing a fused CUDA kernel (which would break autograd), the biggest win is eliminating the 6 tensor splits per timestep. Currently splits [batch, 3*hs] → 6 separate [batch, hs] tensors by copying data. Instead, use narrow() (zero-copy from CL-261) to create views into the concatenated tensor. This eliminates 6 allocations + 6 memcpys per timestep.\n\nAlso transpose the weights once outside the seq loop instead of per-timestep.",
+  "created_at": "2026-03-25T16:52:33.635609631Z",
+  "kind": "decision"
+}
