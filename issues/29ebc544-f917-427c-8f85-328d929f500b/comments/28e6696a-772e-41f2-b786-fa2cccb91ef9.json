@@ -1,0 +1,8 @@
+{
+  "uuid": "28e6696a-772e-41f2-b786-fa2cccb91ef9",
+  "issue_uuid": "29ebc544-f917-427c-8f85-328d929f500b",
+  "author": "anon-a7c6025f",
+  "content": "Delivered:\n1. GPU parallel reduction kernel (reduce_sum_kernel) — tree reduction with shared memory, grid-stride accumulation, 256 threads/block. Two-pass: first pass produces partial sums, second pass reduces to scalar.\n2. gpu_reduce_sum() function with CPU fallback\n3. sum_f32 backend now uses GPU kernel instead of downloading entire tensor to CPU\n4. mean() now uses GPU sum + scalar multiply instead of CPU round-trip\n5. sum_dim() now dispatches to GPU sum_axis_f32 kernel when tensor is CUDA f32\n6. CPU path also fixed for non-contiguous tensors (calls contiguous())\n7. 807 core + 193 gpu + 6 integration tests pass",
+  "created_at": "2026-03-25T12:31:44.377204794Z",
+  "kind": "result"
+}
