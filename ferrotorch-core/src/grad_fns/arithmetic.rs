@@ -568,23 +568,28 @@ impl<T: Float> GradFn<T> for DivBackward<T> {
 /// Division by zero follows IEEE 754 semantics: `x / 0.0` produces `+inf`
 /// or `-inf` depending on the sign of `x`, and `0.0 / 0.0` produces `NaN`.
 pub fn div<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if a.device() != b.device() {
+        return Err(FerrotorchError::DeviceMismatch {
+            expected: a.device(),
+            got: b.device(),
+        });
+    }
+
     if a.is_cuda() && is_f32::<T>() {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
 
-        // No broadcast div kernel yet — fall back to CPU-roundtrip for mismatched shapes.
-        let (handle, out_shape) = if a.shape() != b.shape() {
-            let result = binary_map(a, b, |x, y| x / y)?;
-            let (s, sh) = result.into_storage_and_shape()?;
-            return if needs_grad(a, b) {
-                let grad_fn = Arc::new(DivBackward {
-                    a: a.clone(),
-                    b: b.clone(),
-                });
-                Tensor::from_operation(s, sh, grad_fn)
-            } else {
-                Tensor::from_storage(s, sh, false)
-            };
+        let needs_broadcast = a.shape() != b.shape();
+        let (handle, out_shape) = if needs_broadcast {
+            let out_shape = broadcast_shapes(a.shape(), b.shape())?;
+            let h = backend.broadcast_div_f32(
+                a.gpu_handle()?,
+                b.gpu_handle()?,
+                a.shape(),
+                b.shape(),
+                &out_shape,
+            )?;
+            (h, out_shape)
         } else {
             (
                 backend.div_f32(a.gpu_handle()?, b.gpu_handle()?)?,
