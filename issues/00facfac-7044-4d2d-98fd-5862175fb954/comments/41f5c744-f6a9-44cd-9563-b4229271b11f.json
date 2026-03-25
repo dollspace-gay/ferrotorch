@@ -1,0 +1,8 @@
+{
+  "uuid": "41f5c744-f6a9-44cd-9563-b4229271b11f",
+  "issue_uuid": "00facfac-7044-4d2d-98fd-5862175fb954",
+  "author": "anon-a7c6025f",
+  "content": "Decision: Change Conv2dBackward.cols from Vec<T> to Tensor<T>. During forward, after im2col produces the column matrix on GPU, wrap it as a Tensor and store it in the grad_fn. During backward, the cols are already on GPU and can be used directly for the matmuls (grad_weight = grad_output @ cols^T, grad_input via weight^T @ grad_output → col2im).\n\nThis requires: (1) changing the cols field type, (2) updating forward to store cols as Tensor, (3) updating backward to use Tensor ops instead of raw data access.",
+  "created_at": "2026-03-25T21:21:46.324336618Z",
+  "kind": "decision"
+}
