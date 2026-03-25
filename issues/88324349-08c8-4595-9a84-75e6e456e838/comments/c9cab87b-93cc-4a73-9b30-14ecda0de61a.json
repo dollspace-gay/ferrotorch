@@ -1,0 +1,8 @@
+{
+  "uuid": "c9cab87b-93cc-4a73-9b30-14ecda0de61a",
+  "issue_uuid": "88324349-08c8-4595-9a84-75e6e456e838",
+  "author": "anon-a7c6025f",
+  "content": "Decision: permute will be implemented as a zero-copy stride permutation — share storage via Arc::clone, permute shape and strides arrays. This makes permute O(ndim) instead of O(numel). Works on both CPU and GPU since it's metadata-only. The backward is also zero-copy (inverse permute). Need a general-purpose view constructor that takes arbitrary strides.",
+  "created_at": "2026-03-25T04:46:24.606317467Z",
+  "kind": "decision"
+}
