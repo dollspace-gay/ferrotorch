@@ -1,0 +1,8 @@
+{
+  "uuid": "002e6b3b-62c6-42c8-9734-6be296fef985",
+  "issue_uuid": "83b72c04-0173-436d-881b-b6aad0ec4d38",
+  "author": "anon-a7c6025f",
+  "content": "Delivered: saved_tensors_hooks module with:\n1. Thread-local pack/unpack hooks (f32 and f64)\n2. saved_tensors_hooks(pack, unpack, closure) — RAII scoped context manager\n3. pack_saved_tensor() / unpack_saved_tensor() — called by GradFn save/load\n4. has_saved_tensor_hooks() query\n5. Nestable (inner scopes override outer)\n6. 3 tests: identity, transform roundtrip, scope cleanup\n7. 810 core tests pass",
+  "created_at": "2026-03-25T15:13:12.530947265Z",
+  "kind": "result"
+}
