@@ -1,0 +1,8 @@
+{
+  "uuid": "409035e7-2c50-41e3-8432-0e5a6be133e3",
+  "issue_uuid": "ebe7df62-47ac-478b-b517-1dbff48e6d29",
+  "author": "anon-a7c6025f",
+  "content": "Starting investigation of pin_memory. In CUDA, pinned (page-locked) host memory enables DMA transfers that are ~2x faster than pageable memory. PyTorch's pin_memory=True in DataLoader allocates batch tensors in pinned memory so that .to(device) transfers are faster and can overlap with computation via non-blocking transfers.\n\nNeed to understand: (1) how cudarc exposes host-pinned allocation, (2) how to integrate with TensorStorage, (3) how to wire into DataLoader.",
+  "created_at": "2026-03-25T16:34:41.302114951Z",
+  "kind": "plan"
+}
