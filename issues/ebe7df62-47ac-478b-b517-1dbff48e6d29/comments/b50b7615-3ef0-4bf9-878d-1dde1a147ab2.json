@@ -1,0 +1,8 @@
+{
+  "uuid": "b50b7615-3ef0-4bf9-878d-1dde1a147ab2",
+  "issue_uuid": "ebe7df62-47ac-478b-b517-1dbff48e6d29",
+  "author": "anon-a7c6025f",
+  "content": "Observation: cudarc provides CudaContext::alloc_pinned<T>() → PinnedHostSlice<T> and clone_htod/memcpy_htod accept PinnedHostSlice via the HostSlice trait. The CUDA driver automatically uses DMA for pinned→device transfers.\n\nDesign:\n1. Add pin_memory() method to GpuBackend trait — allocates pinned host memory and copies CPU data into it\n2. Add PinnedBuffer wrapper in ferrotorch-gpu that holds a PinnedHostSlice\n3. Add pin_memory option to DataLoader that converts batch tensors to pinned storage\n4. Tensor::pin_memory() method that creates a CPU tensor backed by pinned memory\n5. When .to(device) is called on a pinned tensor, use the fast DMA path",
+  "created_at": "2026-03-25T16:35:51.033228731Z",
+  "kind": "observation"
+}
