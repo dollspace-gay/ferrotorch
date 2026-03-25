@@ -85,6 +85,15 @@ impl CudaBackendImpl {
             })
     }
 
+    /// Extract a `&mut CudaBuffer<f32>` from a [`GpuBufferHandle`].
+    fn unwrap_buffer_mut(handle: &mut GpuBufferHandle) -> FerrotorchResult<&mut CudaBuffer<f32>> {
+        handle
+            .downcast_mut::<CudaBuffer<f32>>()
+            .ok_or(FerrotorchError::InvalidArgument {
+                message: "GPU handle does not contain a CudaBuffer<f32>".into(),
+            })
+    }
+
     /// Extract a `&CudaBuffer<f64>` from a [`GpuBufferHandle`].
     fn unwrap_buffer_f64(handle: &GpuBufferHandle) -> FerrotorchResult<&CudaBuffer<f64>> {
         handle
@@ -331,6 +340,45 @@ impl GpuBackend for CudaBackendImpl {
         let dev = self.device(a.device_ordinal())?;
         let result = crate::kernels::gpu_tanh(a_buf, dev).map_err(Self::map_gpu_err)?;
         Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_adam_f32(
+        &self,
+        param: &mut GpuBufferHandle,
+        grad: &GpuBufferHandle,
+        exp_avg: &mut GpuBufferHandle,
+        exp_avg_sq: &mut GpuBufferHandle,
+        beta1: f32,
+        beta2: f32,
+        lr: f32,
+        eps: f32,
+        bc1: f32,
+        bc2: f32,
+        weight_decay: f32,
+    ) -> FerrotorchResult<()> {
+        let ordinal = param.device_ordinal();
+        let dev = self.device(ordinal)?;
+        let p_buf = Self::unwrap_buffer_mut(param)?;
+        let g_buf = Self::unwrap_buffer(grad)?;
+        let m_buf = Self::unwrap_buffer_mut(exp_avg)?;
+        let v_buf = Self::unwrap_buffer_mut(exp_avg_sq)?;
+        crate::kernels::gpu_fused_adam(
+            p_buf,
+            g_buf,
+            m_buf,
+            v_buf,
+            beta1,
+            beta2,
+            lr,
+            eps,
+            bc1,
+            bc2,
+            weight_decay,
+            dev,
+        )
+        .map_err(Self::map_gpu_err)?;
+        Ok(())
     }
 
     // -- Linalg f32 -----------------------------------------------------------

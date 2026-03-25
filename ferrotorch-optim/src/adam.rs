@@ -6,8 +6,10 @@
 //! All parameter updates execute inside `no_grad()` so the optimizer step is
 //! never recorded in the autograd graph.
 
+use std::any::TypeId;
 use std::collections::HashMap;
 
+use ferrotorch_core::gpu_dispatch::{gpu_backend, GpuBufferHandle};
 use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, no_grad};
 use ferrotorch_nn::Parameter;
 
@@ -54,16 +56,25 @@ impl Default for AdamConfig {
 // ---------------------------------------------------------------------------
 
 /// Mutable state tracked for each parameter across steps.
+///
+/// For GPU f32 parameters, moments are stored as `GpuBufferHandle`s on-device
+/// and the fused Adam kernel updates param + moments in a single launch. For
+/// CPU parameters (or f64), moments are `Vec<f64>` with the original scalar
+/// loop.
 #[derive(Debug)]
 struct AdamParamState {
     /// Number of optimizer steps taken for this parameter.
     step_count: u64,
-    /// First moment estimate (exponential moving average of gradients).
+    /// CPU first moment estimate (exponential moving average of gradients).
     exp_avg: Vec<f64>,
-    /// Second moment estimate (exponential moving average of squared gradients).
+    /// CPU second moment estimate (exponential moving average of squared gradients).
     exp_avg_sq: Vec<f64>,
     /// Maximum of bias-corrected second moment estimates (AMSGrad only).
     max_exp_avg_sq: Option<Vec<f64>>,
+    /// GPU first moment (present when param is on CUDA and T is f32).
+    gpu_exp_avg: Option<GpuBufferHandle>,
+    /// GPU second moment (present when param is on CUDA and T is f32).
+    gpu_exp_avg_sq: Option<GpuBufferHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +118,7 @@ impl<T: Float> Optimizer<T> for Adam<T> {
     fn step(&mut self) -> FerrotorchResult<()> {
         let config = self.config;
         let (beta1, beta2) = config.betas;
+        let is_f32 = TypeId::of::<T>() == TypeId::of::<f32>();
 
         for gi in 0..self.param_groups.len() {
             let group_lr = self.param_groups[gi].lr;
@@ -123,9 +135,84 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                 };
 
                 let key = Self::param_key(gi, pi);
+                let numel = tensor.numel();
 
-                // Read parameter data and gradient data into f64 workspace.
-                // data_vec() handles GPU→CPU transfer transparently.
+                // ---- GPU fast-path: fused Adam kernel (f32, non-AMSGrad) ----
+                let use_gpu = is_f32
+                    && tensor.is_cuda()
+                    && grad_tensor.is_cuda()
+                    && !config.amsgrad
+                    && !config.maximize;
+
+                if use_gpu {
+                    let backend =
+                        gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+
+                    // Lazy-init GPU state.
+                    let state =
+                        self.state.entry(key.clone()).or_insert_with(|| {
+                            let ordinal = match tensor.device() {
+                                ferrotorch_core::Device::Cuda(o) => o,
+                                _ => 0,
+                            };
+                            let gpu_m = backend
+                                .alloc_zeros(numel, std::mem::size_of::<f32>(), ordinal)
+                                .ok();
+                            let gpu_v = backend
+                                .alloc_zeros(numel, std::mem::size_of::<f32>(), ordinal)
+                                .ok();
+                            AdamParamState {
+                                step_count: 0,
+                                exp_avg: Vec::new(),
+                                exp_avg_sq: Vec::new(),
+                                max_exp_avg_sq: None,
+                                gpu_exp_avg: gpu_m,
+                                gpu_exp_avg_sq: gpu_v,
+                            }
+                        });
+
+                    state.step_count += 1;
+                    let step = state.step_count;
+                    let bc1 = 1.0 - (beta1 as f32).powi(step as i32);
+                    let bc2 = 1.0 - (beta2 as f32).powi(step as i32);
+
+                    if let (Some(gpu_m), Some(gpu_v)) =
+                        (&mut state.gpu_exp_avg, &mut state.gpu_exp_avg_sq)
+                    {
+                        no_grad(|| {
+                            // SAFETY: Optimizer step runs inside no_grad() with
+                            // exclusive access to parameters; no aliasing.
+                            unsafe {
+                                let storage_ptr = std::sync::Arc::as_ptr(
+                                    &tensor.inner_storage_arc(),
+                                ) as *mut ferrotorch_core::TensorStorage<T>;
+                                let storage = &mut *storage_ptr;
+                                let param_handle = storage
+                                    .gpu_handle_mut()
+                                    .ok_or(FerrotorchError::DeviceUnavailable)?;
+
+                                backend.fused_adam_f32(
+                                    param_handle,
+                                    grad_tensor.gpu_handle()?,
+                                    gpu_m,
+                                    gpu_v,
+                                    beta1 as f32,
+                                    beta2 as f32,
+                                    group_lr as f32,
+                                    config.eps as f32,
+                                    bc1,
+                                    bc2,
+                                    group_wd as f32,
+                                )
+                            }
+                        })?;
+                        continue;
+                    }
+                    // Fall through to CPU path if GPU alloc failed.
+                }
+
+                // ---- CPU path (or f64 / AMSGrad / maximize) ----
+
                 let param_data: Vec<f64> = tensor
                     .data_vec()?
                     .iter()
@@ -152,7 +239,6 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                 }
 
                 // Lazy-init state.
-                let numel = param_data.len();
                 let state = self.state.entry(key).or_insert_with(|| AdamParamState {
                     step_count: 0,
                     exp_avg: vec![0.0; numel],
@@ -162,6 +248,8 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                     } else {
                         None
                     },
+                    gpu_exp_avg: None,
+                    gpu_exp_avg_sq: None,
                 });
 
                 state.step_count += 1;
@@ -256,9 +344,44 @@ impl<T: Float> Optimizer<T> for Adam<T> {
         for (key, pstate) in &self.state {
             let mut entry = HashMap::new();
             entry.insert("step_count".to_string(), vec![pstate.step_count as f64]);
+
+            // For GPU state, download moments to CPU f64 for serialization.
+            if let (Some(gpu_m), Some(gpu_v)) =
+                (&pstate.gpu_exp_avg, &pstate.gpu_exp_avg_sq)
+            {
+                if let Some(backend) = gpu_backend() {
+                    if let (Ok(m_bytes), Ok(v_bytes)) =
+                        (backend.gpu_to_cpu(gpu_m), backend.gpu_to_cpu(gpu_v))
+                    {
+                        let m_f32: &[f32] = unsafe {
+                            std::slice::from_raw_parts(
+                                m_bytes.as_ptr() as *const f32,
+                                m_bytes.len() / 4,
+                            )
+                        };
+                        let v_f32: &[f32] = unsafe {
+                            std::slice::from_raw_parts(
+                                v_bytes.as_ptr() as *const f32,
+                                v_bytes.len() / 4,
+                            )
+                        };
+                        entry.insert(
+                            "exp_avg".to_string(),
+                            m_f32.iter().map(|&x| x as f64).collect(),
+                        );
+                        entry.insert(
+                            "exp_avg_sq".to_string(),
+                            v_f32.iter().map(|&x| x as f64).collect(),
+                        );
+                        out.insert(key.clone(), entry);
+                        continue;
+                    }
+                }
+            }
+
             entry.insert("exp_avg".to_string(), pstate.exp_avg.clone());
             entry.insert("exp_avg_sq".to_string(), pstate.exp_avg_sq.clone());
-            if let Some(ref max_sq) = pstate.max_exp_avg_sq {
+            if let Some(max_sq) = &pstate.max_exp_avg_sq {
                 entry.insert("max_exp_avg_sq".to_string(), max_sq.clone());
             }
             out.insert(key.clone(), entry);
@@ -297,6 +420,8 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                     exp_avg,
                     exp_avg_sq,
                     max_exp_avg_sq,
+                    gpu_exp_avg: None,
+                    gpu_exp_avg_sq: None,
                 },
             );
         }

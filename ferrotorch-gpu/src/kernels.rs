@@ -3377,6 +3377,118 @@ DONE:
 }
 ";
 
+/// PTX source for `fused_adam_kernel`: in-place Adam optimizer update.
+///
+/// For each element i:
+///   g = grad[i] + weight_decay * param[i]  (if wd > 0)
+///   exp_avg[i] = beta1 * exp_avg[i] + (1-beta1) * g
+///   exp_avg_sq[i] = beta2 * exp_avg_sq[i] + (1-beta2) * g * g
+///   m_hat = exp_avg[i] / bc1
+///   v_hat = exp_avg_sq[i] / bc2
+///   param[i] = param[i] - lr * m_hat / (sqrt(v_hat) + eps)
+#[cfg(feature = "cuda")]
+pub(crate) const FUSED_ADAM_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry fused_adam_kernel(
+    .param .u64 param_ptr,
+    .param .u64 grad_ptr,
+    .param .u64 exp_avg_ptr,
+    .param .u64 exp_avg_sq_ptr,
+    .param .f32 beta1,
+    .param .f32 beta2,
+    .param .f32 lr,
+    .param .f32 eps,
+    .param .f32 bc1,
+    .param .f32 bc2,
+    .param .f32 weight_decay,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %p, %g, %m, %v, %off;
+    .reg .f32 %vp, %vg, %vm, %vv;
+    .reg .f32 %b1, %b2, %f_lr, %f_eps, %f_bc1, %f_bc2, %f_wd;
+    .reg .f32 %t1, %t2, %m_hat, %v_hat, %denom, %update;
+    .reg .f32 %one;
+    .reg .pred %p_bound, %p_wd;
+
+    ld.param.u64 %p, [param_ptr];
+    ld.param.u64 %g, [grad_ptr];
+    ld.param.u64 %m, [exp_avg_ptr];
+    ld.param.u64 %v, [exp_avg_sq_ptr];
+    ld.param.f32 %b1, [beta1];
+    ld.param.f32 %b2, [beta2];
+    ld.param.f32 %f_lr, [lr];
+    ld.param.f32 %f_eps, [eps];
+    ld.param.f32 %f_bc1, [bc1];
+    ld.param.f32 %f_bc2, [bc2];
+    ld.param.f32 %f_wd, [weight_decay];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p_bound, %r_tid, %n_reg;
+    @%p_bound bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+
+    add.u64 %p, %p, %off;
+    add.u64 %g, %g, %off;
+    add.u64 %m, %m, %off;
+    add.u64 %v, %v, %off;
+
+    ld.global.f32 %vp, [%p];
+    ld.global.f32 %vg, [%g];
+    ld.global.f32 %vm, [%m];
+    ld.global.f32 %vv, [%v];
+
+    // L2 weight decay: g = g + wd * p
+    mov.f32 %one, 0f00000000;
+    setp.gt.f32 %p_wd, %f_wd, %one;
+    @%p_wd fma.rn.f32 %vg, %f_wd, %vp, %vg;
+
+    // exp_avg = beta1 * exp_avg + (1 - beta1) * g
+    mov.f32 %one, 0f3F800000;
+    sub.f32 %t1, %one, %b1;
+    mul.f32 %vm, %vm, %b1;
+    fma.rn.f32 %vm, %t1, %vg, %vm;
+
+    // exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * g * g
+    sub.f32 %t2, %one, %b2;
+    mul.f32 %vv, %vv, %b2;
+    mul.f32 %t1, %vg, %vg;
+    fma.rn.f32 %vv, %t2, %t1, %vv;
+
+    // m_hat = exp_avg / bc1
+    div.rn.f32 %m_hat, %vm, %f_bc1;
+
+    // v_hat = exp_avg_sq / bc2
+    div.rn.f32 %v_hat, %vv, %f_bc2;
+
+    // denom = sqrt(v_hat) + eps
+    sqrt.rn.f32 %denom, %v_hat;
+    add.f32 %denom, %denom, %f_eps;
+
+    // param = param - lr * m_hat / denom
+    div.rn.f32 %update, %m_hat, %denom;
+    mul.f32 %update, %update, %f_lr;
+    sub.f32 %vp, %vp, %update;
+
+    st.global.f32 [%p], %vp;
+    st.global.f32 [%m], %vm;
+    st.global.f32 [%v], %vv;
+
+DONE:
+    ret;
+}
+";
+
 // ---------------------------------------------------------------------------
 // Launch configuration helper
 // ---------------------------------------------------------------------------
@@ -5472,6 +5584,121 @@ pub fn gpu_tanh(a: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<CudaBuffer
         return Ok(out);
     }
     cpu_fallback_unary(a, device, |x| x.tanh())
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- fused Adam optimizer step
+// ---------------------------------------------------------------------------
+
+/// Fused Adam optimizer step: updates param, exp_avg, and exp_avg_sq in-place
+/// in a single kernel launch.
+///
+/// All four buffers must have the same length `n`. `param`, `exp_avg`, and
+/// `exp_avg_sq` are modified in-place. `grad` is read-only.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_fused_adam(
+    param: &mut CudaBuffer<f32>,
+    grad: &CudaBuffer<f32>,
+    exp_avg: &mut CudaBuffer<f32>,
+    exp_avg_sq: &mut CudaBuffer<f32>,
+    beta1: f32,
+    beta2: f32,
+    lr: f32,
+    eps: f32,
+    bc1: f32,
+    bc2: f32,
+    weight_decay: f32,
+    device: &GpuDevice,
+) -> GpuResult<()> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = param.len();
+    if grad.len() != n || exp_avg.len() != n || exp_avg_sq.len() != n {
+        return Err(GpuError::LengthMismatch {
+            a: n,
+            b: grad.len(),
+        });
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        FUSED_ADAM_PTX,
+        "fused_adam_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback: download, compute, upload.
+            let mut p_host = gpu_to_cpu(param, device)?;
+            let g_host = gpu_to_cpu(grad, device)?;
+            let mut m_host = gpu_to_cpu(exp_avg, device)?;
+            let mut v_host = gpu_to_cpu(exp_avg_sq, device)?;
+
+            for i in 0..n {
+                let mut g = g_host[i];
+                if weight_decay > 0.0 {
+                    g += weight_decay * p_host[i];
+                }
+                m_host[i] = beta1 * m_host[i] + (1.0 - beta1) * g;
+                v_host[i] = beta2 * v_host[i] + (1.0 - beta2) * g * g;
+                let m_hat = m_host[i] / bc1;
+                let v_hat = v_host[i] / bc2;
+                p_host[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+            }
+
+            *param = cpu_to_gpu(&p_host, device)?;
+            *exp_avg = cpu_to_gpu(&m_host, device)?;
+            *exp_avg_sq = cpu_to_gpu(&v_host, device)?;
+            return Ok(());
+        }
+    };
+
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(param.inner_mut())
+            .arg(grad.inner())
+            .arg(exp_avg.inner_mut())
+            .arg(exp_avg_sq.inner_mut())
+            .arg(&beta1)
+            .arg(&beta2)
+            .arg(&lr)
+            .arg(&eps)
+            .arg(&bc1)
+            .arg(&bc2)
+            .arg(&weight_decay)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(())
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_fused_adam(
+    _param: &mut CudaBuffer<f32>,
+    _grad: &CudaBuffer<f32>,
+    _exp_avg: &mut CudaBuffer<f32>,
+    _exp_avg_sq: &mut CudaBuffer<f32>,
+    _beta1: f32,
+    _beta2: f32,
+    _lr: f32,
+    _eps: f32,
+    _bc1: f32,
+    _bc2: f32,
+    _weight_decay: f32,
+    _device: &GpuDevice,
+) -> GpuResult<()> {
+    Err(GpuError::NoCudaFeature)
 }
 
 // ---------------------------------------------------------------------------

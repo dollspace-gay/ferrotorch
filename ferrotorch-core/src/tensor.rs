@@ -846,6 +846,38 @@ impl<T: Float> Tensor<T> {
         Ok(())
     }
 
+    /// Replace this tensor's storage with a new `TensorStorage` in-place.
+    ///
+    /// Used by GPU-native optimizer steps that compute the updated parameter
+    /// entirely on-device and need to swap the underlying buffer without a
+    /// CPU round-trip.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`update_data`]: caller must ensure exclusive access. The new
+    /// storage must have the same number of elements as the tensor and reside
+    /// on the same device.
+    pub unsafe fn update_storage(&self, new_storage: TensorStorage<T>) -> FerrotorchResult<()> {
+        let numel = self.numel();
+        if new_storage.len() != numel {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "update_storage: new storage has {} elements but tensor has {}",
+                    new_storage.len(),
+                    numel,
+                ),
+            });
+        }
+
+        let storage_ptr = Arc::as_ptr(&self.inner.storage) as *mut TensorStorage<T>;
+        // SAFETY: Caller guarantees exclusive access (optimizer step inside no_grad).
+        unsafe {
+            std::ptr::write(storage_ptr, new_storage);
+        }
+
+        Ok(())
+    }
+
     /// Detach this tensor from the computation graph, returning a new
     /// tensor that shares storage but has no grad_fn.
     pub fn detach(&self) -> Self {
@@ -1090,6 +1122,16 @@ impl<T: Float> Tensor<T> {
     #[inline]
     pub(crate) fn storage_refcount(&self) -> usize {
         Arc::strong_count(&self.inner.storage)
+    }
+
+    /// Get a reference to the inner storage `Arc`.
+    ///
+    /// Exposed for optimizer kernels that need to modify the param's GPU
+    /// buffer in-place via `unsafe` pointer cast (same pattern as
+    /// `update_data`).
+    #[inline]
+    pub fn inner_storage_arc(&self) -> &Arc<TensorStorage<T>> {
+        &self.inner.storage
     }
 
     /// Returns true if two tensors share the same underlying storage allocation.
