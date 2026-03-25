@@ -1,0 +1,8 @@
+{
+  "uuid": "7af09cac-8b8b-4235-a6f6-9003432c73b1",
+  "issue_uuid": "c890627e-d1a5-4ed8-8aff-6da490e7de20",
+  "author": "anon-a7c6025f",
+  "content": "Plan: The bucketing from CL-370 processes buckets sequentially AFTER backward completes. The overlap optimization registers autograd hooks on parameters so that when a bucket's last gradient arrives, its allreduce starts immediately — while backward continues computing gradients for earlier layers.\n\nApproach: Add a DDP method that registers post-accumulate-grad hooks on each parameter. When a parameter's gradient is ready, mark its bucket. When all params in a bucket have grads, spawn the allreduce for that bucket in a background thread. sync_gradients then just waits for all pending allreduces to complete.\n\nThis requires: (1) tracking which params have received grads, (2) per-bucket ready counters, (3) background allreduce via thread pool.",
+  "created_at": "2026-03-25T16:00:48.145796979Z",
+  "kind": "plan"
+}
