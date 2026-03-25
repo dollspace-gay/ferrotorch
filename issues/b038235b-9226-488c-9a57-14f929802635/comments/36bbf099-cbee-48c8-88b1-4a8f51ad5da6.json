@@ -1,0 +1,8 @@
+{
+  "uuid": "36bbf099-cbee-48c8-88b1-4a8f51ad5da6",
+  "issue_uuid": "b038235b-9226-488c-9a57-14f929802635",
+  "author": "anon-a7c6025f",
+  "content": "Decision: Writing vec4 variants as separate PTX constants (ADD_VEC4_PTX etc.) that process 4 elements per thread using ld.global.v4.f32 / st.global.v4.f32. The existing try_launch_binary/unary helpers will try the vec4 kernel first when n is divisible by 4, falling back to the scalar kernel for the remainder or when n is small.",
+  "created_at": "2026-03-25T15:42:51.759204921Z",
+  "kind": "decision"
+}
