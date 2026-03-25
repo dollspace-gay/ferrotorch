@@ -1,0 +1,8 @@
+{
+  "uuid": "65c44d0b-8817-4a1c-be7e-6cae8c373aa5",
+  "issue_uuid": "560d35e3-4245-4f07-8fda-e80e2bed6000",
+  "author": "anon-a7c6025f",
+  "content": "Delivered: DDP gradient bucketing. Parameters grouped into ~25MB buckets (configurable via with_bucket_size). Buckets filled in reverse parameter order matching PyTorch convention. Each bucket allreduced independently. Backward-compatible — existing tests pass without changes. compute_buckets helper for bucket assignment.",
+  "created_at": "2026-03-25T15:50:22.334336993Z",
+  "kind": "result"
+}
