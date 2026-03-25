@@ -503,6 +503,67 @@ DONE:
 }
 ";
 
+/// PTX source for `f32_to_bf16_kernel`: convert f32 → bf16 (stored as u16).
+///
+/// BF16 is the top 16 bits of f32 with round-to-nearest-even. We do this
+/// with integer bit ops: add rounding bias 0x7FFF + bit 16 of the value,
+/// then shift right 16. This works on sm_52+ (no special bf16 instructions
+/// needed).
+#[cfg(feature = "cuda")]
+pub(crate) const F32_TO_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry f32_to_bf16_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %in, %out, %off_in, %off_out;
+    .reg .f32 %vf;
+    .reg .u32 %bits, %round, %lsb, %result;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off_in, %r_tid;
+    shl.b64 %off_in, %off_in, 2;
+    add.u64 %in, %in, %off_in;
+
+    cvt.u64.u32 %off_out, %r_tid;
+    shl.b64 %off_out, %off_out, 1;
+    add.u64 %out, %out, %off_out;
+
+    // Load f32 as raw bits
+    ld.global.u32 %bits, [%in];
+
+    // Round-to-nearest-even: add (0x7FFF + bit[16]) then shift right 16
+    shr.u32 %lsb, %bits, 16;
+    and.b32 %lsb, %lsb, 1;
+    add.u32 %round, %bits, 0x7FFF;
+    add.u32 %round, %round, %lsb;
+    shr.u32 %result, %round, 16;
+
+    // Store as u16
+    st.global.u16 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
 // ---------------------------------------------------------------------------
 // Small matmul PTX kernel: C = A @ B, one thread per output element
 // ---------------------------------------------------------------------------
@@ -7086,6 +7147,58 @@ pub(crate) fn gpu_f32_to_f16(
 /// Stub -- always returns [`GpuError::NoCudaFeature`].
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn gpu_f32_to_f16(_input: &CudaBuffer<f32>, _device: &GpuDevice) -> GpuResult<()> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Convert f32 GPU buffer to bf16 (stored as u16) on-device.
+///
+/// Uses bit manipulation for round-to-nearest-even bf16 conversion.
+/// Works on sm_52+ (no special bf16 hardware required).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_f32_to_bf16(
+    input: &CudaBuffer<f32>,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = input.len();
+    if n == 0 {
+        let empty = device.stream().alloc_zeros::<u16>(0)?;
+        return Ok(empty);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = crate::module_cache::get_or_compile(
+        ctx,
+        F32_TO_BF16_PTX,
+        "f32_to_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|_| GpuError::PtxCompileFailed {
+        kernel: "f32_to_bf16_kernel",
+    })?;
+
+    let mut out = stream.alloc_zeros::<u16>(n)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(&mut out)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn gpu_f32_to_bf16(_input: &CudaBuffer<f32>, _device: &GpuDevice) -> GpuResult<()> {
     Err(GpuError::NoCudaFeature)
 }
 

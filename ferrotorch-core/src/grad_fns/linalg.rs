@@ -2006,7 +2006,14 @@ pub fn bmm<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
     // GPU path.
     if a.is_cuda() {
         if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
-            let handle = backend.bmm_f32(a.gpu_handle()?, b.gpu_handle()?, batch, m, k, n)?;
+            // Use f16 Tensor Core path when autocast selects ReducedPrecision.
+            let handle = if is_f32::<T>()
+                && autocast_guard("bmm") == Some(AutocastCategory::ReducedPrecision)
+            {
+                backend.bmm_f16_f32(a.gpu_handle()?, b.gpu_handle()?, batch, m, k, n)?
+            } else {
+                backend.bmm_f32(a.gpu_handle()?, b.gpu_handle()?, batch, m, k, n)?
+            };
             return Tensor::from_storage(TensorStorage::gpu(handle), out_shape, false);
         }
     }
