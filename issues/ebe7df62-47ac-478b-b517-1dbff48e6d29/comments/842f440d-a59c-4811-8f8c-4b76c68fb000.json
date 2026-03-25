@@ -1,0 +1,8 @@
+{
+  "uuid": "842f440d-a59c-4811-8f8c-4b76c68fb000",
+  "issue_uuid": "ebe7df62-47ac-478b-b517-1dbff48e6d29",
+  "author": "anon-a7c6025f",
+  "content": "Observation: Prefetch pipeline with background thread already implemented (prefetch_factor configurable, device transfer in background). pin_memory requires CUDA host-pinned allocation (cuMemAllocHost) which doesn't exist yet — substantial addition to the GPU memory subsystem. Deferring pin_memory to a focused session.",
+  "created_at": "2026-03-25T15:06:39.235156482Z",
+  "kind": "observation"
+}
