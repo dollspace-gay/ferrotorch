@@ -14,10 +14,14 @@ use ferrotorch_core::storage::TensorStorage;
 use ferrotorch_core::{FerrotorchResult, Float, Tensor};
 use ferrotorch_nn::{Module, Parameter};
 
+/// Default bucket size for gradient bucketing (25 MB).
+const DEFAULT_BUCKET_SIZE_BYTES: usize = 25 * 1024 * 1024;
+
 /// Distributed Data Parallel module wrapper.
 ///
 /// Wraps an inner [`Module`] and provides [`sync_gradients`] to allreduce
-/// parameter gradients across all ranks. Typical usage:
+/// parameter gradients across all ranks. Parameters are grouped into
+/// buckets (default 25 MB) for efficient communication.
 ///
 /// ```ignore
 /// let ddp = DDP::new(model, backend);
@@ -31,29 +35,36 @@ use ferrotorch_nn::{Module, Parameter};
 ///     optimizer.zero_grad()?;
 /// }
 /// ```
-///
-/// # Design note
-///
-/// Unlike PyTorch's DDP, which hooks into the autograd engine to overlap
-/// communication with backward computation, this MVP performs gradient
-/// synchronization as an explicit step after backward. Overlapped
-/// communication can be added later by bucketing parameters and
-/// registering autograd hooks.
 pub struct DDP<M: Module<T>, T: Float> {
     module: M,
     backend: Arc<dyn Backend>,
+    /// Bucket assignments: `buckets[i]` is a list of parameter indices in bucket i.
+    buckets: Vec<Vec<usize>>,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<M: Module<T>, T: Float> DDP<M, T> {
     /// Wrap a module for distributed data-parallel training.
     ///
-    /// All ranks must hold the same initial model weights (e.g., loaded
-    /// from a checkpoint or broadcast from rank 0).
+    /// Parameters are assigned to ~25 MB gradient buckets in reverse order
+    /// (matching PyTorch's convention — backward computes gradients in
+    /// reverse parameter order, so the first bucket fills first).
     pub fn new(module: M, backend: Arc<dyn Backend>) -> Self {
+        Self::with_bucket_size(module, backend, DEFAULT_BUCKET_SIZE_BYTES)
+    }
+
+    /// Wrap a module with a custom bucket size (in bytes).
+    pub fn with_bucket_size(
+        module: M,
+        backend: Arc<dyn Backend>,
+        bucket_size_bytes: usize,
+    ) -> Self {
+        let params = module.parameters();
+        let buckets = compute_buckets::<T>(&params, bucket_size_bytes);
         Self {
             module,
             backend,
+            buckets,
             _marker: std::marker::PhantomData,
         }
     }
@@ -78,63 +89,66 @@ impl<M: Module<T>, T: Float> DDP<M, T> {
         &self.backend
     }
 
-    /// Allreduce all parameter gradients across ranks (mean reduction).
+    /// Allreduce parameter gradients across ranks using gradient bucketing.
     ///
-    /// Call this after `backward()` and before `optimizer.step()`. Every
-    /// parameter is included in the flat gradient buffer (using zeros for
-    /// parameters without gradients) so that all ranks always exchange
-    /// buffers of identical size. Each parameter's `.grad()` is then
-    /// replaced with the mean gradient across all ranks.
+    /// Parameters are grouped into ~25 MB buckets. Each bucket is
+    /// allreduced independently as a single flat buffer. This enables
+    /// future overlapped communication where the first bucket can start
+    /// transferring while backward is still computing later gradients.
+    ///
+    /// Call this after `backward()` and before `optimizer.step()`.
     pub fn sync_gradients(&self) -> FerrotorchResult<()> {
         let params = self.module.parameters();
 
-        // Build a flat buffer that ALWAYS includes every parameter.
-        // This ensures all ranks produce the same buffer size even if
-        // some parameters lack gradients on certain ranks (B9).
-        let mut flat_data: Vec<T> = Vec::new();
-        let mut param_numels: Vec<usize> = Vec::new();
+        for bucket in &self.buckets {
+            // Build flat buffer for this bucket.
+            let mut flat_data: Vec<T> = Vec::new();
+            let mut param_numels: Vec<usize> = Vec::new();
 
-        for param in &params {
-            let numel = param.tensor().numel();
-            param_numels.push(numel);
+            for &pi in bucket {
+                let param = &params[pi];
+                let numel = param.tensor().numel();
+                param_numels.push(numel);
 
-            let grad = param.tensor().grad()?;
-            match grad {
-                Some(g) => {
-                    // Handle GPU gradients by transferring to CPU (B16).
-                    let data = g.data_vec()?;
-                    flat_data.extend(data);
-                }
-                None => {
-                    flat_data.extend(std::iter::repeat_n(<T as num_traits::Zero>::zero(), numel));
+                let grad = param.tensor().grad()?;
+                match grad {
+                    Some(g) => {
+                        let data = g.data_vec()?;
+                        flat_data.extend(data);
+                    }
+                    None => {
+                        flat_data.extend(
+                            std::iter::repeat_n(<T as num_traits::Zero>::zero(), numel),
+                        );
+                    }
                 }
             }
-        }
 
-        if flat_data.is_empty() {
-            return Ok(());
-        }
+            if flat_data.is_empty() {
+                continue;
+            }
 
-        // Allreduce the single flat buffer.
-        let flat_tensor = Tensor::from_storage(
-            TensorStorage::cpu(flat_data),
-            vec![param_numels.iter().sum()],
-            false,
-        )?;
-        let synced = allreduce(&flat_tensor, self.backend.as_ref(), ReduceOp::Mean)?;
-        let synced_data = synced.data()?;
-
-        // Scatter the synced buffer back into per-parameter gradients.
-        let mut offset = 0;
-        for (param, &numel) in params.iter().zip(param_numels.iter()) {
-            let grad_slice = &synced_data[offset..offset + numel];
-            let grad_tensor = Tensor::from_storage(
-                TensorStorage::cpu(grad_slice.to_vec()),
-                param.tensor().shape().to_vec(),
+            // Allreduce this bucket.
+            let flat_tensor = Tensor::from_storage(
+                TensorStorage::cpu(flat_data),
+                vec![param_numels.iter().sum()],
                 false,
             )?;
-            param.tensor().set_grad(Some(grad_tensor))?;
-            offset += numel;
+            let synced = allreduce(&flat_tensor, self.backend.as_ref(), ReduceOp::Mean)?;
+            let synced_data = synced.data()?;
+
+            // Scatter back to per-parameter gradients.
+            let mut offset = 0;
+            for (&pi, &numel) in bucket.iter().zip(param_numels.iter()) {
+                let grad_slice = &synced_data[offset..offset + numel];
+                let grad_tensor = Tensor::from_storage(
+                    TensorStorage::cpu(grad_slice.to_vec()),
+                    params[pi].tensor().shape().to_vec(),
+                    false,
+                )?;
+                params[pi].tensor().set_grad(Some(grad_tensor))?;
+                offset += numel;
+            }
         }
 
         Ok(())
@@ -197,6 +211,42 @@ impl<M: Module<T>, T: Float> Module<T> for DDP<M, T> {
     fn is_training(&self) -> bool {
         self.module.is_training()
     }
+}
+
+/// Assign parameters to gradient buckets.
+///
+/// Parameters are added in reverse order (matching PyTorch — backward
+/// computes gradients in reverse parameter order, so the last parameters
+/// fill the first bucket). Each bucket holds at most `bucket_size_bytes`
+/// of gradient data.
+fn compute_buckets<T: Float>(
+    params: &[&Parameter<T>],
+    bucket_size_bytes: usize,
+) -> Vec<Vec<usize>> {
+    let elem_size = std::mem::size_of::<T>();
+    let mut buckets: Vec<Vec<usize>> = Vec::new();
+    let mut current_bucket: Vec<usize> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    // Reverse order: last parameter first.
+    for i in (0..params.len()).rev() {
+        let param_bytes = params[i].tensor().numel() * elem_size;
+
+        if !current_bucket.is_empty() && current_bytes + param_bytes > bucket_size_bytes {
+            buckets.push(current_bucket);
+            current_bucket = Vec::new();
+            current_bytes = 0;
+        }
+
+        current_bucket.push(i);
+        current_bytes += param_bytes;
+    }
+
+    if !current_bucket.is_empty() {
+        buckets.push(current_bucket);
+    }
+
+    buckets
 }
 
 #[cfg(test)]
