@@ -1,0 +1,8 @@
+{
+  "uuid": "fa23dffa-6c1f-45a1-92cd-eee643dcc898",
+  "issue_uuid": "b038235b-9226-488c-9a57-14f929802635",
+  "author": "anon-a7c6025f",
+  "content": "Delivered: Vec4 PTX kernels for add and mul using ld.global.v4.f32 / st.global.v4.f32 (128-bit memory transactions). Each thread processes 4 floats. try_launch_binary_vec4 helper with automatic fallback to scalar kernel when n is not aligned or compilation fails. gpu_add and gpu_mul now try vec4 first when n >= 16 and n % 4 == 0. 810 core + 193 gpu tests pass.",
+  "created_at": "2026-03-25T15:46:21.351632162Z",
+  "kind": "result"
+}
