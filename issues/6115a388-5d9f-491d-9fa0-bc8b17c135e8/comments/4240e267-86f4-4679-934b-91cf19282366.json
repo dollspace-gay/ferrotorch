@@ -1,0 +1,8 @@
+{
+  "uuid": "4240e267-86f4-4679-934b-91cf19282366",
+  "issue_uuid": "6115a388-5d9f-491d-9fa0-bc8b17c135e8",
+  "author": "anon-a7c6025f",
+  "content": "Plan: The current backward engine in graph.rs processes nodes sequentially in reverse topological order on a single thread. PyTorch uses a multi-threaded engine where independent backward nodes can execute in parallel.\n\nKey insight: in the autograd DAG, nodes at the same depth level are independent and can run concurrently. For GPU models, parallel execution of independent backward ops on different streams provides overlap.\n\nApproach:\n1. Convert the sequential backward loop to a work-stealing thread pool\n2. Use a ready queue: a node becomes ready when all its consumers have been processed\n3. Worker threads pull from the ready queue and process backward nodes\n4. Per-device stream assignment so GPU kernels overlap\n5. Synchronize at the end before returning gradients\n\nStarting with the analysis of the current backward engine structure.",
+  "created_at": "2026-03-25T16:17:12.374028378Z",
+  "kind": "plan"
+}
