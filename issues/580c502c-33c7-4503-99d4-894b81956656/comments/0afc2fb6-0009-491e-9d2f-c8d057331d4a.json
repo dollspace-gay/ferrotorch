@@ -1,0 +1,8 @@
+{
+  "uuid": "0afc2fb6-0009-491e-9d2f-c8d057331d4a",
+  "issue_uuid": "580c502c-33c7-4503-99d4-894b81956656",
+  "author": "anon-a7c6025f",
+  "content": "Delivered: Replaced serial per-head attention loop (num_heads iterations × 2 mm calls each) with 2 bmm calls for all heads in parallel. K^T uses zero-copy permute from CL-261. Scale and causal mask operate on the batched 3D tensor. New helpers: transpose_heads_to_2d (inverse reshape), apply_causal_mask_3d. 808 nn + 6 integration tests pass.",
+  "created_at": "2026-03-25T15:10:33.062515960Z",
+  "kind": "result"
+}
