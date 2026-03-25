@@ -126,6 +126,19 @@ impl<T: Element> TensorStorage<T> {
         }
     }
 
+    /// Get a mutable GPU buffer handle. Returns `None` for CPU storage.
+    ///
+    /// # Safety note
+    ///
+    /// Callers must ensure exclusive access to the storage (e.g. via the
+    /// same unsafe contract as `update_data`).
+    pub fn gpu_handle_mut(&mut self) -> Option<&mut GpuBufferHandle> {
+        match &mut self.data {
+            StorageBuffer::Gpu(h) => Some(h),
+            StorageBuffer::Cpu(_) => None,
+        }
+    }
+
     /// Fallible clone — same as `Clone::clone` but returns `Result` instead
     /// of panicking when the GPU backend is missing or a CUDA call fails.
     pub fn try_clone(&self) -> crate::error::FerrotorchResult<Self> {

@@ -639,6 +639,32 @@ pub trait GpuBackend: Send + Sync {
             message: "qr_f32 GPU op not yet implemented".into(),
         })
     }
+
+    /// Fused Adam optimizer step: updates param, exp_avg, and exp_avg_sq
+    /// in a single kernel launch.
+    ///
+    /// All four buffers (`param`, `grad`, `exp_avg`, `exp_avg_sq`) must have
+    /// the same length. `param`, `exp_avg`, and `exp_avg_sq` are modified
+    /// in-place.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_adam_f32(
+        &self,
+        _param: &mut GpuBufferHandle,
+        _grad: &GpuBufferHandle,
+        _exp_avg: &mut GpuBufferHandle,
+        _exp_avg_sq: &mut GpuBufferHandle,
+        _beta1: f32,
+        _beta2: f32,
+        _lr: f32,
+        _eps: f32,
+        _bc1: f32,
+        _bc2: f32,
+        _weight_decay: f32,
+    ) -> FerrotorchResult<()> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "fused_adam_f32 GPU op not yet implemented".into(),
+        })
+    }
 }
 
 static GPU_BACKEND: OnceLock<Box<dyn GpuBackend>> = OnceLock::new();
