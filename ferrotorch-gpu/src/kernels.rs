@@ -1755,6 +1755,110 @@ DONE:\n\
 // Sum-axis PTX kernel: reduce along one axis of a tensor
 // ---------------------------------------------------------------------------
 // Parameters: input_ptr, output_ptr, outer_size, axis_size, inner_size, total_output
+/// PTX source for `reduce_sum_kernel`: parallel block-level sum reduction.
+///
+/// Each block reduces a contiguous chunk of the input array using shared
+/// memory. Threads first accumulate a sequential sum (grid-stride loop),
+/// store to shared memory, then do a tree reduction within the block.
+/// Each block writes one partial sum to `output[blockIdx.x]`.
+///
+/// For a full reduction, launch once to get partial sums, then launch
+/// again on the partial sums (or reduce on CPU if few blocks).
+#[cfg(feature = "cuda")]
+pub(crate) const REDUCE_SUM_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+// Shared memory for intra-block reduction (256 floats = 1024 bytes).
+.shared .align 4 .f32 sdata[256];
+
+.visible .entry reduce_sum_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %tid, %bid, %bdim, %gdim, %n_reg, %idx, %stride, %half;
+    .reg .u64 %in, %out, %off;
+    .reg .f32 %sum, %other;
+    .reg .pred %p, %ptid;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %tid, %tid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %gdim, %nctaid.x;
+
+    // Grid-stride accumulation: each thread sums multiple elements.
+    // idx = bid * bdim + tid; stride = bdim * gdim
+    mad.lo.u32 %idx, %bid, %bdim, %tid;
+    mul.lo.u32 %stride, %bdim, %gdim;
+    mov.f32 %sum, 0f00000000;
+
+GRID_LOOP:
+    setp.ge.u32 %p, %idx, %n_reg;
+    @%p bra GRID_DONE;
+
+    cvt.u64.u32 %off, %idx;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %in, %off;
+    ld.global.f32 %other, [%off];
+    add.f32 %sum, %sum, %other;
+    add.u32 %idx, %idx, %stride;
+    bra GRID_LOOP;
+
+GRID_DONE:
+    // Write thread's partial sum to shared memory.
+    cvt.u64.u32 %off, %tid;
+    shl.b64 %off, %off, 2;
+    st.shared.f32 [sdata + %off], %sum;
+    bar.sync 0;
+
+    // Tree reduction in shared memory.
+    mov.u32 %half, 128;
+TREE_LOOP:
+    setp.lt.u32 %p, %half, 1;
+    @%p bra TREE_DONE;
+
+    setp.ge.u32 %ptid, %tid, %half;
+    @%ptid bra TREE_SKIP;
+
+    // Load partner's value from sdata[tid + half].
+    add.u32 %idx, %tid, %half;
+    cvt.u64.u32 %off, %idx;
+    shl.b64 %off, %off, 2;
+    ld.shared.f32 %other, [sdata + %off];
+    // Load own value.
+    cvt.u64.u32 %off, %tid;
+    shl.b64 %off, %off, 2;
+    ld.shared.f32 %sum, [sdata + %off];
+    add.f32 %sum, %sum, %other;
+    st.shared.f32 [sdata + %off], %sum;
+
+TREE_SKIP:
+    bar.sync 0;
+    shr.u32 %half, %half, 1;
+    bra TREE_LOOP;
+
+TREE_DONE:
+    // Thread 0 writes block result.
+    setp.ne.u32 %ptid, %tid, 0;
+    @%ptid bra END;
+
+    ld.shared.f32 %sum, [sdata];
+    cvt.u64.u32 %off, %bid;
+    shl.b64 %off, %off, 2;
+    add.u64 %out, %out, %off;
+    st.global.f32 [%out], %sum;
+
+END:
+    ret;
+}
+";
+
 // Thread i: output[i] = sum_{k=0}^{axis_size-1} input[outer_idx * axis_size * inner_size + k * inner_size + inner_idx]
 // where outer_idx = i / inner_size, inner_idx = i % inner_size.
 
@@ -4648,6 +4752,91 @@ pub fn gpu_softmax_backward(
 /// Reduce along one axis of a tensor.
 ///
 /// Thread i computes:
+/// Full parallel sum reduction on GPU.
+///
+/// Uses a two-pass approach: first pass reduces `n` elements to `num_blocks`
+/// partial sums via the `reduce_sum_kernel`, second pass reduces the partial
+/// sums to a single scalar. For small inputs (< 256 blocks), the second pass
+/// runs on CPU to avoid kernel launch overhead.
+#[cfg(feature = "cuda")]
+pub fn gpu_reduce_sum(
+    a: &CudaBuffer<f32>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = a.len();
+    if n == 0 {
+        return cpu_to_gpu(&[0.0f32], device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        REDUCE_SUM_PTX,
+        "reduce_sum_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback
+            let host = gpu_to_cpu(a, device)?;
+            let total: f32 = host.iter().sum();
+            return cpu_to_gpu(&[total], device);
+        }
+    };
+
+    // Pass 1: reduce to partial sums (one per block).
+    const BLOCK: u32 = 256;
+    let num_blocks = ((n as u32).saturating_add(BLOCK - 1)) / BLOCK;
+    // Cap blocks to avoid excessive partial sums.
+    let num_blocks = num_blocks.min(1024);
+
+    let mut partials = alloc_zeros_f32(num_blocks as usize, device)?;
+    let n_u32 = n as u32;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_blocks.max(1), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0, // Statically allocated in PTX
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(partials.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    // Pass 2: reduce partial sums.
+    if num_blocks <= 1 {
+        return Ok(partials);
+    }
+
+    // For small number of blocks, reduce on CPU (cheaper than another kernel launch).
+    if num_blocks <= 256 {
+        let host_partials = gpu_to_cpu(&partials, device)?;
+        let total: f32 = host_partials.iter().sum();
+        return cpu_to_gpu(&[total], device);
+    }
+
+    // For many blocks, recurse with another kernel launch.
+    gpu_reduce_sum(&partials, device)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_reduce_sum(
+    _a: &CudaBuffer<f32>,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
 ///   `output[i] = sum_{k=0}^{axis_size-1} input[outer_idx * axis_size * inner_size + k * inner_size + inner_idx]`
 ///
 /// where `outer_idx = i / inner_size`, `inner_idx = i % inner_size`.
