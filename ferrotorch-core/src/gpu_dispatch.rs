@@ -265,6 +265,14 @@ pub trait GpuBackend: Send + Sync {
         b_shape: &[usize],
         out_shape: &[usize],
     ) -> FerrotorchResult<GpuBufferHandle>;
+    fn broadcast_div_f32(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        a_shape: &[usize],
+        b_shape: &[usize],
+        out_shape: &[usize],
+    ) -> FerrotorchResult<GpuBufferHandle>;
 
     // Softmax f32 (row-wise over last dim)
     fn softmax_f32(

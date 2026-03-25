@@ -3581,6 +3581,91 @@ DONE:
 }
 ";
 
+/// PTX source for `broadcast_div_kernel`: broadcast division, identical structure
+/// to `broadcast_mul_kernel` but uses `div.f32` instead of `mul.f32`.
+#[cfg(feature = "cuda")]
+pub(crate) const BROADCAST_DIV_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry broadcast_div_kernel(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 out_ptr,
+    .param .u64 a_strides_ptr,
+    .param .u64 b_strides_ptr,
+    .param .u64 out_shape_ptr,
+    .param .u32 n,
+    .param .u32 ndim
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg, %ndim_reg;
+    .reg .u32 %remaining, %a_idx, %b_idx, %d;
+    .reg .u32 %shape_d, %a_str_d, %b_str_d, %coord;
+    .reg .u64 %a, %b, %out, %a_str, %b_str, %oshape;
+    .reg .u64 %off_a, %off_b, %off_out, %d64, %tmp;
+    .reg .f32 %va, %vb, %vr;
+    .reg .pred %p, %loop_p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %b, [b_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %a_str, [a_strides_ptr];
+    ld.param.u64 %b_str, [b_strides_ptr];
+    ld.param.u64 %oshape, [out_shape_ptr];
+    ld.param.u32 %n_reg, [n];
+    ld.param.u32 %ndim_reg, [ndim];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    mov.u32 %remaining, %r_tid;
+    mov.u32 %a_idx, 0;
+    mov.u32 %b_idx, 0;
+    mov.u32 %d, %ndim_reg;
+LOOP:
+    setp.eq.u32 %loop_p, %d, 0;
+    @%loop_p bra END_LOOP;
+    sub.u32 %d, %d, 1;
+    cvt.u64.u32 %d64, %d;
+    shl.b64 %d64, %d64, 2;
+    add.u64 %tmp, %oshape, %d64;
+    ld.global.u32 %shape_d, [%tmp];
+    add.u64 %tmp, %a_str, %d64;
+    ld.global.u32 %a_str_d, [%tmp];
+    add.u64 %tmp, %b_str, %d64;
+    ld.global.u32 %b_str_d, [%tmp];
+    rem.u32 %coord, %remaining, %shape_d;
+    div.u32 %remaining, %remaining, %shape_d;
+    mad.lo.u32 %a_idx, %coord, %a_str_d, %a_idx;
+    mad.lo.u32 %b_idx, %coord, %b_str_d, %b_idx;
+    bra LOOP;
+END_LOOP:
+
+    cvt.u64.u32 %off_a, %a_idx;
+    shl.b64 %off_a, %off_a, 2;
+    add.u64 %off_a, %a, %off_a;
+    ld.global.f32 %va, [%off_a];
+    cvt.u64.u32 %off_b, %b_idx;
+    shl.b64 %off_b, %off_b, 2;
+    add.u64 %off_b, %b, %off_b;
+    ld.global.f32 %vb, [%off_b];
+
+    div.f32 %vr, %va, %vb;
+
+    cvt.u64.u32 %off_out, %r_tid;
+    shl.b64 %off_out, %off_out, 2;
+    add.u64 %off_out, %out, %off_out;
+    st.global.f32 [%off_out], %vr;
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `strided_split_kernel`: extract a sub-tensor along a given axis.
 ///
 /// Thread `i` computes:
@@ -5076,6 +5161,38 @@ pub fn gpu_broadcast_mul(
     }
 
     cpu_fallback_broadcast_binary(a, b, a_shape, b_shape, out_shape, device, |x, y| x * y)
+}
+
+/// Broadcast division: `out[i] = a[bcast_a(i)] / b[bcast_b(i)]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_broadcast_div(
+    a: &CudaBuffer<f32>,
+    b: &CudaBuffer<f32>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    let a_str = broadcast_strides(a_shape, out_shape);
+    let b_str = broadcast_strides(b_shape, out_shape);
+    let shape_u32: Vec<u32> = out_shape.iter().map(|&d| d as u32).collect();
+    let out_numel: usize = out_shape.iter().product();
+
+    if let Some(out) = try_launch_broadcast_binary(
+        a,
+        b,
+        &a_str,
+        &b_str,
+        &shape_u32,
+        out_numel,
+        device,
+        BROADCAST_DIV_PTX,
+        "broadcast_div_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    cpu_fallback_broadcast_binary(a, b, a_shape, b_shape, out_shape, device, |x, y| x / y)
 }
 
 /// CPU fallback for broadcast binary ops — downloads, applies op with
