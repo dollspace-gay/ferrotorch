@@ -1,0 +1,8 @@
+{
+  "uuid": "bbd9c701-6ab7-4f24-90eb-c3993fc61b14",
+  "issue_uuid": "50cdef76-d822-4db8-b3b0-574f987111a8",
+  "author": "anon-a7c6025f",
+  "content": "Current unscale_ downloads grads to CPU via .data(), scales on CPU, creates new CPU tensor. Fix: for GPU f32 grads, use backend.scale_f32 with inv_scale to keep everything on GPU. Check for inf/NaN via a GPU reduction (sum and check for non-finite).",
+  "created_at": "2026-03-25T13:17:49.251297411Z",
+  "kind": "plan"
+}
