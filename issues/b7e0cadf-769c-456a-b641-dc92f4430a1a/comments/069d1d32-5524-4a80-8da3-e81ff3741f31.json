@@ -1,0 +1,8 @@
+{
+  "uuid": "069d1d32-5524-4a80-8da3-e81ff3741f31",
+  "issue_uuid": "b7e0cadf-769c-456a-b641-dc92f4430a1a",
+  "author": "anon-a7c6025f",
+  "content": "Observation: None of these GPU kernels exist yet (0 matches in kernels.rs). Each requires a new PTX kernel + backend wiring + forward dispatch changes. GroupNorm alone needs mean+variance computation per group. This is 4 separate kernel implementations — splitting into focused work items.",
+  "created_at": "2026-03-25T15:47:36.198795359Z",
+  "kind": "observation"
+}
