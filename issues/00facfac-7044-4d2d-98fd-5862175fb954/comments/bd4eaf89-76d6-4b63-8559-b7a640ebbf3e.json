@@ -1,0 +1,8 @@
+{
+  "uuid": "bd4eaf89-76d6-4b63-8559-b7a640ebbf3e",
+  "issue_uuid": "00facfac-7044-4d2d-98fd-5862175fb954",
+  "author": "anon-a7c6025f",
+  "content": "Delivered:\n1. Added GpuBackend::conv2d_f32() trait method + CudaBackendImpl wiring to gpu_conv2d_f32\n2. Conv2d::forward now dispatches to GPU for f32 CUDA tensors — im2col + GEMM + bias entirely on-device\n3. Backward still uses CPU path (stores im2col cols from a CPU recompute), but forward is fully GPU\n4. Full GPU backward (recomputing im2col on GPU) deferred — would require the backward to also call gpu_conv2d infrastructure\n\nThis eliminates the CPU roundtrip for the forward pass. Backward is the next optimization target.\n46 conv + 6 integration tests pass.",
+  "created_at": "2026-03-25T21:26:14.955458062Z",
+  "kind": "result"
+}
