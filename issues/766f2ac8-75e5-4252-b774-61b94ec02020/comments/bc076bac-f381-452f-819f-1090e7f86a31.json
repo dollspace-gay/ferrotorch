@@ -1,0 +1,8 @@
+{
+  "uuid": "bc076bac-f381-452f-819f-1090e7f86a31",
+  "issue_uuid": "766f2ac8-75e5-4252-b774-61b94ec02020",
+  "author": "anon-a7c6025f",
+  "content": "Root cause: im2col iterates in (channel, kh, kw, oh, ow) order — the input reads jump by width between consecutive oh values, causing L1/L2 cache misses. The output writes are sequential, but reads dominate cost for large feature maps.\n\nFix: reorder to (batch, oh, ow, c, kh, kw) for spatial-major input access. Also eliminate the per-element padding branch with a fast path for the common non-padded interior region.",
+  "created_at": "2026-03-25T16:48:40.661743714Z",
+  "kind": "observation"
+}
