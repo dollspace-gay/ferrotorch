@@ -1,0 +1,8 @@
+{
+  "uuid": "1b578e18-8d00-459c-a1fe-c07b61b942bb",
+  "issue_uuid": "b7e0cadf-769c-456a-b641-dc92f4430a1a",
+  "author": "anon-a7c6025f",
+  "content": "Observation: Only LayerNorm has GPU kernels. BatchNorm, GroupNorm, MaxPool2d, AvgPool2d have zero GPU coverage.\n\nPrioritizing BatchNorm forward since it's used in every CNN training step. The approach: BatchNorm computes per-channel mean and variance, then normalizes. On GPU this is a per-channel parallel reduction + elementwise normalization. Can reuse the reduce_sum_kernel pattern from CL-338.",
+  "created_at": "2026-03-25T21:27:34.970118255Z",
+  "kind": "observation"
+}
