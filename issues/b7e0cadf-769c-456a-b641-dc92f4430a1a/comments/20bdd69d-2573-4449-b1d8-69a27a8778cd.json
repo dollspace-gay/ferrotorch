@@ -1,0 +1,8 @@
+{
+  "uuid": "20bdd69d-2573-4449-b1d8-69a27a8778cd",
+  "issue_uuid": "b7e0cadf-769c-456a-b641-dc92f4430a1a",
+  "author": "anon-a7c6025f",
+  "content": "Starting investigation of missing GPU kernels. Need to check: (1) which norm/pool ops already have GPU dispatch, (2) which fall back to CPU, (3) what PyTorch's approach is for each.",
+  "created_at": "2026-03-25T21:27:12.271839889Z",
+  "kind": "plan"
+}
