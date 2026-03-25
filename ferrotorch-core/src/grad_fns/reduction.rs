@@ -132,7 +132,37 @@ impl<T: Float> GradFn<T> for MeanBackward<T> {
 /// When gradient tracking is enabled and the input requires grad, the returned
 /// tensor carries a [`MeanBackward`] node.
 pub fn mean<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    let result = elementwise::mean(input)?;
+    // GPU path: use GPU sum kernel + scalar divide (avoids CPU round-trip).
+    let result = if input.is_cuda() && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let sum_handle = backend.sum_f32(input.gpu_handle()?, input.numel())?;
+            // Divide by numel to get mean.
+            let n = input.numel() as f32;
+            let inv_n_data = vec![1.0f32 / n];
+            let inv_n_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    inv_n_data.as_ptr() as *const u8,
+                    inv_n_data.len() * 4,
+                )
+            };
+            let device = input.device();
+            let ordinal = match device {
+                crate::device::Device::Cuda(o) => o,
+                _ => 0,
+            };
+            let inv_handle = backend.cpu_to_gpu(inv_n_bytes, 4, ordinal)?;
+            let mean_handle = backend.mul_f32(&sum_handle, &inv_handle)?;
+            Tensor::from_storage(
+                TensorStorage::gpu(mean_handle),
+                vec![],
+                false,
+            )?
+        } else {
+            elementwise::mean(input)?
+        }
+    } else {
+        elementwise::mean(input)?
+    };
 
     if is_grad_enabled() && input.requires_grad() {
         let grad_fn = Arc::new(MeanBackward {
@@ -355,13 +385,7 @@ pub fn sum_dim<T: Float>(
         });
     }
 
-    let input_cpu = if input.is_cuda() {
-        input.cpu()?
-    } else {
-        input.clone()
-    };
-    let in_data = input_cpu.data()?;
-    let in_shape = input_cpu.shape();
+    let in_shape = input.shape();
 
     // Compute output shape.
     let mut out_shape: Vec<usize> = in_shape.to_vec();
@@ -370,6 +394,40 @@ pub fn sum_dim<T: Float>(
     } else {
         out_shape.remove(norm_dim);
     }
+
+    // GPU path: use sum_axis kernel (no CPU round-trip).
+    let is_f32 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>();
+    if input.is_cuda() && is_f32 {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let handle = backend.sum_axis_f32(
+                input.gpu_handle()?,
+                in_shape,
+                norm_dim,
+            )?;
+
+            let storage = TensorStorage::gpu(handle);
+            return if is_grad_enabled() && input.requires_grad() {
+                let grad_fn = Arc::new(SumDimBackward {
+                    input: input.clone(),
+                    dim: norm_dim,
+                    keepdim,
+                });
+                Tensor::from_operation(storage, out_shape, grad_fn)
+            } else {
+                Tensor::from_storage(storage, out_shape, false)
+            };
+        }
+    }
+
+    // CPU path.
+    let input_cpu = if input.is_cuda() {
+        input.cpu()?
+    } else if !input.is_contiguous() {
+        input.contiguous()?
+    } else {
+        input.clone()
+    };
+    let in_data = input_cpu.data()?;
 
     // For the accumulation, we work with a "keepdim" view internally.
     let mut accum_shape: Vec<usize> = in_shape.to_vec();
@@ -396,17 +454,18 @@ pub fn sum_dim<T: Float>(
         accum[oi] += val;
     }
 
+    let device = input.device();
     if is_grad_enabled() && input.requires_grad() {
         let grad_fn = Arc::new(SumDimBackward {
             input: input.clone(),
             dim: norm_dim,
             keepdim,
         });
-        let result = Tensor::from_operation(TensorStorage::cpu(accum), out_shape, grad_fn)?;
-        result.to(input.device())
+        let storage = TensorStorage::on_device(accum, device)?;
+        Tensor::from_operation(storage, out_shape, grad_fn)
     } else {
-        let result = Tensor::from_storage(TensorStorage::cpu(accum), out_shape, false)?;
-        result.to(input.device())
+        let storage = TensorStorage::on_device(accum, device)?;
+        Tensor::from_storage(storage, out_shape, false)
     }
 }
 

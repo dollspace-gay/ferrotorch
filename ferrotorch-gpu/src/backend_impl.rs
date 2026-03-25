@@ -416,15 +416,10 @@ impl GpuBackend for CudaBackendImpl {
     // -- Reduction f32 --------------------------------------------------------
 
     fn sum_f32(&self, a: &GpuBufferHandle, _len: usize) -> FerrotorchResult<GpuBufferHandle> {
-        // No dedicated GPU sum kernel yet. Fall back to GPU -> CPU -> sum -> GPU.
         let a_buf = Self::unwrap_buffer(a)?;
         let dev = self.device(a.device_ordinal())?;
-        let host_data = crate::transfer::gpu_to_cpu(a_buf, dev).map_err(Self::map_gpu_err)?;
-
-        let total: f32 = host_data.iter().sum();
-
-        let result_buf = crate::transfer::cpu_to_gpu(&[total], dev).map_err(Self::map_gpu_err)?;
-        Ok(Self::wrap_buffer(result_buf, a.device_ordinal()))
+        let result = crate::kernels::gpu_reduce_sum(a_buf, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, a.device_ordinal()))
     }
 
     // -- Linalg f64 (cuBLAS DGEMM) --------------------------------------------
