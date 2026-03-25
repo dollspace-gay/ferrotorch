@@ -329,6 +329,22 @@ pub trait GpuBackend: Send + Sync {
         n: usize,
     ) -> FerrotorchResult<GpuBufferHandle>;
 
+    /// Batched matmul with f16 Tensor Core acceleration.
+    /// Takes f32 handles, converts to f16 internally, accumulates in f32.
+    fn bmm_f16_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _b: &GpuBufferHandle,
+        _batch: usize,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "bmm_f16_f32 GPU op not yet implemented".into(),
+        })
+    }
+
     // GELU activation f32
     fn gelu_f32(&self, a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle>;
 

@@ -685,6 +685,248 @@ pub fn gpu_matmul_f16(
 }
 
 // ---------------------------------------------------------------------------
+// Batched mixed-precision matmul (f16 inputs, f32 accumulate) via GemmStridedBatchedEx
+// ---------------------------------------------------------------------------
+
+/// Batched matrix multiply with f16 Tensor Core acceleration.
+///
+/// Takes f32 inputs, converts to f16 on-device, executes
+/// `cublasGemmStridedBatchedEx` with `CUDA_R_16F` operands and
+/// `CUBLAS_COMPUTE_32F` accumulation. Returns f32 output.
+///
+/// `a` is `[batch, m, k]`, `b` is `[batch, k, n]`, result is `[batch, m, n]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_bmm_f16(
+    a: &CudaBuffer<f32>,
+    b: &CudaBuffer<f32>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use core::ffi::c_void;
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if batch == 0 || m == 0 || k == 0 || n == 0 {
+        return alloc_zeros_f32(batch * m * n, device);
+    }
+    if a.len() != batch * m * k {
+        return Err(GpuError::ShapeMismatch {
+            op: "bmm_f16",
+            expected: vec![batch, m, k],
+            got: vec![a.len()],
+        });
+    }
+    if b.len() != batch * k * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "bmm_f16",
+            expected: vec![batch, k, n],
+            got: vec![b.len()],
+        });
+    }
+
+    let m_i32 = i32::try_from(m).map_err(|_| GpuError::ShapeMismatch {
+        op: "bmm_f16",
+        expected: vec![i32::MAX as usize],
+        got: vec![m],
+    })?;
+    let k_i32 = i32::try_from(k).map_err(|_| GpuError::ShapeMismatch {
+        op: "bmm_f16",
+        expected: vec![i32::MAX as usize],
+        got: vec![k],
+    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::ShapeMismatch {
+        op: "bmm_f16",
+        expected: vec![i32::MAX as usize],
+        got: vec![n],
+    })?;
+
+    // Convert f32 inputs to f16 on-device.
+    let a_f16 = crate::kernels::gpu_f32_to_f16(a, device)?;
+    let b_f16 = crate::kernels::gpu_f32_to_f16(b, device)?;
+
+    let mut c = alloc_zeros_f32(batch * m * n, device)?;
+
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let blas = device.blas();
+    let stream = device.stream();
+
+    {
+        let (a_ptr, _ra) = a_f16.device_ptr(&stream);
+        let (b_ptr, _rb) = b_f16.device_ptr(&stream);
+        let (c_ptr, _rc) = c.inner_mut().device_ptr_mut(&stream);
+
+        // Row-major trick: swap A/B and their leading dimensions.
+        // cuBLAS col-major: C = B_row @ A_row with lda=n, ldb=k, ldc=n.
+        // f16 strides are in u16 elements (half the byte size of f32).
+        let stride_a_f16 = (k * n) as i64; // B_row batch stride (in u16 elements)
+        let stride_b_f16 = (m * k) as i64; // A_row batch stride (in u16 elements)
+        let stride_c = (m * n) as i64;
+
+        unsafe {
+            cublas_result::gemm_strided_batched_ex(
+                *blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                m_i32,
+                k_i32,
+                (&alpha) as *const f32 as *const c_void,
+                b_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
+                n_i32,
+                stride_a_f16,
+                a_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
+                k_i32,
+                stride_b_f16,
+                (&beta) as *const f32 as *const c_void,
+                c_ptr as *mut c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                n_i32,
+                stride_c,
+                batch as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )?;
+        }
+    }
+
+    Ok(c)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_bmm_f16(
+    _a: &CudaBuffer<f32>,
+    _b: &CudaBuffer<f32>,
+    _batch: usize,
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+// ---------------------------------------------------------------------------
+// BF16 mixed-precision matmul via cublasGemmEx
+// ---------------------------------------------------------------------------
+
+/// Matrix multiply with bf16 Tensor Core acceleration.
+///
+/// Takes f32 inputs, converts to bf16 on-device, executes
+/// `cublasGemmEx` with `CUDA_R_BF16` operands and `CUBLAS_COMPUTE_32F`
+/// accumulation. Returns f32 output.
+///
+/// BF16 has the same exponent range as f32 (8 bits) so it handles large
+/// values better than f16, at the cost of less mantissa precision.
+#[cfg(feature = "cuda")]
+pub fn gpu_matmul_bf16(
+    a: &CudaBuffer<f32>,
+    b: &CudaBuffer<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use core::ffi::c_void;
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if a.len() != m * k {
+        return Err(GpuError::ShapeMismatch {
+            op: "matmul_bf16",
+            expected: vec![m, k],
+            got: vec![a.len()],
+        });
+    }
+    if b.len() != k * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "matmul_bf16",
+            expected: vec![k, n],
+            got: vec![b.len()],
+        });
+    }
+    if m == 0 || k == 0 || n == 0 {
+        return alloc_zeros_f32(m * n, device);
+    }
+
+    let m_i32 = i32::try_from(m).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16",
+        expected: vec![i32::MAX as usize],
+        got: vec![m],
+    })?;
+    let k_i32 = i32::try_from(k).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16",
+        expected: vec![i32::MAX as usize],
+        got: vec![k],
+    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16",
+        expected: vec![i32::MAX as usize],
+        got: vec![n],
+    })?;
+
+    let a_bf16 = crate::kernels::gpu_f32_to_bf16(a, device)?;
+    let b_bf16 = crate::kernels::gpu_f32_to_bf16(b, device)?;
+    let mut c = alloc_zeros_f32(m * n, device)?;
+
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let blas = device.blas();
+    let stream = device.stream();
+
+    {
+        let (a_ptr, _ra) = a_bf16.device_ptr(&stream);
+        let (b_ptr, _rb) = b_bf16.device_ptr(&stream);
+        let (c_ptr, _rc) = c.inner_mut().device_ptr_mut(&stream);
+
+        unsafe {
+            cublas_result::gemm_ex(
+                *blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                m_i32,
+                k_i32,
+                (&alpha) as *const f32 as *const c_void,
+                b_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                a_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                (&beta) as *const f32 as *const c_void,
+                c_ptr as *mut c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                n_i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )?;
+        }
+    }
+
+    Ok(c)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_matmul_bf16(
+    _a: &CudaBuffer<f32>,
+    _b: &CudaBuffer<f32>,
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+// ---------------------------------------------------------------------------
 // CPU fallback implementations
 // ---------------------------------------------------------------------------
 
