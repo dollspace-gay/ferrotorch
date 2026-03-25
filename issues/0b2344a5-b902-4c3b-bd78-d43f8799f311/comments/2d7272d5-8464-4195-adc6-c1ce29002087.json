@@ -1,0 +1,8 @@
+{
+  "uuid": "2d7272d5-8464-4195-adc6-c1ce29002087",
+  "issue_uuid": "0b2344a5-b902-4c3b-bd78-d43f8799f311",
+  "author": "anon-a7c6025f",
+  "content": "Analysis: ferray-ufunc's exp_f32/log_f32 call dispatch_unary_f32 with f32::exp/f32::ln as the scalar function. Even with pulp SIMD dispatch, the transcendental itself is scalar libm — LLVM cannot auto-vectorize complex libm functions.\n\nPlan: Write polynomial approximation kernels for exp/log directly in ferrotorch-core that ARE auto-vectorizable. The exp polynomial (range-reduction + Horner evaluation + 2^n scaling) uses only add/mul/round/bitops — all of which LLVM vectorizes. Replace ferray-ufunc calls in fast_exp/fast_log with these.\n\nExpected speedup: ~4-8x on AVX2 (4-8 elements per SIMD lane instead of 1).",
+  "created_at": "2026-03-25T12:47:54.612896369Z",
+  "kind": "plan"
+}
