@@ -1,0 +1,8 @@
+{
+  "uuid": "978a775a-cfca-489a-9a77-18f6a20d3bda",
+  "issue_uuid": "50cdef76-d822-4db8-b3b0-574f987111a8",
+  "author": "anon-a7c6025f",
+  "content": "Delivered: GradScaler::unscale_ now uses GPU scale_f32 + sum-based inf check for f32 GPU gradients. No CPU round-trip — gradient stays on GPU throughout. CPU path updated to use data_vec() (handles GPU tensors) and on_device() to preserve device. All 250 optim tests pass.",
+  "created_at": "2026-03-25T13:18:50.218296763Z",
+  "kind": "result"
+}
