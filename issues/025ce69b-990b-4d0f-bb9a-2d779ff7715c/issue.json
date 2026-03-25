@@ -2,11 +2,12 @@
   "uuid": "025ce69b-990b-4d0f-bb9a-2d779ff7715c",
   "display_id": 199,
   "title": "Add broadcast matmul and nn::Linear support for arbitrary-rank inputs",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-22T21:27:48.938053461Z",
-  "updated_at": "2026-03-22T21:27:56.279231898Z",
+  "updated_at": "2026-03-25T13:16:36.420187192Z",
+  "closed_at": "2026-03-25T13:16:36.420187192Z",
   "labels": [
     "feature"
   ]
