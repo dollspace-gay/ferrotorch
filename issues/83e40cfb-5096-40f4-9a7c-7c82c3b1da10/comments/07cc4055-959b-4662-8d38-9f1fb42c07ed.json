@@ -1,0 +1,8 @@
+{
+  "uuid": "07cc4055-959b-4662-8d38-9f1fb42c07ed",
+  "issue_uuid": "83e40cfb-5096-40f4-9a7c-7c82c3b1da10",
+  "author": "anon-a7c6025f",
+  "content": "Result: Fixed contiguous() severing the autograd chain. contiguous_t() was creating a new tensor via data_vec()+from_storage without a backward node, silently dropping the grad_fn. Added ContiguousBackward (identity gradient pass-through). Pythia gradcheck now shows 27/27 parameters with gradients (was 15/27). All attn_qkv.w weights across all 12 layers now receive gradients on GPU. Full ferrotorch test suite: 3,254 passed, 0 failed.",
+  "created_at": "2026-03-26T02:08:49.705013246Z",
+  "kind": "result"
+}
