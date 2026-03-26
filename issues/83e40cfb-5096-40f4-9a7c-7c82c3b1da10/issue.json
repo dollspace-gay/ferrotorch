@@ -1,0 +1,10 @@
+{
+  "uuid": "83e40cfb-5096-40f4-9a7c-7c82c3b1da10",
+  "display_id": 411,
+  "title": "Fix LinearFusedBackward GPU path returning wrong gradient count when bias is None",
+  "status": "open",
+  "priority": "critical",
+  "created_by": "anon-a7c6025f",
+  "created_at": "2026-03-26T01:42:20.012864058Z",
+  "updated_at": "2026-03-26T01:42:20.012864058Z"
+}
