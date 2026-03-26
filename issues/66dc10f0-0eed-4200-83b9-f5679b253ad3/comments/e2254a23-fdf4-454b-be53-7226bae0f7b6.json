@@ -1,0 +1,8 @@
+{
+  "uuid": "e2254a23-fdf4-454b-be53-7226bae0f7b6",
+  "issue_uuid": "66dc10f0-0eed-4200-83b9-f5679b253ad3",
+  "author": "anon-a7c6025f",
+  "content": "Plan: Download Pythia-160M weights from HuggingFace. The model expects safetensors format at models/pythia-160m/model_f32.safetensors plus config.json. HuggingFace hosts EleutherAI/pythia-160m with safetensors. Will download model.safetensors and config.json, then run inference.",
+  "created_at": "2026-03-26T01:38:05.439879015Z",
+  "kind": "plan"
+}
