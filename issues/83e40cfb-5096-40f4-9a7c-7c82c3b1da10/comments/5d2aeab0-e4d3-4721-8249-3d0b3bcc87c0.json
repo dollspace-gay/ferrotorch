@@ -1,0 +1,8 @@
+{
+  "uuid": "5d2aeab0-e4d3-4721-8249-3d0b3bcc87c0",
+  "issue_uuid": "83e40cfb-5096-40f4-9a7c-7c82c3b1da10",
+  "author": "anon-a7c6025f",
+  "content": "Observation: Driver corrected my assumption — machine has RTX 3090 24GB. The 2 GPU pool test failures (pool_return_then_take, pool_take_miss_returns_none) are real bugs, not hardware-absent.",
+  "created_at": "2026-03-26T01:54:54.687300354Z",
+  "kind": "observation"
+}
