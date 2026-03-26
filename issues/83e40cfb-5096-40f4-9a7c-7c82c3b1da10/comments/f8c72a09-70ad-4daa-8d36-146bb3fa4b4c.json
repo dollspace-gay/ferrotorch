@@ -1,0 +1,8 @@
+{
+  "uuid": "f8c72a09-70ad-4daa-8d36-146bb3fa4b4c",
+  "issue_uuid": "83e40cfb-5096-40f4-9a7c-7c82c3b1da10",
+  "author": "anon-a7c6025f",
+  "content": "Observation: Found root cause of attn_qkv gradient break. contiguous_t() at methods.rs:502-510 creates a new tensor via data_vec() + from_storage WITHOUT attaching a backward node. When permute() returns a non-contiguous strided view with PermuteBackward grad_fn, calling .contiguous() copies the data but severs the autograd chain. The new tensor has requires_grad=true but no grad_fn, so backward cannot reach the original permuted tensor or anything before it. Fix: add a ContiguousBackward that reshapes the gradient back (identity, since contiguous is just a data rearrangement — the gradient is the same shape).",
+  "created_at": "2026-03-26T02:06:06.510526962Z",
+  "kind": "observation"
+}
