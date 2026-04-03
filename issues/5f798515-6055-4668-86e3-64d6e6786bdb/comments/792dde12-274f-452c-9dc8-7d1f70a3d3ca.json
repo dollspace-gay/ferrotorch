@@ -1,0 +1,10 @@
+{
+  "uuid": "792dde12-274f-452c-9dc8-7d1f70a3d3ca",
+  "issue_uuid": "5f798515-6055-4668-86e3-64d6e6786bdb",
+  "author": "y4rr",
+  "content": "Reprioritized after dispatch path audit. GPU backward kernels (#462-#468) are the real training bottleneck — relu/sigmoid/tanh/gelu/softmax/layernorm/sum_axis all do GPU→CPU→GPU roundtrips during backward pass. Demoted CPU matmul (#415) and CPU SIMD (#416) from critical to high since they only affect CPU-resident tensors and don't cause the passthrough anti-pattern.",
+  "created_at": "2026-04-03T22:59:40.295112842Z",
+  "kind": "decision",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9Ec53qn3BHGqhi3OBV6tgIioyFU/xojkNpFeWbaqoPUEOSyWxbUOwe3/aDV7ywtlOdfwa3eASMjGPC1191K8Aw=="
+}
