@@ -1,0 +1,10 @@
+{
+  "uuid": "a583b502-98b4-4c57-a461-4fe08651e04b",
+  "issue_uuid": "29295eea-dea2-4c54-a385-a65994f2f08c",
+  "author": "y4rr",
+  "content": "Already implemented — PTX kernel gpu_tanh_backward exists in kernels.rs with backend_impl override",
+  "created_at": "2026-04-03T23:05:51.319769531Z",
+  "kind": "observation",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJoNQJG06cegp4S5ooHD9B+C+6nol0a7HHZf8XniaP3izKTXr8LM+v1BaEakUOXeLVd3w7SeUjmMUghNdjyZpCA=="
+}
