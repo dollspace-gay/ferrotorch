@@ -1,0 +1,10 @@
+{
+  "uuid": "e6c6daa8-f9dc-4153-91a6-c40dc9676f58",
+  "display_id": 438,
+  "title": "Implement SparseAdam and Adafactor optimizers",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-04-03T22:20:28.958815545Z",
+  "updated_at": "2026-04-03T22:20:28.958815545Z"
+}
