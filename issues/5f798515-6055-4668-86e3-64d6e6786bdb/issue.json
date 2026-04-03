@@ -6,7 +6,7 @@
   "priority": "medium",
   "created_by": "y4rr",
   "created_at": "2026-04-03T22:00:57.612022252Z",
-  "updated_at": "2026-04-03T22:23:08.431742144Z",
+  "updated_at": "2026-04-03T22:23:08.453457951Z",
   "labels": [
     "audit"
   ],
@@ -24,6 +24,7 @@
     "38abf4ad-4081-4b37-8f52-af78b7e75ada",
     "3984f130-accf-4ab6-9bdb-fc3db53710ca",
     "0c4aedf2-16ce-48ce-bb08-d460598ee773",
-    "cd347ec2-25b4-480f-b26a-1beb0bc71089"
+    "cd347ec2-25b4-480f-b26a-1beb0bc71089",
+    "e6c6daa8-f9dc-4153-91a6-c40dc9676f58"
   ]
 }
