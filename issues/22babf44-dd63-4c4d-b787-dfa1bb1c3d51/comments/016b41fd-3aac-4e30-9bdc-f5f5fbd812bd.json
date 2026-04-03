@@ -1,0 +1,10 @@
+{
+  "uuid": "016b41fd-3aac-4e30-9bdc-f5f5fbd812bd",
+  "issue_uuid": "22babf44-dd63-4c4d-b787-dfa1bb1c3d51",
+  "author": "y4rr",
+  "content": "Result: Completed the missing assertion in test_pool_miss_then_hit — misses_before is now compared against misses_after to verify the second allocation was a true pool hit with no new allocator miss. Warning eliminated, all 4 cpu_pool tests pass.",
+  "created_at": "2026-04-03T23:22:59.422606602Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9zGrAzzSILkV9Jw3jI2PNBHTjPSkKmrM94A+1OSAjKL0Z3TvTNGtq1EBVBFszNUYZkm1U0yeNbYKXK0ueH2hBg=="
+}
