@@ -1,12 +1,12 @@
 {
   "uuid": "ccd8d285-84d0-441b-8e5e-c77311cda1e0",
   "display_id": 469,
-  "title": "GPU forward: GELU tanh/erf approximations on GPU — currently CPU-only fallback",
+  "title": "Add GPU forward kernels for GELU Tanh and erf approximation modes",
   "status": "open",
   "priority": "critical",
   "created_by": "y4rr",
   "created_at": "2026-04-03T22:58:20.179639475Z",
-  "updated_at": "2026-04-03T22:58:22.086778283Z",
+  "updated_at": "2026-04-03T23:06:22.690347057Z",
   "labels": [
     "gpu"
   ]
