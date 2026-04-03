@@ -1,0 +1,10 @@
+{
+  "uuid": "54976c53-e931-4986-a17d-a719e7b1eeaa",
+  "display_id": 433,
+  "title": "Implement missing dropout variants: Dropout1d, Dropout3d, AlphaDropout, FeatureAlphaDropout",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-04-03T22:19:44.309625459Z",
+  "updated_at": "2026-04-03T22:19:44.309625459Z"
+}
