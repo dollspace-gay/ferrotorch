@@ -1,0 +1,10 @@
+{
+  "uuid": "ad8a1399-bf48-409b-9386-f026b60a7f61",
+  "display_id": 455,
+  "title": "Optimize channels_last memory format fast paths",
+  "status": "open",
+  "priority": "low",
+  "created_by": "y4rr",
+  "created_at": "2026-04-03T22:22:02.531367549Z",
+  "updated_at": "2026-04-03T22:22:02.531367549Z"
+}
