@@ -1,0 +1,10 @@
+{
+  "uuid": "2eb420ae-38e9-4bcf-96f9-9aba4f6ea90b",
+  "issue_uuid": "5f798515-6055-4668-86e3-64d6e6786bdb",
+  "author": "y4rr",
+  "content": "Created 47 issues (#415-#461) covering all gaps from PyTorch comparison, all related to parent #414. P0: 3 perf-critical, P1: 6 high-priority features, P2: 22 medium ecosystem breadth, P3: 17 low nice-to-have.",
+  "created_at": "2026-04-03T22:25:39.890598954Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgErXi9F6z2XbdFjFdJu+bdImjZMt1Ma4jDSvnp+3R1gKQxR5lA6eHLyBt/8KksvUCxF9y3bl50TDTlwXHneKDQ=="
+}
