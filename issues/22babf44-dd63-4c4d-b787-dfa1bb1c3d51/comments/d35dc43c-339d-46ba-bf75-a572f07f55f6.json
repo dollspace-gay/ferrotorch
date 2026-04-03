@@ -1,0 +1,10 @@
+{
+  "uuid": "d35dc43c-339d-46ba-bf75-a572f07f55f6",
+  "issue_uuid": "22babf44-dd63-4c4d-b787-dfa1bb1c3d51",
+  "author": "y4rr",
+  "content": "Plan: Add the missing assertion — after the second allocation (which should be a pool hit), verify that the miss count did not increase from misses_before. This confirms the second alloc actually came from the pool rather than the allocator.",
+  "created_at": "2026-04-03T23:22:14.067147291Z",
+  "kind": "plan",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ48r0t/+WaaROahtipEADos5Y+GfboYIwa5z4Zw4qTAsJRPxa9cuvpUDt7NolxdIwXFhe3d+TDpQZRadsV55DA=="
+}
