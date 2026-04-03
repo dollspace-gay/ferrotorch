@@ -1,0 +1,10 @@
+{
+  "uuid": "9090b9e5-8bb2-447f-b0cd-d6e82e2422ae",
+  "display_id": 416,
+  "title": "Wire ferray-ufunc SIMD kernels into CPU elementwise ops",
+  "status": "open",
+  "priority": "critical",
+  "created_by": "y4rr",
+  "created_at": "2026-04-03T22:18:14.746722727Z",
+  "updated_at": "2026-04-03T22:18:14.746722727Z"
+}
