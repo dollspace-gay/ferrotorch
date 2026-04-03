@@ -2,3 +2,5 @@
 # Format: <principal> <key-type> <base64-key> [comment]
 # approved by human backfill at 2026-04-03
 backfill@crosslink ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHtCmOJf2exv735MdNJBcGbWNxYw/JXXulXDzUjU9OpMi+WVJ80BmyVDMznZRXeubP0Qs2YVSUFaJy0N8is4qRg= texas@dollspace
+# approved by doll at 2026-04-03 21:55:58 UTC
+y4rr@crosslink ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPxyrAc495hgH04kh+QGzlLBeG+YpRwD3POYEMA/2Y7f crosslink-agent:y4rr@dollspace
