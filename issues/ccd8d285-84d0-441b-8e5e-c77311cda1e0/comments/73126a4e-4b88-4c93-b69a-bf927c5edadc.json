@@ -1,0 +1,10 @@
+{
+  "uuid": "73126a4e-4b88-4c93-b69a-bf927c5edadc",
+  "issue_uuid": "ccd8d285-84d0-441b-8e5e-c77311cda1e0",
+  "author": "y4rr",
+  "content": "activation.rs:802 only dispatches Sigmoid mode to GPU (gelu_f32). Tanh and None(erf) modes compute on CPU via unary_map even for CUDA tensors, then the result stays on CPU. These are the real missing GPU forward paths.",
+  "created_at": "2026-04-03T23:06:24.518646633Z",
+  "kind": "observation",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtCIpovIdBInMK3kpl2ScKqNAQN0fhVk/4scpj9Ur9InEzNpQGTtgG5BedpZGXHfwQ1UgeHH09e8FD6GSEd5VAA=="
+}
