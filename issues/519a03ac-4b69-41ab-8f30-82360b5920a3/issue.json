@@ -6,5 +6,8 @@
   "priority": "critical",
   "created_by": "y4rr",
   "created_at": "2026-04-03T22:58:08.679080014Z",
-  "updated_at": "2026-04-03T22:58:08.679080014Z"
+  "updated_at": "2026-04-03T22:58:10.501895749Z",
+  "labels": [
+    "gpu"
+  ]
 }
