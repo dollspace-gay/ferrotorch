@@ -1,0 +1,10 @@
+{
+  "uuid": "7722e62f-d507-44dd-99c7-539f27eba0da",
+  "display_id": 429,
+  "title": "Add missing distributions: LowRankMultivariateNormal, MixtureSameFamily, Independent",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-04-03T22:19:21.786956561Z",
+  "updated_at": "2026-04-03T22:19:21.786956561Z"
+}
