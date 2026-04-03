@@ -1,0 +1,10 @@
+{
+  "uuid": "a44edd1d-85e2-4c96-8eba-7f2314030456",
+  "issue_uuid": "5f798515-6055-4668-86e3-64d6e6786bdb",
+  "author": "y4rr",
+  "content": "Full gap analysis complete. Key findings: (1) 736x CPU matmul gap — ferray-linalg not wired in, (2) 41 missing nn module types out of 169, (3) 44 missing distributions out of 55, (4) no NCCL backend. Performance is the #1 priority — the framework architecture is sound, it's a kernel optimization problem.",
+  "created_at": "2026-04-03T22:13:37.315739248Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAy/LmTHJdw6qjE856li3PjBjQNW90twHfajLwhpPIFK0W0xJk0TfnJYdh/XPgceiggz7eH7+lxHGAI3rx0X5jDQ=="
+}
