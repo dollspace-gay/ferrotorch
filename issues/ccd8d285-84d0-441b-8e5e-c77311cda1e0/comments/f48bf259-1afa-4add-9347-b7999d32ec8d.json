@@ -1,0 +1,10 @@
+{
+  "uuid": "f48bf259-1afa-4add-9347-b7999d32ec8d",
+  "issue_uuid": "ccd8d285-84d0-441b-8e5e-c77311cda1e0",
+  "author": "y4rr",
+  "content": "Decision: Writing 3 new PTX kernels: (1) gelu_tanh_kernel for forward tanh approx — formula: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))), (2) gelu_erf_kernel for forward exact erf — formula: x*0.5*(1+erf(x/sqrt(2))) using A&S 7.1.26, (3) gelu_backward_tanh_kernel for #465 — derivative of the tanh approx. Following existing PTX patterns: sm_52, ex2.approx for exp, rcp.approx for division.",
+  "created_at": "2026-04-03T23:08:46.768999880Z",
+  "kind": "decision",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASDnft0434jY3gZLt9axfkM2LbojDWIwHv1u8K2I2FE89U3OBXd4Hb8OM0f7g/ZvAACXLK8pLdFdiXvsDtcRgBg=="
+}
