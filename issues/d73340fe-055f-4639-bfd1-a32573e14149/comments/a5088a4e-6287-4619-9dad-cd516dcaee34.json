@@ -1,0 +1,10 @@
+{
+  "uuid": "a5088a4e-6287-4619-9dad-cd516dcaee34",
+  "issue_uuid": "d73340fe-055f-4639-bfd1-a32573e14149",
+  "author": "y4rr",
+  "content": "Already implemented — PTX kernel gpu_sigmoid_backward exists in kernels.rs with backend_impl override",
+  "created_at": "2026-04-03T23:05:47.269897071Z",
+  "kind": "observation",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6BT0nWlZgKXGUQgg3E2rrCd4EMqsKtTsm1S1UyBNnNKiYREjrk7bX4+rhOSto+AyorBYQ22mmgnIyORry45GDQ=="
+}
