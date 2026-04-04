@@ -1,0 +1,10 @@
+{
+  "uuid": "bd1adaa6-2fc4-49eb-82b5-f3426a266830",
+  "issue_uuid": "9baef5bd-ee12-40a7-add6-38bb6c9f805b",
+  "author": "y4rr",
+  "content": "[result] Wired backward and broadcast f64 ops end-to-end. Total f64 coverage: 21 PTX kernels (14 arithmetic/unary + 3 backward + 4 broadcast), all with launchers, backend_impl, and dispatch sites. Backward ops (relu, sigmoid, tanh) and broadcast ops (add, sub, mul, div) now fully support f64 on GPU. All 3255 tests pass.",
+  "created_at": "2026-04-04T17:33:29.642890675Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmBmeZSGUZkgpBLPXBcJYVWHvEzd8x3up9H50tJ2MhE/2s5eipSY2ByCjZYbTfgQTmijcEr8oInnGRBr5vnbBDw=="
+}
