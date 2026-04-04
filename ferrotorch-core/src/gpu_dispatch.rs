@@ -392,6 +392,35 @@ pub trait GpuBackend: Send + Sync {
         eps: f32,
     ) -> FerrotorchResult<GpuBufferHandle>;
 
+    // RMSNorm f32 (row-wise, weight only — no bias, no mean centering)
+    fn rmsnorm_f32(
+        &self,
+        _input: &GpuBufferHandle,
+        _weight: &GpuBufferHandle,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "rmsnorm_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    // RMSNorm backward f32: returns (grad_input, grad_weight)
+    fn rmsnorm_backward_f32(
+        &self,
+        _input: &GpuBufferHandle,
+        _grad_output: &GpuBufferHandle,
+        _weight: &GpuBufferHandle,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "rmsnorm_backward_f32 GPU op not yet implemented".into(),
+        })
+    }
+
     // Slice write: write [N, D] into row `pos` of [N, max_len, D] (in-place)
     fn slice_write_f32(
         &self,
@@ -474,6 +503,77 @@ pub trait GpuBackend: Send + Sync {
         grad: &GpuBufferHandle,
         input: &GpuBufferHandle,
     ) -> FerrotorchResult<GpuBufferHandle>;
+
+    // SiLU activation: out[i] = x * sigmoid(x)
+    fn silu_f32(&self, _a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "silu_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn silu_backward_f32(
+        &self,
+        _grad: &GpuBufferHandle,
+        _input: &GpuBufferHandle,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "silu_backward_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    // ELU activation: out[i] = x > 0 ? x : alpha*(exp(x)-1)
+    fn elu_f32(&self, _a: &GpuBufferHandle, _alpha: f32) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "elu_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn elu_backward_f32(
+        &self,
+        _grad: &GpuBufferHandle,
+        _input: &GpuBufferHandle,
+        _alpha: f32,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "elu_backward_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    // Mish activation: out[i] = x * tanh(softplus(x))
+    fn mish_f32(&self, _a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "mish_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn mish_backward_f32(
+        &self,
+        _grad: &GpuBufferHandle,
+        _input: &GpuBufferHandle,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "mish_backward_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    // LogSoftmax: out[i] = x[i] - log(sum(exp(x))) (row-wise)
+    fn log_softmax_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _cols: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "log_softmax_f32 GPU op not yet implemented".into(),
+        })
+    }
+    // LogSoftmax backward: out[i] = grad[i] - softmax[i] * sum(grad) (row-wise)
+    fn log_softmax_backward_f32(
+        &self,
+        _grad: &GpuBufferHandle,
+        _output: &GpuBufferHandle,
+        _cols: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "log_softmax_backward_f32 GPU op not yet implemented".into(),
+        })
+    }
 
     // Indexing operations
     // index_select_1d: out[i] = input[indices[i]]  (indices stored as f32)

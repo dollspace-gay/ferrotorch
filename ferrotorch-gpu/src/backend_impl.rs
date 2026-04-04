@@ -821,6 +821,42 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer(result, input.device_ordinal()))
     }
 
+    fn rmsnorm_f32(
+        &self,
+        input: &GpuBufferHandle,
+        weight: &GpuBufferHandle,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let in_buf = Self::unwrap_buffer(input)?;
+        let w_buf = Self::unwrap_buffer(weight)?;
+        let dev = self.device(input.device_ordinal())?;
+        let result = crate::kernels::gpu_rmsnorm(in_buf, w_buf, rows, cols, eps, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, input.device_ordinal()))
+    }
+
+    fn rmsnorm_backward_f32(
+        &self,
+        input: &GpuBufferHandle,
+        grad_output: &GpuBufferHandle,
+        weight: &GpuBufferHandle,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        let in_buf = Self::unwrap_buffer(input)?;
+        let go_buf = Self::unwrap_buffer(grad_output)?;
+        let w_buf = Self::unwrap_buffer(weight)?;
+        let dev = self.device(input.device_ordinal())?;
+        let (gi, gw) =
+            crate::kernels::gpu_rmsnorm_backward(in_buf, go_buf, w_buf, rows, cols, eps, dev)
+                .map_err(Self::map_gpu_err)?;
+        let ordinal = input.device_ordinal();
+        Ok((Self::wrap_buffer(gi, ordinal), Self::wrap_buffer(gw, ordinal)))
+    }
+
     fn slice_write_f32(
         &self,
         src: &GpuBufferHandle,
@@ -957,6 +993,94 @@ impl GpuBackend for CudaBackendImpl {
         let dev = self.device(grad.device_ordinal())?;
         let result = crate::kernels::gpu_gelu_backward_erf(grad_buf, input_buf, dev)
             .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, grad.device_ordinal()))
+    }
+
+    fn silu_f32(&self, a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let result = crate::kernels::gpu_silu(a_buf, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    fn silu_backward_f32(
+        &self,
+        grad: &GpuBufferHandle,
+        input: &GpuBufferHandle,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let grad_buf = Self::unwrap_buffer(grad)?;
+        let input_buf = Self::unwrap_buffer(input)?;
+        let dev = self.device(grad.device_ordinal())?;
+        let result = crate::kernels::gpu_silu_backward(grad_buf, input_buf, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, grad.device_ordinal()))
+    }
+
+    fn elu_f32(&self, a: &GpuBufferHandle, alpha: f32) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let result = crate::kernels::gpu_elu(a_buf, alpha, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    fn elu_backward_f32(
+        &self,
+        grad: &GpuBufferHandle,
+        input: &GpuBufferHandle,
+        alpha: f32,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let grad_buf = Self::unwrap_buffer(grad)?;
+        let input_buf = Self::unwrap_buffer(input)?;
+        let dev = self.device(grad.device_ordinal())?;
+        let result = crate::kernels::gpu_elu_backward(grad_buf, input_buf, alpha, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, grad.device_ordinal()))
+    }
+
+    fn mish_f32(&self, a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let result = crate::kernels::gpu_mish(a_buf, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    fn mish_backward_f32(
+        &self,
+        grad: &GpuBufferHandle,
+        input: &GpuBufferHandle,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let grad_buf = Self::unwrap_buffer(grad)?;
+        let input_buf = Self::unwrap_buffer(input)?;
+        let dev = self.device(grad.device_ordinal())?;
+        let result = crate::kernels::gpu_mish_backward(grad_buf, input_buf, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, grad.device_ordinal()))
+    }
+
+    fn log_softmax_f32(
+        &self,
+        a: &GpuBufferHandle,
+        cols: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let result =
+            crate::kernels::gpu_log_softmax(a_buf, cols, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    fn log_softmax_backward_f32(
+        &self,
+        grad: &GpuBufferHandle,
+        output: &GpuBufferHandle,
+        cols: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let grad_buf = Self::unwrap_buffer(grad)?;
+        let output_buf = Self::unwrap_buffer(output)?;
+        let dev = self.device(grad.device_ordinal())?;
+        let result =
+            crate::kernels::gpu_log_softmax_backward(grad_buf, output_buf, cols, dev)
+                .map_err(Self::map_gpu_err)?;
         Ok(Self::wrap_buffer(result, grad.device_ordinal()))
     }
 

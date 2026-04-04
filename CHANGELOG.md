@@ -102,6 +102,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - M≤4 cuBLAS bypass: route vector-matrix multiplies through PTX `small_matmul` kernel instead of cuBLAS SGEMM
 
 ### Changed
+- Add GPU backward kernels for SiLU, ELU, Mish, LogSoftmax (no GPU path, force CPU roundtrip) (#477)
+- Add GPU forward kernel for log_softmax (currently explicit .cpu() download) (#476)
+- Add GPU forward kernels for SiLU, ELU, Mish activations (currently use unary_map CPU roundtrip) (#475)
+- Eliminate GPU→CPU roundtrips in norm.rs forward/backward (LayerNorm, GroupNorm, RMSNorm, BatchNorm) (#474)
+- Eliminate GPU→CPU roundtrips in all loss function backward passes (13+ losses, 42 .cpu() calls) (#473)
 - Add GPU backward kernel for GELU Tanh approximation mode (#465)
 - Add GPU forward kernels for GELU Tanh and erf approximation modes (#469)
 - GPU Conv2d backward pass — forward-only GPU kernel, backward falls to CPU (#349)

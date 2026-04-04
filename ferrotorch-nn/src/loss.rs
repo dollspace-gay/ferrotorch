@@ -112,63 +112,27 @@ struct MSEBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for MSEBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_pred = if self.pred.is_cuda() {
-            self.pred.cpu()?
-        } else {
-            self.pred.clone()
-        };
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let pred_data = cpu_pred.data()?;
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
-        let two = T::from(2.0).unwrap();
-        let n = T::from(pred_data.len()).unwrap();
+        use ferrotorch_core::autograd::no_grad::no_grad;
+        use ferrotorch_core::grad_fns::arithmetic::{mul, sub};
 
-        let result: Vec<T> = match self.reduction {
-            Reduction::Mean => {
-                // grad_output is scalar
-                let go = grad_data[0];
-                pred_data
-                    .iter()
-                    .zip(target_data.iter())
-                    .map(|(&p, &t)| two * (p - t) * go / n)
-                    .collect()
+        // grad = 2 * (pred - target) * grad_output [/ n for mean]
+        let grad_input = no_grad(|| {
+            let diff = sub(&self.pred, &self.target)?;
+            let two = ferrotorch_core::creation::scalar(T::from(2.0).unwrap())?
+                .to(self.pred.device())?;
+            let scaled = mul(&diff, &two)?;
+            let result = mul(&scaled, grad_output)?;
+            match self.reduction {
+                Reduction::Mean => {
+                    let n = ferrotorch_core::creation::scalar(
+                        T::from(self.pred.shape().iter().product::<usize>()).unwrap(),
+                    )?
+                    .to(self.pred.device())?;
+                    ferrotorch_core::grad_fns::arithmetic::div(&result, &n)
+                }
+                _ => Ok(result),
             }
-            Reduction::Sum => {
-                // grad_output is scalar
-                let go = grad_data[0];
-                pred_data
-                    .iter()
-                    .zip(target_data.iter())
-                    .map(|(&p, &t)| two * (p - t) * go)
-                    .collect()
-            }
-            Reduction::None => {
-                // grad_output has same shape as pred
-                pred_data
-                    .iter()
-                    .zip(target_data.iter())
-                    .zip(grad_data.iter())
-                    .map(|((&p, &t), &g)| two * (p - t) * g)
-                    .collect()
-            }
-        };
-
-        let grad_input = Tensor::from_storage(
-            TensorStorage::cpu(result),
-            self.pred.shape().to_vec(),
-            false,
-        )?;
-        let grad_input = grad_input.to(self.pred.device())?;
+        })?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -506,67 +470,26 @@ struct BCEWithLogitsBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for BCEWithLogitsBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_logits = if self.logits.is_cuda() {
-            self.logits.cpu()?
-        } else {
-            self.logits.clone()
-        };
-        let cpu_targets = if self.targets.is_cuda() {
-            self.targets.cpu()?
-        } else {
-            self.targets.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let logits_data = cpu_logits.data()?;
-        let targets_data = cpu_targets.data()?;
-        let grad_data = cpu_go.data()?;
-        let one = <T as One>::one();
-        let n = T::from(logits_data.len()).unwrap();
+        use ferrotorch_core::autograd::no_grad::no_grad;
+        use ferrotorch_core::grad_fns::activation::sigmoid;
+        use ferrotorch_core::grad_fns::arithmetic::{div, mul, sub};
 
-        let result: Vec<T> = match self.reduction {
-            Reduction::Mean => {
-                let go = grad_data[0];
-                logits_data
-                    .iter()
-                    .zip(targets_data.iter())
-                    .map(|(&x, &y)| {
-                        let sig = one / (one + (-x).exp());
-                        (sig - y) * go / n
-                    })
-                    .collect()
+        // grad = (sigmoid(logits) - targets) * grad_output [/ n for mean]
+        let grad_input = no_grad(|| {
+            let sig = sigmoid(&self.logits)?;
+            let diff = sub(&sig, &self.targets)?;
+            let result = mul(&diff, grad_output)?;
+            match self.reduction {
+                Reduction::Mean => {
+                    let n = ferrotorch_core::creation::scalar(
+                        T::from(self.logits.shape().iter().product::<usize>()).unwrap(),
+                    )?
+                    .to(self.logits.device())?;
+                    div(&result, &n)
+                }
+                _ => Ok(result),
             }
-            Reduction::Sum => {
-                let go = grad_data[0];
-                logits_data
-                    .iter()
-                    .zip(targets_data.iter())
-                    .map(|(&x, &y)| {
-                        let sig = one / (one + (-x).exp());
-                        (sig - y) * go
-                    })
-                    .collect()
-            }
-            Reduction::None => logits_data
-                .iter()
-                .zip(targets_data.iter())
-                .zip(grad_data.iter())
-                .map(|((&x, &y), &g)| {
-                    let sig = one / (one + (-x).exp());
-                    (sig - y) * g
-                })
-                .collect(),
-        };
-
-        let grad_input = Tensor::from_storage(
-            TensorStorage::cpu(result),
-            self.logits.shape().to_vec(),
-            false,
-        )?;
-        let grad_input = grad_input.to(self.logits.device())?;
+        })?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -868,42 +791,24 @@ struct KLDivBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for KLDivBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
-        let n = T::from(target_data.len()).unwrap();
+        use ferrotorch_core::autograd::no_grad::no_grad;
+        use ferrotorch_core::grad_fns::arithmetic::{div, mul, neg};
 
-        let result: Vec<T> = match self.reduction {
-            Reduction::Mean => {
-                let go = grad_data[0];
-                target_data.iter().map(|&t| -t * go / n).collect()
+        // grad = -target * grad_output [/ n for mean]
+        let grad_input = no_grad(|| {
+            let neg_target = neg(&self.target)?;
+            let result = mul(&neg_target, grad_output)?;
+            match self.reduction {
+                Reduction::Mean => {
+                    let n = ferrotorch_core::creation::scalar(
+                        T::from(self.input.shape().iter().product::<usize>()).unwrap(),
+                    )?
+                    .to(self.input.device())?;
+                    div(&result, &n)
+                }
+                _ => Ok(result),
             }
-            Reduction::Sum => {
-                let go = grad_data[0];
-                target_data.iter().map(|&t| -t * go).collect()
-            }
-            Reduction::None => target_data
-                .iter()
-                .zip(grad_data.iter())
-                .map(|(&t, &g)| -t * g)
-                .collect(),
-        };
-
-        let grad_input = Tensor::from_storage(
-            TensorStorage::cpu(result),
-            self.input.shape().to_vec(),
-            false,
-        )?;
-        let grad_input = grad_input.to(self.input.device())?;
+        })?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -2380,81 +2285,36 @@ struct PoissonNLLBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for PoissonNLLBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_input = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_data = cpu_input.data()?;
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
-        let one = <T as One>::one();
-        let eps_t = T::from(self.eps).unwrap();
-        let n = T::from(input_data.len()).unwrap();
-        let log_input = self.log_input;
+        use ferrotorch_core::autograd::no_grad::no_grad;
+        use ferrotorch_core::grad_fns::arithmetic::{add, div, mul, sub};
+        use ferrotorch_core::grad_fns::transcendental::exp;
 
-        let result: Vec<T> = match self.reduction {
-            Reduction::Mean => {
-                let go = grad_data[0];
-                input_data
-                    .iter()
-                    .zip(target_data.iter())
-                    .map(|(&x, &y)| {
-                        let local = if log_input {
-                            x.exp() - y
-                        } else {
-                            one - y / (x + eps_t)
-                        };
-                        local * go / n
-                    })
-                    .collect()
+        let device = self.input.device();
+        let grad_input = no_grad(|| {
+            // local = exp(input) - target  OR  1 - target / (input + eps)
+            let local = if self.log_input {
+                let exp_input = exp(&self.input)?;
+                sub(&exp_input, &self.target)?
+            } else {
+                let eps = ferrotorch_core::creation::scalar(T::from(self.eps).unwrap())?
+                    .to(device)?;
+                let one = ferrotorch_core::creation::scalar(<T as One>::one())?.to(device)?;
+                let denom = add(&self.input, &eps)?;
+                let ratio = div(&self.target, &denom)?;
+                sub(&one, &ratio)?
+            };
+            let result = mul(&local, grad_output)?;
+            match self.reduction {
+                Reduction::Mean => {
+                    let n = ferrotorch_core::creation::scalar(
+                        T::from(self.input.shape().iter().product::<usize>()).unwrap(),
+                    )?
+                    .to(device)?;
+                    div(&result, &n)
+                }
+                _ => Ok(result),
             }
-            Reduction::Sum => {
-                let go = grad_data[0];
-                input_data
-                    .iter()
-                    .zip(target_data.iter())
-                    .map(|(&x, &y)| {
-                        let local = if log_input {
-                            x.exp() - y
-                        } else {
-                            one - y / (x + eps_t)
-                        };
-                        local * go
-                    })
-                    .collect()
-            }
-            Reduction::None => input_data
-                .iter()
-                .zip(target_data.iter())
-                .zip(grad_data.iter())
-                .map(|((&x, &y), &g)| {
-                    let local = if log_input {
-                        x.exp() - y
-                    } else {
-                        one - y / (x + eps_t)
-                    };
-                    local * g
-                })
-                .collect(),
-        };
-
-        let grad_input = Tensor::from_storage(
-            TensorStorage::cpu(result),
-            self.input.shape().to_vec(),
-            false,
-        )?;
-        let grad_input = grad_input.to(self.input.device())?;
+        })?;
         Ok(vec![Some(grad_input)])
     }
 
