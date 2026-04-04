@@ -1,0 +1,10 @@
+{
+  "uuid": "92a1f84b-307a-417e-bbbd-53b1151611e9",
+  "issue_uuid": "cc5b863e-432f-43aa-b3f1-567b0b25a7dc",
+  "author": "y4rr",
+  "content": "[result] All 66 f64 PTX kernels now use proper f64 precision. Replaced every f32 downcast pattern (cvt.rn.f32.f64 + ex2.approx.f32 + cvt.rn.f64.f32) with inline Cody-Waite range reduction + degree-11 Horner polynomial for exp, and argument reduction + Horner for log. Fixed the 1/3! coefficient bug (was using 1/4! = 0d3FA5... instead of 1/6 = 0d3FC5...). Fixed range reduction to use cvt.rni (round-to-nearest) instead of floor+0.5. Affected kernels: EXP, LOG, SIGMOID, TANH, all GELU variants, SILU, ELU, MISH, POW, SOFTMAX, LOG_SOFTMAX, LOGCUMSUMEXP + all their backward variants. 3271 tests pass.",
+  "created_at": "2026-04-04T22:53:19.252334290Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAU+oObuNCmKzB9zegrzYX6kyNJQMfOG0bx/AEKQII1dj0fzirmM+cnyd81QdiUiQlPYKw60/GNOofUj1cUvToDg=="
+}
