@@ -1,0 +1,10 @@
+{
+  "uuid": "fdfccdba-46e6-411b-aeb1-ddab736a436c",
+  "issue_uuid": "9baef5bd-ee12-40a7-add6-38bb6c9f805b",
+  "author": "y4rr",
+  "content": "[result] Added end-to-end f64 GPU support for 14 core operations: ADD, SUB, MUL, DIV, NEG, RELU, SCALE, EXP, LOG, SQRT, POW, ABS, SIGMOID, TANH. Includes 14 f64 PTX kernels, f64 launch helpers, ~70 _f64 GpuBackend trait methods (stubs for unimplemented ops), 14 backend_impl wiring methods, 10 dispatch site updates, is_f64 helpers in 7 files. All 3255 tests pass. Remaining: backward ops, activation/norm/reduction/shape/matmul f64 kernels.",
+  "created_at": "2026-04-04T17:18:05.945480446Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtZnYa8ugGhFOULrrVCkdndFU0yzrcLTjV+05frnnnmNtCbE5MqJZqB+P7e4CQng0U90B+l1w/cTASJ3Xy/hWAw=="
+}
