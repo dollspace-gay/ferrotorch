@@ -1,0 +1,10 @@
+{
+  "uuid": "e9448faf-afdf-4189-9d47-e0299bef64d7",
+  "issue_uuid": "124a13eb-4177-4433-a646-d7de6c710822",
+  "author": "y4rr",
+  "content": "Plan: The norm modules in nn/norm.rs have their own forward/backward implementations that download GPU tensors to CPU. However, the core autograd layer (grad_fns/) already has GPU-dispatched layernorm with a dedicated PTX kernel (backend.layernorm_f32 forward, backend.layernorm_backward_f32 backward). Need to verify whether nn::LayerNorm's forward calls the core layernorm op (which has GPU dispatch) or does its own CPU computation. If it does its own computation, refactor it to delegate to the core op.",
+  "created_at": "2026-04-04T01:59:22.309641891Z",
+  "kind": "plan",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAITuePZBxZwBYulTv9y3hGpItbIvAZSuFKAjylCBMoWz6se7KRWrFkn5PXA5pKKpbM/Jq6DzTWs+x3AyrHM7iAQ=="
+}
