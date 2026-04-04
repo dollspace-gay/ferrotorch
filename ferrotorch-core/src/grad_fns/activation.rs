@@ -449,6 +449,20 @@ impl<T: Float> SiluBackward<T> {
 
 impl<T: Float> GradFn<T> for SiluBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // GPU-native path for f32
+        if grad_output.is_cuda() && is_f32::<T>() {
+            let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+            let result_h =
+                backend.silu_backward_f32(grad_output.gpu_handle()?, self.input.gpu_handle()?)?;
+            let grad_input = Tensor::from_storage(
+                TensorStorage::gpu(result_h),
+                self.input.shape().to_vec(),
+                false,
+            )?;
+            return Ok(vec![Some(grad_input)]);
+        }
+
+        // CPU fallback
         let cpu_input = if self.input.is_cuda() {
             self.input.cpu()?
         } else {
@@ -622,6 +636,25 @@ impl<T: Float> LogSoftmaxBackward<T> {
 
 impl<T: Float> GradFn<T> for LogSoftmaxBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // GPU-native path for f32
+        // log_softmax_backward: out[j] = grad[j] - softmax[j] * sum(grad) per row
+        if grad_output.is_cuda() && is_f32::<T>() {
+            let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+            let shape = self.input.shape();
+            let cols = *shape.last().unwrap_or(&1);
+            let result_h = backend.log_softmax_backward_f32(
+                grad_output.gpu_handle()?,
+                self.softmax_output.gpu_handle()?,
+                cols,
+            )?;
+            let grad_input = Tensor::from_storage(
+                TensorStorage::gpu(result_h),
+                self.input.shape().to_vec(),
+                false,
+            )?;
+            return Ok(vec![Some(grad_input)]);
+        }
+
         let cpu_sm = if self.softmax_output.is_cuda() {
             self.softmax_output.cpu()?
         } else {
@@ -868,6 +901,23 @@ pub fn gelu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
 /// Compute `silu(x) = x * sigmoid(x)`, attaching a backward node when
 /// gradients are enabled.
 pub fn silu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    // GPU fast path for f32
+    if input.is_cuda() && is_f32::<T>() {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let handle = backend.silu_f32(input.gpu_handle()?)?;
+            return if is_grad_enabled() && input.requires_grad() {
+                Tensor::from_operation(
+                    TensorStorage::gpu(handle),
+                    input.shape().to_vec(),
+                    Arc::new(SiluBackward::new(input.clone())),
+                )
+            } else {
+                Tensor::from_storage(TensorStorage::gpu(handle), input.shape().to_vec(), false)
+            };
+        }
+    }
+
+    // CPU path
     let one = <T as num_traits::One>::one();
     let output = unary_map(input, |x| {
         let s = one / (one + (-x).exp());
@@ -965,13 +1015,38 @@ pub fn softmax<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
 /// Compute `log_softmax(x)` along the last axis, attaching a backward node
 /// when gradients are enabled.
 pub fn log_softmax<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let shape = input.shape();
+
+    // GPU fast path for f32
+    if input.is_cuda() && is_f32::<T>() && !shape.is_empty() {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let cols = *shape.last().unwrap();
+            let handle = backend.log_softmax_f32(input.gpu_handle()?, cols)?;
+            return if is_grad_enabled() && input.requires_grad() {
+                // Compute softmax = exp(log_softmax) on GPU for backward storage
+                let sm_handle = backend.exp_f32(&handle)?;
+                let softmax_tensor = Tensor::from_storage(
+                    TensorStorage::gpu(sm_handle),
+                    shape.to_vec(),
+                    false,
+                )?;
+                Tensor::from_operation(
+                    TensorStorage::gpu(handle),
+                    shape.to_vec(),
+                    Arc::new(LogSoftmaxBackward::new(input.clone(), softmax_tensor)),
+                )
+            } else {
+                Tensor::from_storage(TensorStorage::gpu(handle), shape.to_vec(), false)
+            };
+        }
+    }
+
     let cpu_input = if input.is_cuda() {
         input.cpu()?
     } else {
         input.clone()
     };
     let data = cpu_input.data()?;
-    let shape = input.shape();
 
     // Compute softmax and log_softmax simultaneously for efficiency.
     let (sm_vec, lsm_vec) = if shape.is_empty() {
@@ -1188,6 +1263,23 @@ impl<T: Float> EluBackward<T> {
 
 impl<T: Float> GradFn<T> for EluBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // GPU-native path for f32
+        if grad_output.is_cuda() && is_f32::<T>() {
+            let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+            let result_h = backend.elu_backward_f32(
+                grad_output.gpu_handle()?,
+                self.input.gpu_handle()?,
+                self.alpha as f32,
+            )?;
+            let grad_input = Tensor::from_storage(
+                TensorStorage::gpu(result_h),
+                self.input.shape().to_vec(),
+                false,
+            )?;
+            return Ok(vec![Some(grad_input)]);
+        }
+
+        // CPU fallback
         let cpu_input = if self.input.is_cuda() {
             self.input.cpu()?
         } else {
@@ -1241,6 +1333,23 @@ impl<T: Float> GradFn<T> for EluBackward<T> {
 ///        = alpha * (exp(x) - 1)  if x <= 0
 /// ```
 pub fn elu<T: Float>(input: &Tensor<T>, alpha: f64) -> FerrotorchResult<Tensor<T>> {
+    // GPU fast path for f32
+    if input.is_cuda() && is_f32::<T>() {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let handle = backend.elu_f32(input.gpu_handle()?, alpha as f32)?;
+            return if is_grad_enabled() && input.requires_grad() {
+                Tensor::from_operation(
+                    TensorStorage::gpu(handle),
+                    input.shape().to_vec(),
+                    Arc::new(EluBackward::new(input.clone(), alpha)),
+                )
+            } else {
+                Tensor::from_storage(TensorStorage::gpu(handle), input.shape().to_vec(), false)
+            };
+        }
+    }
+
+    // CPU path
     let zero = <T as num_traits::Zero>::zero();
     let one = <T as num_traits::One>::one();
     let alpha_t = T::from(alpha).unwrap();
@@ -1292,6 +1401,20 @@ impl<T: Float> MishBackward<T> {
 
 impl<T: Float> GradFn<T> for MishBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // GPU-native path for f32
+        if grad_output.is_cuda() && is_f32::<T>() {
+            let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+            let result_h =
+                backend.mish_backward_f32(grad_output.gpu_handle()?, self.input.gpu_handle()?)?;
+            let grad_input = Tensor::from_storage(
+                TensorStorage::gpu(result_h),
+                self.input.shape().to_vec(),
+                false,
+            )?;
+            return Ok(vec![Some(grad_input)]);
+        }
+
+        // CPU fallback
         let cpu_input = if self.input.is_cuda() {
             self.input.cpu()?
         } else {
@@ -1339,6 +1462,23 @@ impl<T: Float> GradFn<T> for MishBackward<T> {
 /// Compute `mish(x) = x * tanh(softplus(x))`, attaching a backward node
 /// when gradients are enabled.
 pub fn mish<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    // GPU fast path for f32
+    if input.is_cuda() && is_f32::<T>() {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let handle = backend.mish_f32(input.gpu_handle()?)?;
+            return if is_grad_enabled() && input.requires_grad() {
+                Tensor::from_operation(
+                    TensorStorage::gpu(handle),
+                    input.shape().to_vec(),
+                    Arc::new(MishBackward::new(input.clone())),
+                )
+            } else {
+                Tensor::from_storage(TensorStorage::gpu(handle), input.shape().to_vec(), false)
+            };
+        }
+    }
+
+    // CPU path
     let one = <T as num_traits::One>::one();
 
     let output = unary_map(input, |x| {

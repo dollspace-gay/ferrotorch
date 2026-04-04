@@ -972,7 +972,32 @@ impl<T: Float> Module<T> for RMSNorm<T> {
         let norm_size: usize = self.normalized_shape.iter().product();
         let batch_size = input.numel() / norm_size;
 
-        // Transfer to CPU for computation if on GPU.
+        // GPU fast path: native RMSNorm kernel.
+        if input.is_cuda() {
+            if let Some(backend) = ferrotorch_core::gpu_dispatch::gpu_backend() {
+                let eps_f32 = self.eps as f32;
+                let handle = backend.rmsnorm_f32(
+                    input.gpu_handle()?,
+                    self.weight.tensor().gpu_handle()?,
+                    batch_size,
+                    norm_size,
+                    eps_f32,
+                )?;
+                return if is_grad_enabled() && input.requires_grad() {
+                    let grad_fn = Arc::new(RMSNormBackward {
+                        input: input.clone(),
+                        weight: self.weight.tensor().clone(),
+                        normalized_shape: self.normalized_shape.clone(),
+                        eps: self.eps,
+                    });
+                    Tensor::from_operation(TensorStorage::gpu(handle), shape, grad_fn)
+                } else {
+                    Tensor::from_storage(TensorStorage::gpu(handle), shape, false)
+                };
+            }
+        }
+
+        // CPU path.
         let cpu_input = if input.is_cuda() {
             input.cpu()?
         } else {
@@ -1089,6 +1114,41 @@ impl<T: Float> GradFn<T> for RMSNormBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         let norm_size: usize = self.normalized_shape.iter().product();
         let batch_size = self.input.numel() / norm_size;
+
+        // GPU-native fast path for f32
+        if self.input.is_cuda() && is_f32::<T>() {
+            if let Some(backend) = gpu_backend() {
+                let eps_f32 = self.eps as f32;
+                let (gi_h, gw_h) = backend.rmsnorm_backward_f32(
+                    self.input.gpu_handle()?,
+                    grad_output.gpu_handle()?,
+                    self.weight.gpu_handle()?,
+                    batch_size,
+                    norm_size,
+                    eps_f32,
+                )?;
+
+                let grad_input_tensor = Tensor::from_storage(
+                    TensorStorage::gpu(gi_h),
+                    self.input.shape().to_vec(),
+                    false,
+                )?;
+
+                let grad_weight_out = if self.weight.requires_grad() {
+                    Some(Tensor::from_storage(
+                        TensorStorage::gpu(gw_h),
+                        self.normalized_shape.clone(),
+                        false,
+                    )?)
+                } else {
+                    None
+                };
+
+                return Ok(vec![Some(grad_input_tensor), grad_weight_out]);
+            }
+        }
+
+        // CPU fallback path
         let n_t = T::from(norm_size).unwrap();
         let eps_t = T::from(self.eps).unwrap();
 

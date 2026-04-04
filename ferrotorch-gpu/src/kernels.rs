@@ -1533,6 +1533,459 @@ DONE:
 ";
 
 // ---------------------------------------------------------------------------
+// SiLU / ELU / Mish activation kernels (forward + backward)
+// ---------------------------------------------------------------------------
+
+/// PTX source for `silu_kernel`: `out[i] = x * sigmoid(x)`.
+/// SiLU (Sigmoid Linear Unit), also known as Swish-1.
+#[cfg(feature = "cuda")]
+pub(crate) const SILU_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry silu_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f32 %x, %neg, %e, %denom, %sig, %vr, %one, %lg2e;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %x, [%a];
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    // exp(-x) = 2^(-x * log2(e))
+    mov.f32 %one, 0f3F800000;
+    mov.f32 %lg2e, 0f3FB8AA3B;
+    neg.f32 %neg, %x;
+    mul.f32 %neg, %neg, %lg2e;
+    ex2.approx.f32 %e, %neg;
+    add.f32 %denom, %one, %e;
+    rcp.approx.f32 %sig, %denom;
+    // silu(x) = x * sigmoid(x)
+    mul.f32 %vr, %x, %sig;
+    st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `silu_backward_kernel`:
+/// `out[i] = grad[i] * (sig + x * sig * (1 - sig))` where `sig = sigmoid(input[i])`.
+#[cfg(feature = "cuda")]
+pub(crate) const SILU_BACKWARD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry silu_backward_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f32 %vg, %x, %neg, %e, %denom, %sig, %one, %lg2e;
+    .reg .f32 %one_m_sig, %x_sig_omsig, %deriv, %result;
+    .reg .pred %p;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %vg, [%grad];
+    ld.global.f32 %x, [%input];
+
+    // sig = sigmoid(x) = 1 / (1 + exp(-x))
+    mov.f32 %one, 0f3F800000;
+    mov.f32 %lg2e, 0f3FB8AA3B;
+    neg.f32 %neg, %x;
+    mul.f32 %neg, %neg, %lg2e;
+    ex2.approx.f32 %e, %neg;
+    add.f32 %denom, %one, %e;
+    rcp.approx.f32 %sig, %denom;
+
+    // deriv = sig + x * sig * (1 - sig)
+    sub.f32 %one_m_sig, %one, %sig;
+    mul.f32 %x_sig_omsig, %x, %sig;
+    mul.f32 %x_sig_omsig, %x_sig_omsig, %one_m_sig;
+    add.f32 %deriv, %sig, %x_sig_omsig;
+    mul.f32 %result, %vg, %deriv;
+    st.global.f32 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `elu_kernel`: `out[i] = x > 0 ? x : alpha * (exp(x) - 1)`.
+/// Takes `alpha` as an extra `.param .f32` parameter.
+#[cfg(feature = "cuda")]
+pub(crate) const ELU_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry elu_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .f32 alpha
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f32 %x, %alpha_r, %lg2e, %one, %ex, %em1, %neg_branch, %vr;
+    .reg .pred %p, %pos;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+    ld.param.f32 %alpha_r, [alpha];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %x, [%a];
+    mov.f32 %one, 0f3F800000;
+    mov.f32 %lg2e, 0f3FB8AA3B;
+
+    // exp(x) = 2^(x * log2(e))
+    mul.f32 %ex, %x, %lg2e;
+    ex2.approx.f32 %ex, %ex;
+    sub.f32 %em1, %ex, %one;
+    mul.f32 %neg_branch, %alpha_r, %em1;
+
+    // x > 0 ? x : alpha*(exp(x)-1)
+    mov.f32 %vr, 0f00000000;
+    setp.gt.f32 %pos, %x, %vr;
+    selp.f32 %vr, %x, %neg_branch, %pos;
+    st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `elu_backward_kernel`:
+/// `out[i] = x > 0 ? grad[i] : grad[i] * alpha * exp(x)`.
+/// Takes `alpha` as an extra `.param .f32` parameter.
+#[cfg(feature = "cuda")]
+pub(crate) const ELU_BACKWARD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry elu_backward_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .f32 alpha
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f32 %vg, %x, %alpha_r, %lg2e, %ex, %neg_branch, %vr, %zero;
+    .reg .pred %p, %pos;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+    ld.param.f32 %alpha_r, [alpha];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %vg, [%grad];
+    ld.global.f32 %x, [%input];
+
+    mov.f32 %lg2e, 0f3FB8AA3B;
+    mov.f32 %zero, 0f00000000;
+
+    // exp(x) = 2^(x * log2(e))
+    mul.f32 %ex, %x, %lg2e;
+    ex2.approx.f32 %ex, %ex;
+    // negative branch: grad * alpha * exp(x)
+    mul.f32 %neg_branch, %vg, %alpha_r;
+    mul.f32 %neg_branch, %neg_branch, %ex;
+
+    // x > 0 ? grad : grad * alpha * exp(x)
+    setp.gt.f32 %pos, %x, %zero;
+    selp.f32 %vr, %vg, %neg_branch, %pos;
+    st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `mish_kernel`: `out[i] = x * tanh(softplus(x))`.
+/// softplus(x) = ln(1 + exp(x)). For stability: when x > 20, softplus ~ x.
+/// tanh(y) = (exp(2y) - 1) / (exp(2y) + 1).
+#[cfg(feature = "cuda")]
+pub(crate) const MISH_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry mish_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f32 %x, %lg2e, %one, %ex, %ep1, %sp, %lg_ep1;
+    .reg .f32 %two_sp, %e2sp, %e2sp_m1, %e2sp_p1, %th, %vr;
+    .reg .f32 %threshold;
+    .reg .pred %p, %large;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %x, [%a];
+    mov.f32 %one, 0f3F800000;
+    mov.f32 %lg2e, 0f3FB8AA3B;
+    // threshold = 20.0 = 0x41A00000
+    mov.f32 %threshold, 0f41A00000;
+
+    // softplus(x) = ln(1 + exp(x))
+    // For large x (> 20), softplus ~ x to avoid overflow
+    setp.gt.f32 %large, %x, %threshold;
+    @%large bra LARGE_X;
+
+    // exp(x) = 2^(x * log2(e))
+    mul.f32 %ex, %x, %lg2e;
+    ex2.approx.f32 %ex, %ex;
+    add.f32 %ep1, %ex, %one;
+    // ln(1+exp(x)) = log2(1+exp(x)) / log2(e)
+    lg2.approx.f32 %lg_ep1, %ep1;
+    // 1/log2(e) = ln(2) = 0.6931472 = 0x3F317218
+    mul.f32 %sp, %lg_ep1, 0f3F317218;
+
+    // tanh(sp) = (exp(2*sp) - 1) / (exp(2*sp) + 1)
+    add.f32 %two_sp, %sp, %sp;
+    mul.f32 %two_sp, %two_sp, %lg2e;
+    ex2.approx.f32 %e2sp, %two_sp;
+    sub.f32 %e2sp_m1, %e2sp, %one;
+    add.f32 %e2sp_p1, %e2sp, %one;
+    rcp.approx.f32 %e2sp_p1, %e2sp_p1;
+    mul.f32 %th, %e2sp_m1, %e2sp_p1;
+
+    mul.f32 %vr, %x, %th;
+    st.global.f32 [%out], %vr;
+    bra DONE;
+
+LARGE_X:
+    // softplus ~ x, mish ~ x * tanh(x)
+    // tanh(x) = (exp(2x)-1)/(exp(2x)+1)
+    add.f32 %two_sp, %x, %x;
+    mul.f32 %two_sp, %two_sp, %lg2e;
+    ex2.approx.f32 %e2sp, %two_sp;
+    sub.f32 %e2sp_m1, %e2sp, %one;
+    add.f32 %e2sp_p1, %e2sp, %one;
+    rcp.approx.f32 %e2sp_p1, %e2sp_p1;
+    mul.f32 %th, %e2sp_m1, %e2sp_p1;
+    mul.f32 %vr, %x, %th;
+    st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `mish_backward_kernel`:
+/// ```text
+/// sp = ln(1 + exp(x))        // softplus
+/// t  = tanh(sp)
+/// sig = sigmoid(x) = 1/(1+exp(-x))
+/// out[i] = grad[i] * (t + x * sig * (1 - t*t))
+/// ```
+/// For stability: when x > 20, sp ~ x, t ~ tanh(x), sig ~ 1.
+#[cfg(feature = "cuda")]
+pub(crate) const MISH_BACKWARD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry mish_backward_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f32 %vg, %x, %lg2e, %one, %ex, %ep1, %sp, %lg_ep1;
+    .reg .f32 %two_sp, %e2sp, %e2sp_m1, %e2sp_p1, %t, %t2, %one_m_t2;
+    .reg .f32 %neg, %en, %denom, %sig, %x_sig_omt2, %deriv, %result;
+    .reg .f32 %threshold;
+    .reg .pred %p, %large;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %vg, [%grad];
+    ld.global.f32 %x, [%input];
+
+    mov.f32 %one, 0f3F800000;
+    mov.f32 %lg2e, 0f3FB8AA3B;
+    // threshold = 20.0
+    mov.f32 %threshold, 0f41A00000;
+
+    setp.gt.f32 %large, %x, %threshold;
+    @%large bra LARGE_X;
+
+    // --- Normal path ---
+    // softplus: sp = ln(1 + exp(x))
+    mul.f32 %ex, %x, %lg2e;
+    ex2.approx.f32 %ex, %ex;
+    add.f32 %ep1, %ex, %one;
+    lg2.approx.f32 %lg_ep1, %ep1;
+    // ln(2) = 0x3F317218
+    mul.f32 %sp, %lg_ep1, 0f3F317218;
+
+    // t = tanh(sp) = (exp(2*sp)-1)/(exp(2*sp)+1)
+    add.f32 %two_sp, %sp, %sp;
+    mul.f32 %two_sp, %two_sp, %lg2e;
+    ex2.approx.f32 %e2sp, %two_sp;
+    sub.f32 %e2sp_m1, %e2sp, %one;
+    add.f32 %e2sp_p1, %e2sp, %one;
+    rcp.approx.f32 %e2sp_p1, %e2sp_p1;
+    mul.f32 %t, %e2sp_m1, %e2sp_p1;
+
+    // sig = sigmoid(x) = 1/(1+exp(-x))
+    neg.f32 %neg, %x;
+    mul.f32 %neg, %neg, %lg2e;
+    ex2.approx.f32 %en, %neg;
+    add.f32 %denom, %one, %en;
+    rcp.approx.f32 %sig, %denom;
+
+    // deriv = t + x * sig * (1 - t*t)
+    mul.f32 %t2, %t, %t;
+    sub.f32 %one_m_t2, %one, %t2;
+    mul.f32 %x_sig_omt2, %x, %sig;
+    mul.f32 %x_sig_omt2, %x_sig_omt2, %one_m_t2;
+    add.f32 %deriv, %t, %x_sig_omt2;
+    mul.f32 %result, %vg, %deriv;
+    st.global.f32 [%out], %result;
+    bra DONE;
+
+LARGE_X:
+    // sp ~ x, t ~ tanh(x), sig ~ 1
+    // tanh(x) = (exp(2x)-1)/(exp(2x)+1)
+    add.f32 %two_sp, %x, %x;
+    mul.f32 %two_sp, %two_sp, %lg2e;
+    ex2.approx.f32 %e2sp, %two_sp;
+    sub.f32 %e2sp_m1, %e2sp, %one;
+    add.f32 %e2sp_p1, %e2sp, %one;
+    rcp.approx.f32 %e2sp_p1, %e2sp_p1;
+    mul.f32 %t, %e2sp_m1, %e2sp_p1;
+
+    // sig ~ 1, deriv ~ t + x*(1-t*t)
+    mul.f32 %t2, %t, %t;
+    sub.f32 %one_m_t2, %one, %t2;
+    mul.f32 %x_sig_omt2, %x, %one_m_t2;
+    add.f32 %deriv, %t, %x_sig_omt2;
+    mul.f32 %result, %vg, %deriv;
+    st.global.f32 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
+// ---------------------------------------------------------------------------
 // Backward activation kernels
 // ---------------------------------------------------------------------------
 
@@ -2263,6 +2716,322 @@ DONE:\n\
 ";
 
 // ---------------------------------------------------------------------------
+// LogSoftmax forward PTX kernel (row-wise, shared-memory max + log-sum-exp)
+// ---------------------------------------------------------------------------
+// For each row of length `cols`:
+//   m = max(x[j])
+//   log_sum_exp = m + log(sum(exp(x[j] - m)))
+//   out[j] = x[j] - log_sum_exp
+// One block per row, 256 threads per block.
+
+#[cfg(feature = "cuda")]
+pub(crate) const LOG_SOFTMAX_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.shared .align 4 .f32 sdata[256];\n\
+\n\
+.visible .entry log_softmax_kernel(\n\
+    .param .u64 input_ptr,\n\
+    .param .u64 output_ptr,\n\
+    .param .u32 rows,\n\
+    .param .u32 cols\n\
+) {\n\
+    .reg .u32 %r_tid, %bid, %bdim, %rows_reg, %cols_reg, %j;\n\
+    .reg .u64 %in, %out, %row_off, %off, %sbase, %saddr;\n\
+    .reg .f32 %val, %max_val, %sum_val, %exp_val, %log_sum_exp, %result;\n\
+    .reg .pred %p, %loop_p;\n\
+    .reg .u32 %half, %other_tid;\n\
+    .reg .f32 %other_val;\n\
+    .reg .pred %reduce_p;\n\
+\n\
+    ld.param.u64 %in, [input_ptr];\n\
+    ld.param.u64 %out, [output_ptr];\n\
+    ld.param.u32 %rows_reg, [rows];\n\
+    ld.param.u32 %cols_reg, [cols];\n\
+\n\
+    mov.u32 %bid, %ctaid.x;\n\
+    mov.u32 %bdim, %ntid.x;\n\
+    mov.u32 %r_tid, %tid.x;\n\
+    mov.u64 %sbase, sdata;\n\
+\n\
+    setp.ge.u32 %p, %bid, %rows_reg;\n\
+    @%p bra DONE;\n\
+\n\
+    // row_off = bid * cols * 4 (byte offset)\n\
+    cvt.u64.u32 %row_off, %bid;\n\
+    cvt.u64.u32 %off, %cols_reg;\n\
+    mul.lo.u64 %row_off, %row_off, %off;\n\
+    shl.b64 %row_off, %row_off, 2;\n\
+\n\
+    // Phase 1: find max across row (grid-stride over columns)\n\
+    mov.f32 %max_val, 0fFF800000;\n\
+    mov.u32 %j, %r_tid;\n\
+FIND_MAX:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra FIND_MAX_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %off, %in, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f32 %val, [%off];\n\
+    max.f32 %max_val, %max_val, %val;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra FIND_MAX;\n\
+FIND_MAX_DONE:\n\
+\n\
+    // Shared-memory tree reduction for max\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f32 [%saddr], %max_val;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+MAX_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra MAX_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra MAX_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f32 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f32 %max_val, [%saddr];\n\
+    max.f32 %max_val, %max_val, %other_val;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f32 [%saddr], %max_val;\n\
+MAX_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra MAX_REDUCE;\n\
+MAX_REDUCE_DONE:\n\
+\n\
+    // Broadcast max to all threads\n\
+    ld.shared.f32 %max_val, [sdata];\n\
+    bar.sync 0;\n\
+\n\
+    // Phase 2: compute partial sum of exp(x[j] - max)\n\
+    mov.f32 %sum_val, 0f00000000;\n\
+    mov.u32 %j, %r_tid;\n\
+SUM_EXP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra SUM_EXP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %off, %in, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f32 %val, [%off];\n\
+    sub.f32 %val, %val, %max_val;\n\
+    // exp(x) = exp2(x * log2(e)), log2(e) = 0x3FB8AA3B\n\
+    mul.f32 %val, %val, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %exp_val, %val;\n\
+    add.f32 %sum_val, %sum_val, %exp_val;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra SUM_EXP;\n\
+SUM_EXP_DONE:\n\
+\n\
+    // Shared-memory tree reduction for sum\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f32 [%saddr], %sum_val;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+SUM_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra SUM_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra SUM_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f32 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f32 %sum_val, [%saddr];\n\
+    add.f32 %sum_val, %sum_val, %other_val;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f32 [%saddr], %sum_val;\n\
+SUM_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra SUM_REDUCE;\n\
+SUM_REDUCE_DONE:\n\
+\n\
+    // Broadcast sum to all threads, compute log_sum_exp = max + log(sum)\n\
+    ld.shared.f32 %sum_val, [sdata];\n\
+    bar.sync 0;\n\
+    // log(x) = log2(x) / log2(e) = log2(x) * ln(2)\n\
+    // ln(2) = 0x3F317218\n\
+    lg2.approx.f32 %log_sum_exp, %sum_val;\n\
+    mul.f32 %log_sum_exp, %log_sum_exp, 0f3F317218;\n\
+    add.f32 %log_sum_exp, %max_val, %log_sum_exp;\n\
+\n\
+    // Phase 3: out[j] = x[j] - log_sum_exp\n\
+    mov.u32 %j, %r_tid;\n\
+WRITE_OUTPUT:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra WRITE_OUTPUT_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %in, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f32 %val, [%saddr];\n\
+    sub.f32 %result, %val, %log_sum_exp;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %out, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    st.global.f32 [%saddr], %result;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra WRITE_OUTPUT;\n\
+WRITE_OUTPUT_DONE:\n\
+\n\
+DONE:\n\
+    ret;\n\
+}\n\
+";
+
+// ---------------------------------------------------------------------------
+// LogSoftmax backward PTX kernel (row-wise, shared-memory sum reduction)
+// ---------------------------------------------------------------------------
+// For each row of length `cols`:
+//   sum_grad = sum(grad[j])
+//   out[j] = grad[j] - exp(output[j]) * sum_grad
+// where output[j] is the log-softmax output, so exp(output[j]) = softmax[j].
+// One block per row, 256 threads per block.
+
+#[cfg(feature = "cuda")]
+pub(crate) const LOG_SOFTMAX_BACKWARD_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.shared .align 4 .f32 sdata[256];\n\
+\n\
+.visible .entry log_softmax_backward_kernel(\n\
+    .param .u64 grad_ptr,\n\
+    .param .u64 output_ptr,\n\
+    .param .u64 out_ptr,\n\
+    .param .u32 rows,\n\
+    .param .u32 cols\n\
+) {\n\
+    .reg .u32 %r_tid, %bid, %bdim, %rows_reg, %cols_reg, %j, %half, %other_tid;\n\
+    .reg .u64 %grad, %output, %out, %row_off, %off, %sbase, %saddr;\n\
+    .reg .f32 %vg, %vo, %sum_grad, %other_val, %softmax_j, %result;\n\
+    .reg .pred %p, %loop_p, %reduce_p;\n\
+\n\
+    ld.param.u64 %grad, [grad_ptr];\n\
+    ld.param.u64 %output, [output_ptr];\n\
+    ld.param.u64 %out, [out_ptr];\n\
+    ld.param.u32 %rows_reg, [rows];\n\
+    ld.param.u32 %cols_reg, [cols];\n\
+\n\
+    mov.u32 %bid, %ctaid.x;\n\
+    mov.u32 %bdim, %ntid.x;\n\
+    mov.u32 %r_tid, %tid.x;\n\
+    mov.u64 %sbase, sdata;\n\
+\n\
+    setp.ge.u32 %p, %bid, %rows_reg;\n\
+    @%p bra DONE;\n\
+\n\
+    // row_off = bid * cols * 4 (byte offset)\n\
+    cvt.u64.u32 %row_off, %bid;\n\
+    cvt.u64.u32 %off, %cols_reg;\n\
+    mul.lo.u64 %row_off, %row_off, %off;\n\
+    shl.b64 %row_off, %row_off, 2;\n\
+\n\
+    // Phase 1: compute partial sum_grad = sum(grad[j]) for this thread's elements\n\
+    mov.f32 %sum_grad, 0f00000000;\n\
+    mov.u32 %j, %r_tid;\n\
+SUM_LOOP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra SUM_LOOP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %grad, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f32 %vg, [%saddr];\n\
+    add.f32 %sum_grad, %sum_grad, %vg;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra SUM_LOOP;\n\
+SUM_LOOP_DONE:\n\
+\n\
+    // Store partial sum into shared memory and reduce\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f32 [%saddr], %sum_grad;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+SUM_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra SUM_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra SUM_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f32 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f32 %sum_grad, [%saddr];\n\
+    add.f32 %sum_grad, %sum_grad, %other_val;\n\
+    st.shared.f32 [%saddr], %sum_grad;\n\
+SUM_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra SUM_REDUCE;\n\
+SUM_REDUCE_DONE:\n\
+\n\
+    // Broadcast sum_grad to all threads\n\
+    ld.shared.f32 %sum_grad, [sdata];\n\
+    bar.sync 0;\n\
+\n\
+    // Phase 2: out[j] = grad[j] - exp(output[j]) * sum_grad\n\
+    mov.u32 %j, %r_tid;\n\
+WRITE_LOOP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra WRITE_LOOP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 2;\n\
+    add.u64 %saddr, %grad, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f32 %vg, [%saddr];\n\
+    add.u64 %saddr, %output, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f32 %vo, [%saddr];\n\
+    // exp(log_softmax_output) = softmax probability\n\
+    mul.f32 %vo, %vo, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %softmax_j, %vo;\n\
+    // out[j] = grad[j] - softmax[j] * sum_grad\n\
+    mul.f32 %result, %softmax_j, %sum_grad;\n\
+    sub.f32 %result, %vg, %result;\n\
+    add.u64 %saddr, %out, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    st.global.f32 [%saddr], %result;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra WRITE_LOOP;\n\
+WRITE_LOOP_DONE:\n\
+\n\
+DONE:\n\
+    ret;\n\
+}\n\
+";
+
+// ---------------------------------------------------------------------------
 // Sum-axis PTX kernel: reduce along one axis of a tensor
 // ---------------------------------------------------------------------------
 // Parameters: input_ptr, output_ptr, outer_size, axis_size, inner_size, total_output
@@ -2957,6 +3726,380 @@ LNB_GI:
 LNB_GID:
 
 LNB_DONE:
+    ret;
+}
+";
+
+// ---------------------------------------------------------------------------
+// RMSNorm PTX kernel (row-wise: rms, normalize+scale)
+//
+// Like LayerNorm but without mean centering or bias:
+//   out[j] = x[j] * rsqrt(mean(x^2) + eps) * weight[j]
+//
+// Uses `.approx` PTX instructions (`div.approx.f32`, `sqrt.approx.f32`,
+// `rcp.approx.f32`) for performance. These have reduced precision (~2^-22
+// relative error) compared to the full-precision variants, which is
+// acceptable for neural network training/inference.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+pub(crate) const RMSNORM_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.shared .align 4 .f32 sdata[256];
+
+.visible .entry rmsnorm_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u64 w_ptr,
+    .param .u32 rows,
+    .param .u32 cols,
+    .param .f32 eps
+) {
+    .reg .u32 %r_tid, %r_bid, %r_bdim, %rows_reg, %cols_reg, %j, %half, %r_otid;
+    .reg .u64 %in, %out, %w, %row_off, %off, %sbase, %saddr;
+    .reg .f32 %val, %sq_sum, %eps_r, %inv_rms, %wv, %result, %other_val, %n_f;
+    .reg .pred %p, %lp, %rp;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %w, [w_ptr];
+    ld.param.u32 %rows_reg, [rows];
+    ld.param.u32 %cols_reg, [cols];
+    ld.param.f32 %eps_r, [eps];
+
+    mov.u64 %sbase, sdata;
+
+    mov.u32 %r_bid, %ctaid.x;
+    mov.u32 %r_bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+
+    setp.ge.u32 %p, %r_bid, %rows_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %row_off, %r_bid;
+    cvt.u64.u32 %off, %cols_reg;
+    mul.lo.u64 %row_off, %row_off, %off;
+    shl.b64 %row_off, %row_off, 2;
+    cvt.rn.f32.u32 %n_f, %cols_reg;
+
+    // ===== Phase 1: Compute sum(x^2) =====
+    mov.f32 %sq_sum, 0f00000000;
+    mov.u32 %j, %r_tid;
+SS:
+    setp.ge.u32 %lp, %j, %cols_reg;
+    @%lp bra SSD;
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %in, %off;
+    add.u64 %off, %off, %row_off;
+    ld.global.f32 %val, [%off];
+    fma.rn.f32 %sq_sum, %val, %val, %sq_sum;
+    add.u32 %j, %j, %r_bdim;
+    bra SS;
+SSD:
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    st.shared.f32 [%saddr], %sq_sum;
+    bar.sync 0;
+    mov.u32 %half, %r_bdim;
+SR:
+    shr.u32 %half, %half, 1;
+    setp.eq.u32 %rp, %half, 0;
+    @%rp bra SRD;
+    setp.ge.u32 %rp, %r_tid, %half;
+    @%rp bra SRS;
+    add.u32 %r_otid, %r_tid, %half;
+    cvt.u64.u32 %off, %r_otid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    ld.shared.f32 %other_val, [%saddr];
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    ld.shared.f32 %sq_sum, [%saddr];
+    add.f32 %sq_sum, %sq_sum, %other_val;
+    add.u64 %saddr, %sbase, %off;
+    st.shared.f32 [%saddr], %sq_sum;
+SRS:
+    bar.sync 0;
+    bra SR;
+SRD:
+    ld.shared.f32 %sq_sum, [%sbase];
+    div.approx.f32 %sq_sum, %sq_sum, %n_f;
+    add.f32 %sq_sum, %sq_sum, %eps_r;
+    sqrt.approx.f32 %inv_rms, %sq_sum;
+    rcp.approx.f32 %inv_rms, %inv_rms;
+    bar.sync 0;
+
+    // ===== Phase 2: Normalize and scale =====
+    // out[j] = x[j] * inv_rms * weight[j]
+    mov.u32 %j, %r_tid;
+NM:
+    setp.ge.u32 %lp, %j, %cols_reg;
+    @%lp bra NMD;
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %in, %off;
+    add.u64 %off, %off, %row_off;
+    ld.global.f32 %val, [%off];
+    mul.f32 %result, %val, %inv_rms;
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %w, %off;
+    ld.global.f32 %wv, [%off];
+    mul.f32 %result, %result, %wv;
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %out, %off;
+    add.u64 %off, %off, %row_off;
+    st.global.f32 [%off], %result;
+    add.u32 %j, %j, %r_bdim;
+    bra NM;
+NMD:
+
+DONE:
+    ret;
+}
+";
+
+// ---------------------------------------------------------------------------
+// RMSNorm backward PTX kernel
+// ---------------------------------------------------------------------------
+//
+// One block per batch element (row). Each block:
+//   1. Recompute inv_rms = 1/sqrt(mean(x^2) + eps)
+//   2. Compute dot = sum(grad_output[j] * x[j] * weight[j])
+//   3. Compute grad_input[j] = inv_rms * weight[j] * go[j]
+//                              - x[j] * inv_rms^3 * dot / cols
+//   4. Accumulate grad_weight[j] (atomicAdd) = go[j] * x[j] * inv_rms
+//
+// Uses shared memory for per-row reductions, 256 threads per block.
+// No grad_bias (RMSNorm has no bias parameter).
+// Parameters:
+//   in_ptr       - pointer to input f32 buffer [rows * cols]
+//   grad_out_ptr - pointer to grad_output f32 buffer [rows * cols]
+//   w_ptr        - pointer to weight f32 buffer [cols]
+//   grad_in_ptr  - pointer to grad_input f32 output buffer [rows * cols]
+//   grad_w_ptr   - pointer to grad_weight f32 output buffer [cols] (atomicAdd)
+//   rows         - number of batch elements
+//   cols         - normalized dimension size
+//   eps          - epsilon for numerical stability
+
+#[cfg(feature = "cuda")]
+pub(crate) const RMSNORM_BACKWARD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.shared .align 4 .f32 sdata[256];
+
+.visible .entry rmsnorm_backward_kernel(
+    .param .u64 in_ptr,
+    .param .u64 grad_out_ptr,
+    .param .u64 w_ptr,
+    .param .u64 grad_in_ptr,
+    .param .u64 grad_w_ptr,
+    .param .u32 rows,
+    .param .u32 cols,
+    .param .f32 eps
+) {
+    .reg .u32 %r_tid, %r_bid, %r_bdim, %rows_reg, %cols_reg, %j, %half, %r_otid;
+    .reg .u64 %in, %go, %w, %gi, %gw, %row_off, %off, %sbase, %saddr, %addr;
+    .reg .f32 %val, %sq_sum, %eps_r, %inv_rms, %inv_rms3, %wv, %gov;
+    .reg .f32 %dot, %other_val, %n_f, %coeff, %result, %tmp;
+    .reg .pred %p, %lp, %rp;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %go, [grad_out_ptr];
+    ld.param.u64 %w, [w_ptr];
+    ld.param.u64 %gi, [grad_in_ptr];
+    ld.param.u64 %gw, [grad_w_ptr];
+    ld.param.u32 %rows_reg, [rows];
+    ld.param.u32 %cols_reg, [cols];
+    ld.param.f32 %eps_r, [eps];
+
+    mov.u64 %sbase, sdata;
+
+    mov.u32 %r_bid, %ctaid.x;
+    mov.u32 %r_bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+
+    setp.ge.u32 %p, %r_bid, %rows_reg;
+    @%p bra RNB_DONE;
+
+    // row_off = bid * cols * 4 (byte offset for this row)
+    cvt.u64.u32 %row_off, %r_bid;
+    cvt.u64.u32 %off, %cols_reg;
+    mul.lo.u64 %row_off, %row_off, %off;
+    shl.b64 %row_off, %row_off, 2;
+    cvt.rn.f32.u32 %n_f, %cols_reg;
+
+    // ===== Phase 1: Compute sum(x^2) -> inv_rms =====
+    mov.f32 %sq_sum, 0f00000000;
+    mov.u32 %j, %r_tid;
+RNB_SS:
+    setp.ge.u32 %lp, %j, %cols_reg;
+    @%lp bra RNB_SSD;
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    add.u64 %addr, %addr, %row_off;
+    ld.global.f32 %val, [%addr];
+    fma.rn.f32 %sq_sum, %val, %val, %sq_sum;
+    add.u32 %j, %j, %r_bdim;
+    bra RNB_SS;
+RNB_SSD:
+    // Shared memory reduce for sum(x^2)
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    st.shared.f32 [%saddr], %sq_sum;
+    bar.sync 0;
+    mov.u32 %half, %r_bdim;
+RNB_SR:
+    shr.u32 %half, %half, 1;
+    setp.eq.u32 %rp, %half, 0;
+    @%rp bra RNB_SRD;
+    setp.ge.u32 %rp, %r_tid, %half;
+    @%rp bra RNB_SRS;
+    add.u32 %r_otid, %r_tid, %half;
+    cvt.u64.u32 %off, %r_otid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    ld.shared.f32 %other_val, [%saddr];
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    ld.shared.f32 %sq_sum, [%saddr];
+    add.f32 %sq_sum, %sq_sum, %other_val;
+    st.shared.f32 [%saddr], %sq_sum;
+RNB_SRS:
+    bar.sync 0;
+    bra RNB_SR;
+RNB_SRD:
+    ld.shared.f32 %sq_sum, [%sbase];
+    div.approx.f32 %sq_sum, %sq_sum, %n_f;
+    add.f32 %sq_sum, %sq_sum, %eps_r;
+    sqrt.approx.f32 %inv_rms, %sq_sum;
+    rcp.approx.f32 %inv_rms, %inv_rms;
+    // inv_rms3 = inv_rms^3 = inv_rms * inv_rms * inv_rms
+    mul.f32 %inv_rms3, %inv_rms, %inv_rms;
+    mul.f32 %inv_rms3, %inv_rms3, %inv_rms;
+    bar.sync 0;
+
+    // ===== Phase 2: Compute dot = sum(go[j] * x[j] * w[j]) =====
+    // Also accumulate grad_weight via atomicAdd
+    mov.f32 %dot, 0f00000000;
+    mov.u32 %j, %r_tid;
+RNB_DOT:
+    setp.ge.u32 %lp, %j, %cols_reg;
+    @%lp bra RNB_DOTD;
+    // Load input[row, j]
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    add.u64 %addr, %addr, %row_off;
+    ld.global.f32 %val, [%addr];
+    // Load grad_output[row, j]
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %go, %off;
+    add.u64 %addr, %addr, %row_off;
+    ld.global.f32 %gov, [%addr];
+    // Load weight[j]
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %w, %off;
+    ld.global.f32 %wv, [%addr];
+    // dot += go * x * w
+    mul.f32 %tmp, %gov, %val;
+    fma.rn.f32 %dot, %tmp, %wv, %dot;
+    // atomicAdd grad_weight[j] += go * x * inv_rms
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %gw, %off;
+    mul.f32 %result, %gov, %val;
+    mul.f32 %result, %result, %inv_rms;
+    atom.global.add.f32 %result, [%addr], %result;
+    add.u32 %j, %j, %r_bdim;
+    bra RNB_DOT;
+RNB_DOTD:
+    // Reduce dot in shared memory
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    st.shared.f32 [%saddr], %dot;
+    bar.sync 0;
+    mov.u32 %half, %r_bdim;
+RNB_DR:
+    shr.u32 %half, %half, 1;
+    setp.eq.u32 %rp, %half, 0;
+    @%rp bra RNB_DRD;
+    setp.ge.u32 %rp, %r_tid, %half;
+    @%rp bra RNB_DRS;
+    add.u32 %r_otid, %r_tid, %half;
+    cvt.u64.u32 %off, %r_otid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    ld.shared.f32 %other_val, [%saddr];
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %saddr, %sbase, %off;
+    ld.shared.f32 %dot, [%saddr];
+    add.f32 %dot, %dot, %other_val;
+    st.shared.f32 [%saddr], %dot;
+RNB_DRS:
+    bar.sync 0;
+    bra RNB_DR;
+RNB_DRD:
+    ld.shared.f32 %dot, [%sbase];
+    // coeff = dot * inv_rms3 / n
+    mul.f32 %coeff, %dot, %inv_rms3;
+    div.approx.f32 %coeff, %coeff, %n_f;
+    bar.sync 0;
+
+    // ===== Phase 3: Compute grad_input =====
+    // grad_input[j] = inv_rms * w[j] * go[j] - x[j] * coeff
+    mov.u32 %j, %r_tid;
+RNB_GI:
+    setp.ge.u32 %lp, %j, %cols_reg;
+    @%lp bra RNB_GID;
+    // Reload input
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    add.u64 %addr, %addr, %row_off;
+    ld.global.f32 %val, [%addr];
+    // Reload grad_output and weight
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %go, %off;
+    add.u64 %addr, %addr, %row_off;
+    ld.global.f32 %gov, [%addr];
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %w, %off;
+    ld.global.f32 %wv, [%addr];
+    // result = inv_rms * w * go - x * coeff
+    mul.f32 %result, %inv_rms, %wv;
+    mul.f32 %result, %result, %gov;
+    mul.f32 %tmp, %val, %coeff;
+    sub.f32 %result, %result, %tmp;
+    // Store grad_input[row, j]
+    cvt.u64.u32 %off, %j;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %gi, %off;
+    add.u64 %addr, %addr, %row_off;
+    st.global.f32 [%addr], %result;
+    add.u32 %j, %j, %r_bdim;
+    bra RNB_GI;
+RNB_GID:
+
+RNB_DONE:
     ret;
 }
 ";
@@ -6151,6 +7294,162 @@ pub fn gpu_softmax_backward(
 }
 
 // ---------------------------------------------------------------------------
+// Public API -- LogSoftmax forward & backward
+// ---------------------------------------------------------------------------
+
+/// Row-wise log-softmax on GPU.
+///
+/// For each row: `out[j] = x[j] - log(sum(exp(x - max(x))))`.
+///
+/// One block per row, 256 threads per block, shared-memory reductions for max
+/// and sum-exp.
+#[cfg(feature = "cuda")]
+pub fn gpu_log_softmax(
+    input: &CudaBuffer<f32>,
+    cols: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_unary(input, device)?;
+
+    let total = input.len();
+    let rows = total / cols;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        LOG_SOFTMAX_PTX,
+        "log_softmax_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0f32; total];
+            for r in 0..rows {
+                let base = r * cols;
+                let mut max_v = f32::NEG_INFINITY;
+                for c in 0..cols {
+                    max_v = max_v.max(host[base + c]);
+                }
+                let mut sum_exp = 0.0f32;
+                for c in 0..cols {
+                    sum_exp += (host[base + c] - max_v).exp();
+                }
+                let log_sum_exp = max_v + sum_exp.ln();
+                for c in 0..cols {
+                    out[base + c] = host[base + c] - log_sum_exp;
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(total, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    // One block per row, 256 threads per block.
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Row-wise log-softmax backward on GPU.
+///
+/// For each row:
+///   `sum_grad = sum(grad[j])`
+///   `out[j] = grad[j] - exp(output[j]) * sum_grad`
+///
+/// where `output` is the log-softmax forward output.
+#[cfg(feature = "cuda")]
+pub fn gpu_log_softmax_backward(
+    grad: &CudaBuffer<f32>,
+    output: &CudaBuffer<f32>,
+    cols: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_binary(grad, output, device)?;
+
+    let total = grad.len();
+    let rows = total / cols;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        LOG_SOFTMAX_BACKWARD_PTX,
+        "log_softmax_backward_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback
+            let grad_host = gpu_to_cpu(grad, device)?;
+            let output_host = gpu_to_cpu(output, device)?;
+            let mut result = vec![0.0f32; total];
+            for r in 0..rows {
+                let base = r * cols;
+                let mut sum_grad = 0.0f32;
+                for c in 0..cols {
+                    sum_grad += grad_host[base + c];
+                }
+                for c in 0..cols {
+                    result[base + c] =
+                        grad_host[base + c] - output_host[base + c].exp() * sum_grad;
+                }
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(total, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    // One block per row, 256 threads per block.
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad.inner())
+            .arg(output.inner())
+            .arg(out.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Public API -- Sum axis
 // ---------------------------------------------------------------------------
 
@@ -7187,6 +8486,221 @@ pub fn gpu_gelu_backward_tanh(
 }
 
 // ---------------------------------------------------------------------------
+// Public API -- SiLU (Swish)
+// ---------------------------------------------------------------------------
+
+/// Elementwise SiLU activation on GPU: `silu(x) = x * sigmoid(x)`.
+#[cfg(feature = "cuda")]
+pub fn gpu_silu(input: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<CudaBuffer<f32>> {
+    validate_unary(input, device)?;
+    if let Some(out) = try_launch_unary(input, device, SILU_PTX, "silu_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary(input, device, |x| {
+        let sig = 1.0 / (1.0 + (-x).exp());
+        x * sig
+    })
+}
+
+/// SiLU backward: `out[i] = grad[i] * (sig + x * sig * (1 - sig))`
+/// where `sig = sigmoid(input[i])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_silu_backward(
+    grad: &CudaBuffer<f32>,
+    input: &CudaBuffer<f32>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    validate_binary(grad, input, device)?;
+
+    if let Some(out) = try_launch_binary(
+        grad,
+        input,
+        device,
+        SILU_BACKWARD_PTX,
+        "silu_backward_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    // CPU fallback
+    let grad_host = gpu_to_cpu(grad, device)?;
+    let input_host = gpu_to_cpu(input, device)?;
+    let result: Vec<f32> = grad_host
+        .iter()
+        .zip(input_host.iter())
+        .map(|(&g, &x)| {
+            let sig = 1.0 / (1.0 + (-x).exp());
+            g * (sig + x * sig * (1.0 - sig))
+        })
+        .collect();
+    cpu_to_gpu(&result, device)
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- ELU
+// ---------------------------------------------------------------------------
+
+/// Elementwise ELU activation on GPU: `elu(x) = x > 0 ? x : alpha * (exp(x) - 1)`.
+///
+/// Uses a custom launch because the kernel takes an extra `alpha` parameter.
+#[cfg(feature = "cuda")]
+pub fn gpu_elu(
+    input: &CudaBuffer<f32>,
+    alpha: f32,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_unary(input, device)?;
+
+    let n = input.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ELU_PTX,
+        "elu_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let result: Vec<f32> = host
+                .iter()
+                .map(|&x| if x > 0.0 { x } else { alpha * (x.exp() - 1.0) })
+                .collect();
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .arg(&alpha)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// ELU backward: `out[i] = x > 0 ? grad[i] : grad[i] * alpha * exp(x)`.
+///
+/// Uses a custom launch because the kernel takes an extra `alpha` parameter.
+#[cfg(feature = "cuda")]
+pub fn gpu_elu_backward(
+    grad: &CudaBuffer<f32>,
+    input: &CudaBuffer<f32>,
+    alpha: f32,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_binary(grad, input, device)?;
+
+    let n = grad.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ELU_BACKWARD_PTX,
+        "elu_backward_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let grad_host = gpu_to_cpu(grad, device)?;
+            let input_host = gpu_to_cpu(input, device)?;
+            let result: Vec<f32> = grad_host
+                .iter()
+                .zip(input_host.iter())
+                .map(|(&g, &x)| if x > 0.0 { g } else { g * alpha * x.exp() })
+                .collect();
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad.inner())
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .arg(&alpha)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- Mish
+// ---------------------------------------------------------------------------
+
+/// Elementwise Mish activation on GPU: `mish(x) = x * tanh(softplus(x))`.
+#[cfg(feature = "cuda")]
+pub fn gpu_mish(input: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<CudaBuffer<f32>> {
+    validate_unary(input, device)?;
+    if let Some(out) = try_launch_unary(input, device, MISH_PTX, "mish_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary(input, device, |x| {
+        let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+        x * sp.tanh()
+    })
+}
+
+/// Mish backward:
+/// `out[i] = grad[i] * (tanh(sp) + x * sigmoid(x) * (1 - tanh(sp)^2))`
+/// where `sp = softplus(x) = ln(1 + exp(x))`.
+#[cfg(feature = "cuda")]
+pub fn gpu_mish_backward(
+    grad: &CudaBuffer<f32>,
+    input: &CudaBuffer<f32>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    validate_binary(grad, input, device)?;
+
+    if let Some(out) = try_launch_binary(
+        grad,
+        input,
+        device,
+        MISH_BACKWARD_PTX,
+        "mish_backward_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    // CPU fallback
+    let grad_host = gpu_to_cpu(grad, device)?;
+    let input_host = gpu_to_cpu(input, device)?;
+    let result: Vec<f32> = grad_host
+        .iter()
+        .zip(input_host.iter())
+        .map(|(&g, &x)| {
+            let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+            let t = sp.tanh();
+            let sig = 1.0 / (1.0 + (-x).exp());
+            g * (t + x * sig * (1.0 - t * t))
+        })
+        .collect();
+    cpu_to_gpu(&result, device)
+}
+
+// ---------------------------------------------------------------------------
 // Public API -- elementwise transcendentals & math ops
 // ---------------------------------------------------------------------------
 
@@ -7941,6 +9455,214 @@ pub fn gpu_layernorm_backward(
     Err(GpuError::NoCudaFeature)
 }
 
+// ---------------------------------------------------------------------------
+// Public API -- RMSNorm
+// ---------------------------------------------------------------------------
+
+/// Row-wise RMS normalization on GPU.
+///
+/// `input`: `[rows * cols]`, `weight`: `[cols]`.
+/// Output: normalized and scaled `[rows * cols]`.
+///
+/// Computes `out[j] = x[j] * rsqrt(mean(x^2) + eps) * weight[j]`.
+/// No bias, no mean centering (unlike LayerNorm).
+#[cfg(feature = "cuda")]
+pub fn gpu_rmsnorm(
+    input: &CudaBuffer<f32>,
+    weight: &CudaBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_unary(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        RMSNORM_PTX,
+        "rmsnorm_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("ferrotorch-gpu: RMSNorm PTX compilation failed ({e:?}), CPU fallback");
+            std::fs::write("/tmp/rmsnorm_debug.ptx", RMSNORM_PTX).ok();
+            eprintln!(
+                "ferrotorch-gpu: dumped PTX to /tmp/rmsnorm_debug.ptx ({} bytes)",
+                RMSNORM_PTX.len()
+            );
+            let h_in = gpu_to_cpu(input, device)?;
+            let h_w = gpu_to_cpu(weight, device)?;
+            let mut out = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                let base = r * cols;
+                let slice = &h_in[base..base + cols];
+                let sq_mean: f32 =
+                    slice.iter().map(|&x| x * x).sum::<f32>() / cols as f32;
+                let inv_rms = 1.0 / (sq_mean + eps).sqrt();
+                for c in 0..cols {
+                    out[base + c] = slice[c] * inv_rms * h_w[c];
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(rows * cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(weight.inner())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- RMSNorm backward
+// ---------------------------------------------------------------------------
+
+/// RMSNorm backward pass on GPU.
+///
+/// Computes grad_input and grad_weight entirely on GPU.
+/// One block per batch element (row), 256 threads per block.
+/// grad_weight is accumulated across batches via atomicAdd.
+///
+/// `input`: `[rows * cols]`, `grad_output`: `[rows * cols]`, `weight`: `[cols]`.
+/// Returns: `(grad_input [rows * cols], grad_weight [cols])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_rmsnorm_backward(
+    input: &CudaBuffer<f32>,
+    grad_output: &CudaBuffer<f32>,
+    weight: &CudaBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<f32>)> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_unary(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        RMSNORM_BACKWARD_PTX,
+        "rmsnorm_backward_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback
+            let h_in = gpu_to_cpu(input, device)?;
+            let h_go = gpu_to_cpu(grad_output, device)?;
+            let h_w = gpu_to_cpu(weight, device)?;
+            let mut grad_input = vec![0.0f32; rows * cols];
+            let mut grad_weight = vec![0.0f32; cols];
+            let n_f = cols as f32;
+            for r in 0..rows {
+                let base = r * cols;
+                let x_slice = &h_in[base..base + cols];
+                let go_slice = &h_go[base..base + cols];
+                let sq_mean: f32 =
+                    x_slice.iter().map(|&x| x * x).sum::<f32>() / n_f;
+                let inv_rms = 1.0 / (sq_mean + eps).sqrt();
+                let inv_rms3 = inv_rms * inv_rms * inv_rms;
+                let mut dot = 0.0f32;
+                for c in 0..cols {
+                    dot += go_slice[c] * x_slice[c] * h_w[c];
+                    grad_weight[c] += go_slice[c] * x_slice[c] * inv_rms;
+                }
+                let coeff = dot * inv_rms3 / n_f;
+                for c in 0..cols {
+                    grad_input[base + c] =
+                        inv_rms * h_w[c] * go_slice[c] - x_slice[c] * coeff;
+                }
+            }
+            let gi = cpu_to_gpu(&grad_input, device)?;
+            let gw = cpu_to_gpu(&grad_weight, device)?;
+            return Ok((gi, gw));
+        }
+    };
+
+    let mut grad_in = alloc_zeros_f32(rows * cols, device)?;
+    let mut grad_w = alloc_zeros_f32(cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    // One block per row, 256 threads per block.
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(grad_output.inner())
+            .arg(weight.inner())
+            .arg(grad_in.inner_mut())
+            .arg(grad_w.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+
+    Ok((grad_in, grad_w))
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_rmsnorm(
+    _input: &CudaBuffer<f32>,
+    _weight: &CudaBuffer<f32>,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_rmsnorm_backward(
+    _input: &CudaBuffer<f32>,
+    _grad_output: &CudaBuffer<f32>,
+    _weight: &CudaBuffer<f32>,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+    _device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<f32>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
 // ===========================================================================
 // _into variants — write to pre-allocated output buffers (zero allocation)
 //
@@ -8678,6 +10400,59 @@ pub fn gpu_gelu_backward_tanh(
 
 /// Stub -- always returns [`GpuError::NoCudaFeature`].
 #[cfg(not(feature = "cuda"))]
+pub fn gpu_silu(_input: &CudaBuffer<f32>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_silu_backward(
+    _grad: &CudaBuffer<f32>,
+    _input: &CudaBuffer<f32>,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_elu(
+    _input: &CudaBuffer<f32>,
+    _alpha: f32,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_elu_backward(
+    _grad: &CudaBuffer<f32>,
+    _input: &CudaBuffer<f32>,
+    _alpha: f32,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_mish(_input: &CudaBuffer<f32>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_mish_backward(
+    _grad: &CudaBuffer<f32>,
+    _input: &CudaBuffer<f32>,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
 pub fn gpu_div(
     _a: &CudaBuffer<f32>,
     _b: &CudaBuffer<f32>,
@@ -9031,6 +10806,27 @@ pub fn gpu_tanh_backward(
 /// Stub -- always returns [`GpuError::NoCudaFeature`].
 #[cfg(not(feature = "cuda"))]
 pub fn gpu_softmax_backward(
+    _grad: &CudaBuffer<f32>,
+    _output: &CudaBuffer<f32>,
+    _cols: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_log_softmax(
+    _input: &CudaBuffer<f32>,
+    _cols: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_log_softmax_backward(
     _grad: &CudaBuffer<f32>,
     _output: &CudaBuffer<f32>,
     _cols: usize,
