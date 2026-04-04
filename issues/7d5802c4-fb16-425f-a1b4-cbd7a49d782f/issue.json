@@ -1,0 +1,10 @@
+{
+  "uuid": "7d5802c4-fb16-425f-a1b4-cbd7a49d782f",
+  "display_id": 483,
+  "title": "Add GPU path for flex_attention (currently downloads Q/K/V to CPU)",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-04-04T01:37:34.919242894Z",
+  "updated_at": "2026-04-04T01:37:34.919242894Z"
+}
