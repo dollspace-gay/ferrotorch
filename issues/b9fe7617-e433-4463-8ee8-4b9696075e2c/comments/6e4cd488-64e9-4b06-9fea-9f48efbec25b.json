@@ -1,0 +1,10 @@
+{
+  "uuid": "6e4cd488-64e9-4b06-9fea-9f48efbec25b",
+  "issue_uuid": "b9fe7617-e433-4463-8ee8-4b9696075e2c",
+  "author": "y4rr",
+  "content": "[result] Eliminated Dropout2d GPU roundtrip by replacing the broken CPU-passthrough GPU path with a hard NotImplementedOnCuda error. Also added CUDA error checks to DropoutBackward and Dropout2dBackward. The previous GPU path was doing: upload ones→dropout→download mask→download input→CPU multiply→re-upload, which defeated the purpose. Regular Dropout forward remains GPU-native via dropout_philox_f32. All 23 dropout tests pass.",
+  "created_at": "2026-04-04T16:42:16.270293984Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcrQytRwuaqnr/PuteJdekPbshGNnPAhSPugg25IbrHVRLqsB3G2/CCBFuAlD3zanyk25ZNEQwFm0ysO3a9DjBQ=="
+}
