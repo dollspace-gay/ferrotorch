@@ -1,0 +1,10 @@
+{
+  "uuid": "c128aed4-9551-4530-a24d-81a37501d5e6",
+  "issue_uuid": "c03af582-e5a2-47fa-9a55-04ec3918ca23",
+  "author": "y4rr",
+  "content": "[result] Added HybridBackend combining TcpBackend (P2P send/recv/barrier) with NcclBackend (GPU-native collectives). Exposes nccl() and tcp() accessors for direct use. Backend trait delegates to TCP for P2P, uses TCP barrier for reliability. Matches PyTorch's ProcessGroupNCCL+Gloo pattern.",
+  "created_at": "2026-04-04T23:57:48.999985787Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3LVoMvPz9hTl8iOYQqG0hGlYOguM4OiHpMgyz7vFMjElQa6fMapPW1Z24zn97MujuQl60e3XWghZofCUzvqlAA=="
+}
