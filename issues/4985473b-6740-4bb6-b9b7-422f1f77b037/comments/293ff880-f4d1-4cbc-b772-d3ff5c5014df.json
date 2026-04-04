@@ -1,0 +1,10 @@
+{
+  "uuid": "293ff880-f4d1-4cbc-b772-d3ff5c5014df",
+  "issue_uuid": "4985473b-6740-4bb6-b9b7-422f1f77b037",
+  "author": "y4rr",
+  "content": "[result] NCCL backend implemented with 3 new modules: nccl_sys.rs (FFI bindings via runtime dlopen — works when NCCL is installed, graceful error when not), nccl_backend.rs (NcclBackend implementing Backend trait with GPU-native allreduce/broadcast/all_gather/reduce_scatter raw methods), nccl_collective.rs (high-level GPU-native collectives operating on GpuBufferHandle via raw_device_ptr). Added 'nccl' feature flag (implies 'gpu'), libc dependency, re-exports in lib.rs. Also added raw_device_ptr/raw_device_ptr_mut to GpuBackend trait + CudaBackendImpl. 3271 tests pass.",
+  "created_at": "2026-04-04T22:19:01.561580815Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQR4dh2r6kAI6LFo/4Bunv7rl1N5QV6xZI30iUj+jOuGp7EM8niZrFssy9JqCj5ztVSwWynYvE7y777lHBat9AA=="
+}
