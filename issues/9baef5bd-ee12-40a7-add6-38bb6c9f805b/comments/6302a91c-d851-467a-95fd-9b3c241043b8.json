@@ -1,0 +1,10 @@
+{
+  "uuid": "6302a91c-d851-467a-95fd-9b3c241043b8",
+  "issue_uuid": "9baef5bd-ee12-40a7-add6-38bb6c9f805b",
+  "author": "y4rr",
+  "content": "65 f64 PTX kernels, 43 backend_impl methods, 44 dispatch sites. Full f64 GPU coverage for arithmetic, activations (all forward+backward), broadcast, reduction, cumulative scans, shape ops. 3255 tests pass.",
+  "created_at": "2026-04-04T18:27:23.244182974Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAI8AKfQUw7twJTYDqkOXO7Dkg6bYKOHYiN4swtZ8rC5501/Gm+IVRV964PZxRt8RPMz3bpFiR4G3z/AKGEuNDDg=="
+}
