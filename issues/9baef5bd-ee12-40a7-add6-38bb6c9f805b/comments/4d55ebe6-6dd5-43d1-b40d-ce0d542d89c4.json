@@ -1,0 +1,10 @@
+{
+  "uuid": "4d55ebe6-6dd5-43d1-b40d-ce0d542d89c4",
+  "issue_uuid": "9baef5bd-ee12-40a7-add6-38bb6c9f805b",
+  "author": "y4rr",
+  "content": "Wired f64 backward (relu/sigmoid/tanh) and broadcast (add/sub/mul/div) ops end-to-end through backend_impl and dispatch sites. 21 f64 PTX kernels total, all fully connected. 3255 tests pass. Remaining: reduction, cumulative, norm, indexing, shape f64 kernels.",
+  "created_at": "2026-04-04T17:33:41.359898589Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyOkhE06wF4rVVTylIXyHz4lgf6GoamVQ8Jkfpal+8e4F65FqtVWF3YbbgLD8+h+iCSDsRfFZX8RsSvOzI+9oDA=="
+}
