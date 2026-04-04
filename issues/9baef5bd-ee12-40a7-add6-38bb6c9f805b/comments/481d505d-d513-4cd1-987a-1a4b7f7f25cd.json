@@ -1,0 +1,10 @@
+{
+  "uuid": "481d505d-d513-4cd1-987a-1a4b7f7f25cd",
+  "issue_uuid": "9baef5bd-ee12-40a7-add6-38bb6c9f805b",
+  "author": "y4rr",
+  "content": "Added f64 reduction kernels (reduce_sum, sum_axis) — PTX, launchers, backend, dispatch. broadcast_grad now works for f64. Total 23 f64 PTX kernels end-to-end. 3255 tests pass.",
+  "created_at": "2026-04-04T17:42:06.100573549Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5gB0jF4jxgpR2pzyN5eerYcABzY7S1v2K0fz/GujKp16hiOv/8IiCkk4j9RVeqJ6ZaBRbTguz0XsjVsd1yWCBA=="
+}
