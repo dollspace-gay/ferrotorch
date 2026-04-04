@@ -1,0 +1,10 @@
+{
+  "uuid": "704c5eb8-824a-4aed-8832-e073a1b06900",
+  "issue_uuid": "124a13eb-4177-4433-a646-d7de6c710822",
+  "author": "y4rr",
+  "content": "Result: Added GPU RMSNorm forward + backward PTX kernels (rmsnorm_kernel, rmsnorm_backward_kernel) with shared-memory parallel reduction. Added GpuBackend trait methods (rmsnorm_f32, rmsnorm_backward_f32), CudaBackendImpl overrides, and GPU fast paths in nn::RMSNorm forward/backward. RMSNorm now runs entirely on GPU for f32 CUDA tensors. LayerNorm was already GPU-accelerated. GroupNorm and BatchNorm still need GPU kernels (separate issues). Also refactored 4 loss backward functions (MSE, BCEWithLogits, KLDiv, PoissonNLL) to eliminate CPU roundtrips using GPU-dispatched tensor ops. All 3200+ workspace tests pass.",
+  "created_at": "2026-04-04T02:08:37.591408394Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAA+C35pjdRp4g6neZRNxsAY9dn6DfFjI6qL9DJwA1X592m+o1Tr5qiPlDf+reWiTp0nvkKvUD3R8xwI2KkFM3Dg=="
+}
