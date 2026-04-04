@@ -1,0 +1,10 @@
+{
+  "uuid": "23a014dc-e54e-44c5-a128-41d3183d123a",
+  "issue_uuid": "78e250bd-71f6-42cd-ac62-9b8fb669c171",
+  "author": "y4rr",
+  "content": "Result: All activation backward kernels now have GPU dispatch: SiLU, ELU, Mish backward PTX kernels added alongside their forward kernels in #475. LogSoftmax backward added in #476. Combined with existing relu/sigmoid/tanh/gelu/softmax/softplus backward kernels, all activation backward passes now run on GPU for f32 CUDA tensors.",
+  "created_at": "2026-04-04T02:50:53.536371980Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyEbxVslFwjoX1f32NgW+mihPgAQ1ngPjkVSUv/hKXQWSHu+hbrV8X3adnTmfXYqCQ/s9Ikmi8cXo5sJemfckAQ=="
+}
