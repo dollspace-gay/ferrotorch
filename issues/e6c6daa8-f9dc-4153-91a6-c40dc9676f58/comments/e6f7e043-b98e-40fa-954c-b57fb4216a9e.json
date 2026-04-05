@@ -1,0 +1,10 @@
+{
+  "uuid": "e6f7e043-b98e-40fa-954c-b57fb4216a9e",
+  "issue_uuid": "e6c6daa8-f9dc-4153-91a6-c40dc9676f58",
+  "author": "y4rr",
+  "content": "[result] Implemented SparseAdam (Adam for sparse gradients — only updates moment estimates at non-zero gradient indices, 4 tests) and Adafactor (memory-efficient factored second moments for 2D+ params, relative step sizing, optional beta1 momentum, 5 tests). Both exported from ferrotorch-optim. 3610 total tests pass, 0 warnings.",
+  "created_at": "2026-04-05T20:46:58.793207568Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArLsOdhYTSmHgnZkB1PMvrj8oZyCEAIG53GnOb6UmTiJxxi+Mnk7mwyKgrgRT6N6yV2tGabDoOEoFobj1jI5fCQ=="
+}
