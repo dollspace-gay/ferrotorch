@@ -1,0 +1,10 @@
+{
+  "uuid": "0e1c78cf-e44c-486d-acf6-7da3b04cf80e",
+  "issue_uuid": "bba02887-d3d8-4e3f-b282-f2fe8ce34eba",
+  "author": "y4rr",
+  "content": "[result] Implemented full Transformer module suite: TransformerEncoderLayer (self-attn + FFN + LayerNorm + Dropout), TransformerDecoderLayer (self-attn + cross-attn + FFN), TransformerEncoder (N-layer stack), TransformerDecoder (N-layer stack), Transformer (encoder-decoder). Also added RoPE, SwiGLU, KVCache. All exported from ferrotorch-nn. 3445 tests pass.",
+  "created_at": "2026-04-05T03:11:38.727084418Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAA1m0AxBEHiKtOcFN4DYm1ZeK5uzYRe5MuAw7KYWuE6Q8vmyOgO9MQQ104nkVnPlyCOYi8BU8pVKXuM9EchtxAw=="
+}
