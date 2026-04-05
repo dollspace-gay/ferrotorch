@@ -1,0 +1,10 @@
+{
+  "uuid": "7a82303f-eaaf-42a4-9f9c-d9bd410ac9af",
+  "issue_uuid": "a0171bf0-3761-4486-8182-3f125dc2ddb1",
+  "author": "y4rr",
+  "content": "[result] Added Poisson (Knuth sampling, 9 tests), LogNormal (wraps Normal, 9 tests), StudentT (Marsaglia-Tsang Chi2, 10 tests), Cauchy (inverse CDF, 10 tests), Gumbel (10 tests), HalfNormal (folded Normal, 13 tests). All with sample/log_prob/entropy and backward nodes for reparameterized sampling. 257 distribution tests pass. Still missing: Binomial, Geometric, NegativeBinomial.",
+  "created_at": "2026-04-05T20:14:08.115883490Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/687DtkkJOzl3X7uY5BthSEkUIWyqdlPFwKWmLxJZ1eJXIScBYx7AX2qHJUkGGaUIbnK5QOMdRtKDxPYmd1RCw=="
+}
