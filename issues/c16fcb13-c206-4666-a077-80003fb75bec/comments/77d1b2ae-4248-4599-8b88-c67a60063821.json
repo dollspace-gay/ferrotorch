@@ -1,0 +1,10 @@
+{
+  "uuid": "77d1b2ae-4248-4599-8b88-c67a60063821",
+  "issue_uuid": "c16fcb13-c206-4666-a077-80003fb75bec",
+  "author": "y4rr",
+  "content": "[result] Implemented WeightedRandomSampler (draws indices with/without replacement according to per-sample weights using alias method) and BatchSampler (wraps any sampler to yield batches with configurable drop_last). Both implement Iterator for ergonomic use with DataLoader. Tests verify sampling distributions and batch sizing. 3445 tests pass.",
+  "created_at": "2026-04-05T03:12:14.397763440Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwQuas0t2FJpxZ/2rvald4KtDqykLejrKJTGl8ZXcYJgoNqe5GzHPHdGotlwTOq7D6yqSo+/Pugh3Yo71D1wgDQ=="
+}
