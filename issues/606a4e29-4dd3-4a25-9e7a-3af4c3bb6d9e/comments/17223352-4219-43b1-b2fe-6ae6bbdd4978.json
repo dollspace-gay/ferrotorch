@@ -1,0 +1,10 @@
+{
+  "uuid": "17223352-4219-43b1-b2fe-6ae6bbdd4978",
+  "issue_uuid": "606a4e29-4dd3-4a25-9e7a-3af4c3bb6d9e",
+  "author": "y4rr",
+  "content": "[result] HalfNormal and LogNormal implemented. HalfCauchy still missing.",
+  "created_at": "2026-04-05T20:14:26.131864722Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAczvqe/gtImPV0qK4Vt5Mw2hi51IJKp3qHx3ARu651nlkvZMygfbYEraqlPVc56Tf2IvSfzpzfrw3r/zpn8z8Bw=="
+}
