@@ -1,0 +1,10 @@
+{
+  "uuid": "cc87f278-0249-4d7e-ab74-487e8c24e196",
+  "issue_uuid": "84fbaa38-0c13-4150-acd4-332d173a0240",
+  "author": "y4rr",
+  "content": "[result] Implemented EmbeddingBag module with Sum/Mean/Max reduction modes. Supports 1D input with explicit offsets (forward_bag) and 2D input where each row is a bag (Module::forward). Fused lookup+reduce avoids full intermediate embedding materialization. Exports EmbeddingBag and EmbeddingBagMode from ferrotorch-nn. Compiles clean.",
+  "created_at": "2026-04-05T00:28:00.947231264Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgYPO5ozmz+IzGiM8yMnALzshzFtUysLvbym3EgoFdNcRq2p3ZATnDQDcxz20vk2RAzDamCu9C2ALF3HhRQMvDg=="
+}
