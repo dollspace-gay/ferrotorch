@@ -1,0 +1,10 @@
+{
+  "uuid": "aa764c24-4c2a-4b97-b75e-9509bb4d65a2",
+  "issue_uuid": "2712dec4-4b3f-410d-92ec-059f8ae2b305",
+  "author": "y4rr",
+  "content": "[result] Investigation shows this is already done. ferrotorch-core/src/ops/linalg.rs already uses faer::linalg::matmul (the same backend ferray-linalg wraps) for CPU matmul of large matrices (>128 dims). Small matrices use an optimized ikj triple-loop with unsafe get_unchecked. Rayon parallelism kicks in for m*k*n >= 512^3. Wrapping through ferray-linalg would add Vec->Array allocation overhead with no benefit since both systems call the same faer BLAS underneath. No changes needed.",
+  "created_at": "2026-04-05T00:14:28.271921578Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZs33fV3xJLKWacx4ObeaUq6bFP6WLesPZ8kIWG7UMV0f4Rqo7ZH/i9k15nOtbUD8lIItZK8O2TWU57s9h6J+Bg=="
+}
