@@ -2,11 +2,12 @@
   "uuid": "a5277aca-8e44-45dd-9f30-69d9a41f991a",
   "display_id": 419,
   "title": "Implement RNN (vanilla), RNNCell, LSTMCell, GRUCell",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "y4rr",
   "created_at": "2026-04-03T22:18:30.744203928Z",
-  "updated_at": "2026-04-03T22:18:32.280204663Z",
+  "updated_at": "2026-04-05T00:36:24.188865334Z",
+  "closed_at": "2026-04-05T00:36:24.188865334Z",
   "labels": [
     "nn"
   ]
