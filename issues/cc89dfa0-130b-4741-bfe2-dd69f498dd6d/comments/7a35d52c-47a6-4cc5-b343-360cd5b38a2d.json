@@ -1,0 +1,10 @@
+{
+  "uuid": "7a35d52c-47a6-4cc5-b343-360cd5b38a2d",
+  "issue_uuid": "cc89dfa0-130b-4741-bfe2-dd69f498dd6d",
+  "author": "y4rr",
+  "content": "[result] Replaced raw_device_ptr usize hack with proper typed pointers. raw_device_ptr now returns *const c_void, raw_device_ptr_mut returns *mut c_void. Added buffer_elem_size() method to GpuBackend trait (returns 4 for f32, 8 for f64). NCCL collectives now auto-detect dtype via buffer_elem_size — nccl_allreduce/broadcast/all_gather/reduce_scatter work correctly for both f32 and f64 without explicit _dtype calls. 3271 tests pass.",
+  "created_at": "2026-04-05T00:04:25.664673833Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASDRY0wNcG8Rt95Zo4udHl17UwqATRqPNg2xkicuuvfEtU+bU2UUZFl4hBGUmUs8Q5ZZq9YkrEe+FzRM3MKXeDA=="
+}
