@@ -1,0 +1,10 @@
+{
+  "uuid": "a6bde5f9-c6a0-4b61-867e-000fe1bc0c71",
+  "issue_uuid": "9090b9e5-8bb2-447f-b0cd-d6e82e2422ae",
+  "author": "y4rr",
+  "content": "[result] Investigation showed ferrotorch already uses ferray-ufunc SIMD kernels for add and mul (via fast_add/fast_mul with rayon parallelism + pool allocation). Added fast_sub and fast_div following the same pattern — vectorizable loops with rayon parallel chunking for tensors >= 32K elements, pool-allocated output buffers, f32/f64 specializations. LLVM auto-vectorizes the simple sub/div loops to SIMD. Wired into arithmetic dispatch (sub/div now use fast_sub/fast_div instead of scalar binary_map). 3271 tests pass.",
+  "created_at": "2026-04-05T00:20:39.669806430Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJ13qyhUBCyooV2HSbzmdsw1uADBSdtbflWYPkLm+uW7p1uTpRJwukEOkxYbQ3/X8AMDxlS2TXiE6fOOu8lCQDg=="
+}
