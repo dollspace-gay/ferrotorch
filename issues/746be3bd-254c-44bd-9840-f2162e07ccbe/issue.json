@@ -2,11 +2,12 @@
   "uuid": "746be3bd-254c-44bd-9840-f2162e07ccbe",
   "display_id": 191,
   "title": "Bump all crate versions to 0.1.2",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-16T04:25:32.679952052Z",
-  "updated_at": "2026-03-16T04:25:39.886984973Z",
+  "updated_at": "2026-04-05T15:12:54.850686474Z",
+  "closed_at": "2026-04-05T15:12:54.850686474Z",
   "labels": [
     "enhancement"
   ]
