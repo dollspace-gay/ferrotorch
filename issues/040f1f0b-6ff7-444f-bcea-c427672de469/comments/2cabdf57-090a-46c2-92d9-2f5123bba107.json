@@ -1,0 +1,10 @@
+{
+  "uuid": "2cabdf57-090a-46c2-92d9-2f5123bba107",
+  "issue_uuid": "040f1f0b-6ff7-444f-bcea-c427672de469",
+  "author": "y4rr",
+  "content": "[result] Added ptx_f32_to_f64() runtime transform function + get_f64_ptx() caching helper. 43 simple f64 launchers now derive their PTX from the f32 source via mechanical substitution (register types, load/store widths, byte offsets, float literals). Each launcher uses a static OnceLock<String> for zero-cost after first call. The 21 complex kernels (transcendentals with polynomial implementations) retain hand-written f64 PTX. New kernels can use get_f64_ptx() instead of hand-writing f64 variants. 3271 tests pass.",
+  "created_at": "2026-04-05T00:08:20.121161711Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGOFAfPIPbt4gH+EEi299BSvwNWfUJoTwHlJIwAiSYjNLmlwY6je3UB+TelojYxJQI9pljBN4DGAv+DIXKkpzAg=="
+}
