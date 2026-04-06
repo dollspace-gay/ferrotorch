@@ -20,6 +20,12 @@
 //! | [`Gamma`] | `concentration`, `rate` | Yes |
 //! | [`Exponential`] | `rate` | Yes |
 //! | [`Laplace`] | `loc`, `scale` | Yes |
+//! | [`Cauchy`] | `loc`, `scale` | Yes |
+//! | [`Gumbel`] | `loc`, `scale` | Yes |
+//! | [`HalfNormal`] | `scale` | Yes |
+//! | [`LogNormal`] | `loc`, `scale` | Yes |
+//! | [`Poisson`] | `rate` | No (discrete) |
+//! | [`StudentT`] | `df`, `loc`, `scale` | Yes |
 //! | [`MultivariateNormal`] | `loc`, `scale_tril` | Yes |
 //! | [`Dirichlet`] | `concentration` | Yes |
 //! | [`Multinomial`] | `total_count`, `probs` | No (discrete) |
@@ -35,30 +41,50 @@
 mod bernoulli;
 mod beta;
 mod categorical;
+mod cauchy;
 pub mod constraints;
 mod dirichlet;
 mod exponential;
 mod gamma;
+mod gumbel;
+mod half_normal;
 pub mod kl;
 mod laplace;
+mod lognormal;
 mod multinomial;
 mod multivariate_normal;
 mod normal;
+mod poisson;
+mod kumaraswamy;
 pub(crate) mod special_fns;
+mod student_t;
 pub mod transforms;
 mod uniform;
+mod von_mises;
+mod weibull;
+mod pareto;
 
 pub use bernoulli::Bernoulli;
 pub use beta::Beta;
 pub use categorical::Categorical;
+pub use cauchy::Cauchy;
 pub use dirichlet::Dirichlet;
 pub use exponential::Exponential;
 pub use gamma::Gamma;
+pub use gumbel::Gumbel;
+pub use half_normal::HalfNormal;
 pub use laplace::Laplace;
+pub use lognormal::LogNormal;
 pub use multinomial::Multinomial;
 pub use multivariate_normal::MultivariateNormal;
 pub use normal::Normal;
+pub use poisson::Poisson;
+pub use student_t::StudentT;
 pub use transforms::TransformedDistribution;
+pub use von_mises::VonMises;
+pub use weibull::Weibull;
+pub use kumaraswamy::Kumaraswamy;
+pub use pareto::Pareto;
 pub use uniform::Uniform;
 
 use ferrotorch_core::dtype::Float;

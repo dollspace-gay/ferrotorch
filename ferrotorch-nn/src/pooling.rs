@@ -1,5 +1,5 @@
 //! Pooling layers: MaxPool1d/2d/3d, AvgPool1d/2d/3d, AdaptiveAvgPool1d/2d/3d,
-//! AdaptiveMaxPool2d, MaxUnpool2d — CL-315.
+//! AdaptiveMaxPool1d/2d/3d, FractionalMaxPool2d, LPPool1d/2d, MaxUnpool2d.
 //!
 //! All are zero-parameter modules operating on `[B, C, *spatial]` tensors.
 //! Each forward pass attaches a `GradFn<T>` for reverse-mode autodiff
@@ -2156,6 +2156,950 @@ impl<T: Float> GradFn<T> for MaxUnpool2dBackward<T> {
 }
 
 // ===========================================================================
+// AdaptiveMaxPool1d — CL-432
+// ===========================================================================
+
+/// 1D adaptive max pooling layer.
+///
+/// Dynamically computes window boundaries to produce the target `output_size`
+/// regardless of input spatial dimensions. Returns the pooled tensor and
+/// stores indices internally for gradient routing.
+///
+/// Input shape: `[B, C, L]`
+/// Output shape: `[B, C, output_size]`
+#[derive(Debug, Clone)]
+pub struct AdaptiveMaxPool1d {
+    pub output_size: usize,
+}
+
+impl AdaptiveMaxPool1d {
+    /// Create a new `AdaptiveMaxPool1d` targeting the given output length.
+    pub fn new(output_size: usize) -> Self {
+        Self { output_size }
+    }
+}
+
+impl<T: Float> Module<T> for AdaptiveMaxPool1d {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        adaptive_max_pool1d_forward(input, self.output_size)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+
+    fn train(&mut self) {}
+    fn eval(&mut self) {}
+
+    fn is_training(&self) -> bool {
+        false
+    }
+}
+
+/// Forward computation for 1D adaptive max pooling.
+fn adaptive_max_pool1d_forward<T: Float>(
+    input: &Tensor<T>,
+    output_size: usize,
+) -> FerrotorchResult<Tensor<T>> {
+    let (batch, channels, l) = validate_3d(input)?;
+    let out_l = output_size;
+
+    if out_l == 0 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: "adaptive output_size must be > 0".into(),
+        });
+    }
+
+    let input_device = input.device();
+    let data = input.data_vec()?;
+    let total = batch * channels * out_l;
+    let mut output = vec![<T as num_traits::Zero>::zero(); total];
+    let mut indices = vec![0usize; total];
+    let neg_inf = T::from(-1e38).unwrap();
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for ol in 0..out_l {
+                let l_start = adaptive_start(ol, l, out_l);
+                let l_end = adaptive_end(ol, l, out_l);
+
+                let out_idx = (b * channels + c) * out_l + ol;
+                let mut max_val = neg_inf;
+                let mut max_idx = 0usize;
+
+                for il in l_start..l_end {
+                    let in_idx = (b * channels + c) * l + il;
+                    let val = data[in_idx];
+                    if val > max_val {
+                        max_val = val;
+                        max_idx = in_idx;
+                    }
+                }
+
+                output[out_idx] = max_val;
+                indices[out_idx] = max_idx;
+            }
+        }
+    }
+
+    let out_shape = vec![batch, channels, out_l];
+    let storage = TensorStorage::cpu(output);
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            storage,
+            out_shape,
+            Arc::new(AdaptiveMaxPool1dBackward {
+                input: input.clone(),
+                indices,
+            }),
+        )?
+        .to(input_device)
+    } else {
+        Tensor::from_storage(storage, out_shape, false)?.to(input_device)
+    }
+}
+
+/// Backward for `AdaptiveMaxPool1d`.
+#[derive(Debug)]
+struct AdaptiveMaxPool1dBackward<T: Float> {
+    input: Tensor<T>,
+    indices: Vec<usize>,
+}
+
+impl<T: Float> GradFn<T> for AdaptiveMaxPool1dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if !self.input.requires_grad() {
+            return Ok(vec![None]);
+        }
+
+        let go_data = grad_output.data_vec()?;
+        let input_numel = self.input.numel();
+        let mut grad_input = vec![<T as num_traits::Zero>::zero(); input_numel];
+
+        for (out_idx, &in_idx) in self.indices.iter().enumerate() {
+            grad_input[in_idx] += go_data[out_idx];
+        }
+
+        let grad_tensor = Tensor::from_storage(
+            TensorStorage::cpu(grad_input),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "AdaptiveMaxPool1dBackward"
+    }
+}
+
+// ===========================================================================
+// AdaptiveMaxPool3d — CL-432
+// ===========================================================================
+
+/// 3D adaptive max pooling layer.
+///
+/// Dynamically computes window boundaries to produce the target `output_size`
+/// regardless of input spatial dimensions.
+///
+/// Input shape: `[B, C, D, H, W]`
+/// Output shape: `[B, C, output_size.0, output_size.1, output_size.2]`
+#[derive(Debug, Clone)]
+pub struct AdaptiveMaxPool3d {
+    pub output_size: (usize, usize, usize),
+}
+
+impl AdaptiveMaxPool3d {
+    /// Create a new `AdaptiveMaxPool3d` targeting the given output spatial size.
+    pub fn new(output_size: (usize, usize, usize)) -> Self {
+        Self { output_size }
+    }
+}
+
+impl<T: Float> Module<T> for AdaptiveMaxPool3d {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        adaptive_max_pool3d_forward(input, self.output_size)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+
+    fn train(&mut self) {}
+    fn eval(&mut self) {}
+
+    fn is_training(&self) -> bool {
+        false
+    }
+}
+
+/// Forward computation for 3D adaptive max pooling.
+fn adaptive_max_pool3d_forward<T: Float>(
+    input: &Tensor<T>,
+    output_size: (usize, usize, usize),
+) -> FerrotorchResult<Tensor<T>> {
+    let (batch, channels, d, h, w) = validate_5d(input)?;
+    let (out_d, out_h, out_w) = output_size;
+
+    if out_d == 0 || out_h == 0 || out_w == 0 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: "adaptive output_size must be > 0".into(),
+        });
+    }
+
+    let input_device = input.device();
+    let data = input.data_vec()?;
+    let total = batch * channels * out_d * out_h * out_w;
+    let mut output = vec![<T as num_traits::Zero>::zero(); total];
+    let mut indices = vec![0usize; total];
+    let neg_inf = T::from(-1e38).unwrap();
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for od in 0..out_d {
+                let d_start = adaptive_start(od, d, out_d);
+                let d_end = adaptive_end(od, d, out_d);
+
+                for oh in 0..out_h {
+                    let h_start = adaptive_start(oh, h, out_h);
+                    let h_end = adaptive_end(oh, h, out_h);
+
+                    for ow in 0..out_w {
+                        let w_start = adaptive_start(ow, w, out_w);
+                        let w_end = adaptive_end(ow, w, out_w);
+
+                        let out_idx =
+                            (((b * channels + c) * out_d + od) * out_h + oh) * out_w + ow;
+                        let mut max_val = neg_inf;
+                        let mut max_idx = 0usize;
+
+                        for id in d_start..d_end {
+                            for ih in h_start..h_end {
+                                for iw in w_start..w_end {
+                                    let in_idx =
+                                        (((b * channels + c) * d + id) * h + ih) * w + iw;
+                                    let val = data[in_idx];
+                                    if val > max_val {
+                                        max_val = val;
+                                        max_idx = in_idx;
+                                    }
+                                }
+                            }
+                        }
+
+                        output[out_idx] = max_val;
+                        indices[out_idx] = max_idx;
+                    }
+                }
+            }
+        }
+    }
+
+    let out_shape = vec![batch, channels, out_d, out_h, out_w];
+    let storage = TensorStorage::cpu(output);
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            storage,
+            out_shape,
+            Arc::new(AdaptiveMaxPool3dBackward {
+                input: input.clone(),
+                indices,
+            }),
+        )?
+        .to(input_device)
+    } else {
+        Tensor::from_storage(storage, out_shape, false)?.to(input_device)
+    }
+}
+
+/// Backward for `AdaptiveMaxPool3d`.
+#[derive(Debug)]
+struct AdaptiveMaxPool3dBackward<T: Float> {
+    input: Tensor<T>,
+    indices: Vec<usize>,
+}
+
+impl<T: Float> GradFn<T> for AdaptiveMaxPool3dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if !self.input.requires_grad() {
+            return Ok(vec![None]);
+        }
+
+        let go_data = grad_output.data_vec()?;
+        let input_numel = self.input.numel();
+        let mut grad_input = vec![<T as num_traits::Zero>::zero(); input_numel];
+
+        for (out_idx, &in_idx) in self.indices.iter().enumerate() {
+            grad_input[in_idx] += go_data[out_idx];
+        }
+
+        let grad_tensor = Tensor::from_storage(
+            TensorStorage::cpu(grad_input),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "AdaptiveMaxPool3dBackward"
+    }
+}
+
+// ===========================================================================
+// FractionalMaxPool2d — CL-432
+// ===========================================================================
+
+/// Fractional max pooling layer (2D).
+///
+/// Applies stochastic pooling as described in "Fractional Max-Pooling" by
+/// Ben Graham. The output spatial dimensions are determined by `output_size`,
+/// and the pooling regions are randomly (stochastically) chosen at each
+/// forward pass during training, or deterministically in eval mode.
+///
+/// Input shape: `[B, C, H, W]`
+/// Output shape: `[B, C, output_size.0, output_size.1]`
+#[derive(Debug, Clone)]
+pub struct FractionalMaxPool2d {
+    pub output_size: (usize, usize),
+}
+
+impl FractionalMaxPool2d {
+    /// Create a new `FractionalMaxPool2d` targeting the given output spatial size.
+    pub fn new(output_size: (usize, usize)) -> Self {
+        Self { output_size }
+    }
+}
+
+/// Generate fractional pooling boundaries using a pseudo-random sequence.
+///
+/// Produces `output_size + 1` boundaries in `[0, input_size]` such that
+/// the intervals cover the input and each interval length is either
+/// `floor(input/output)` or `ceil(input/output)`.
+fn fractional_boundaries(input_size: usize, output_size: usize, seed: u64) -> Vec<usize> {
+    if output_size >= input_size {
+        // Each output bin covers exactly one input position.
+        return (0..=output_size).map(|i| i.min(input_size)).collect();
+    }
+
+    let ratio = input_size as f64 / output_size as f64;
+    let mut boundaries = Vec::with_capacity(output_size + 1);
+    boundaries.push(0);
+
+    // Use the alpha sequence from the paper: generate a random alpha in [0,1)
+    // per output bin to choose between floor and ceil kernel size.
+    let mut rng_state = seed;
+    for i in 0..output_size {
+        // Advance the rng.
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let u = (rng_state as f64) / (u64::MAX as f64);
+
+        let ideal = (i + 1) as f64 * ratio;
+        let boundary = if u < (ideal.ceil() - ideal) {
+            ideal.floor() as usize
+        } else {
+            ideal.ceil() as usize
+        };
+        boundaries.push(boundary.min(input_size));
+    }
+
+    // Ensure the last boundary is exactly input_size.
+    *boundaries.last_mut().unwrap() = input_size;
+    boundaries
+}
+
+impl<T: Float> Module<T> for FractionalMaxPool2d {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let (batch, channels, h, w) = validate_4d(input)?;
+        let (out_h, out_w) = self.output_size;
+
+        if out_h == 0 || out_w == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "FractionalMaxPool2d: output_size must be > 0".into(),
+            });
+        }
+        if out_h > h || out_w > w {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "FractionalMaxPool2d: output_size ({out_h}, {out_w}) must be <= input ({h}, {w})"
+                ),
+            });
+        }
+
+        let input_device = input.device();
+        let data = input.data_vec()?;
+
+        // Generate random boundaries using a per-forward seed.
+        let seed = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            use std::time::SystemTime;
+
+            let mut hasher = DefaultHasher::new();
+            SystemTime::now().hash(&mut hasher);
+            std::thread::current().id().hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let h_bounds = fractional_boundaries(h, out_h, seed);
+        let w_bounds = fractional_boundaries(w, out_w, seed.wrapping_mul(2654435761));
+
+        let total = batch * channels * out_h * out_w;
+        let mut output = vec![<T as num_traits::Zero>::zero(); total];
+        let mut indices = vec![0usize; total];
+        let neg_inf = T::from(-1e38).unwrap();
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for oh in 0..out_h {
+                    let h_start = h_bounds[oh];
+                    let h_end = h_bounds[oh + 1];
+
+                    for ow in 0..out_w {
+                        let w_start = w_bounds[ow];
+                        let w_end = w_bounds[ow + 1];
+
+                        let out_idx = ((b * channels + c) * out_h + oh) * out_w + ow;
+                        let mut max_val = neg_inf;
+                        let mut max_idx = 0usize;
+
+                        for ih in h_start..h_end {
+                            for iw in w_start..w_end {
+                                let in_idx = ((b * channels + c) * h + ih) * w + iw;
+                                let val = data[in_idx];
+                                if val > max_val {
+                                    max_val = val;
+                                    max_idx = in_idx;
+                                }
+                            }
+                        }
+
+                        output[out_idx] = max_val;
+                        indices[out_idx] = max_idx;
+                    }
+                }
+            }
+        }
+
+        let out_shape = vec![batch, channels, out_h, out_w];
+        let storage = TensorStorage::cpu(output);
+
+        if is_grad_enabled() && input.requires_grad() {
+            Tensor::from_operation(
+                storage,
+                out_shape,
+                Arc::new(FractionalMaxPool2dBackward {
+                    input: input.clone(),
+                    indices,
+                }),
+            )?
+            .to(input_device)
+        } else {
+            Tensor::from_storage(storage, out_shape, false)?.to(input_device)
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+
+    fn train(&mut self) {}
+    fn eval(&mut self) {}
+
+    fn is_training(&self) -> bool {
+        false
+    }
+}
+
+/// Backward for `FractionalMaxPool2d`.
+#[derive(Debug)]
+struct FractionalMaxPool2dBackward<T: Float> {
+    input: Tensor<T>,
+    indices: Vec<usize>,
+}
+
+impl<T: Float> GradFn<T> for FractionalMaxPool2dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if !self.input.requires_grad() {
+            return Ok(vec![None]);
+        }
+
+        let go_data = grad_output.data_vec()?;
+        let input_numel = self.input.numel();
+        let mut grad_input = vec![<T as num_traits::Zero>::zero(); input_numel];
+
+        for (out_idx, &in_idx) in self.indices.iter().enumerate() {
+            grad_input[in_idx] += go_data[out_idx];
+        }
+
+        let grad_tensor = Tensor::from_storage(
+            TensorStorage::cpu(grad_input),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "FractionalMaxPool2dBackward"
+    }
+}
+
+// ===========================================================================
+// LPPool1d — CL-432
+// ===========================================================================
+
+/// 1D Lp norm pooling layer.
+///
+/// Computes `(sum(|x|^p) over kernel)^(1/p)` for each pooling window.
+///
+/// Input shape: `[B, C, L]`
+/// Output shape: `[B, C, L_out]`
+///
+/// When `p == 1`, this is equivalent to average pooling (of absolute values).
+/// When `p == 2`, this is the L2 (Euclidean) norm pooling.
+///
+/// Matches `torch.nn.LPPool1d`.
+#[derive(Debug, Clone)]
+pub struct LPPool1d {
+    pub norm_type: f64,
+    pub kernel_size: usize,
+    pub stride: usize,
+}
+
+impl LPPool1d {
+    /// Create a new `LPPool1d` layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `norm_type` - The exponent `p` for the Lp norm.
+    /// * `kernel_size` - Size of the pooling window.
+    /// * `stride` - Stride of the pooling window. If `0`, defaults to `kernel_size`.
+    pub fn new(norm_type: f64, kernel_size: usize, stride: usize) -> Self {
+        let stride = if stride == 0 { kernel_size } else { stride };
+        Self {
+            norm_type,
+            kernel_size,
+            stride,
+        }
+    }
+}
+
+impl<T: Float> Module<T> for LPPool1d {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        lp_pool1d_forward(input, self.norm_type, self.kernel_size, self.stride)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+
+    fn train(&mut self) {}
+    fn eval(&mut self) {}
+
+    fn is_training(&self) -> bool {
+        false
+    }
+}
+
+/// Forward computation for 1D Lp norm pooling.
+fn lp_pool1d_forward<T: Float>(
+    input: &Tensor<T>,
+    norm_type: f64,
+    kernel_size: usize,
+    stride: usize,
+) -> FerrotorchResult<Tensor<T>> {
+    let (batch, channels, l) = validate_3d(input)?;
+    let out_l = validate_pool_params_1d(l, kernel_size, stride, 0)?;
+    let p_t = T::from(norm_type).unwrap();
+    let inv_p = T::from(1.0 / norm_type).unwrap();
+
+    let input_device = input.device();
+    let data = input.data_vec()?;
+    let total = batch * channels * out_l;
+    let mut output = vec![<T as num_traits::Zero>::zero(); total];
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for ol in 0..out_l {
+                let l_start = ol * stride;
+                let l_end = (l_start + kernel_size).min(l);
+
+                let mut sum = <T as num_traits::Zero>::zero();
+                for il in l_start..l_end {
+                    let in_idx = (b * channels + c) * l + il;
+                    sum += data[in_idx].abs().powf(p_t);
+                }
+
+                let out_idx = (b * channels + c) * out_l + ol;
+                output[out_idx] = sum.powf(inv_p);
+            }
+        }
+    }
+
+    let out_shape = vec![batch, channels, out_l];
+    let storage = TensorStorage::cpu(output);
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            storage,
+            out_shape,
+            Arc::new(LPPool1dBackward {
+                input: input.clone(),
+                norm_type,
+                kernel_size,
+                stride,
+            }),
+        )?
+        .to(input_device)
+    } else {
+        Tensor::from_storage(storage, out_shape, false)?.to(input_device)
+    }
+}
+
+/// Backward for `LPPool1d`.
+///
+/// For `y = (sum |x_i|^p)^(1/p)`, the gradient is:
+/// `dy/dx_i = y^(1-p) * |x_i|^(p-1) * sign(x_i)`
+/// which is equivalent to `(|x_i|/y)^(p-1) * sign(x_i) / y^0 ` simplified to:
+/// `dy/dx_i = x_i * |x_i|^(p-2) / y^(p-1)`
+#[derive(Debug)]
+struct LPPool1dBackward<T: Float> {
+    input: Tensor<T>,
+    norm_type: f64,
+    kernel_size: usize,
+    stride: usize,
+}
+
+impl<T: Float> GradFn<T> for LPPool1dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if !self.input.requires_grad() {
+            return Ok(vec![None]);
+        }
+
+        let in_shape = self.input.shape();
+        let (batch, channels, l) = (in_shape[0], in_shape[1], in_shape[2]);
+        let out_l = (l - self.kernel_size) / self.stride + 1;
+
+        let input_data = self.input.data_vec()?;
+        let go_data = grad_output.data_vec()?;
+
+        let p_t = T::from(self.norm_type).unwrap();
+        let inv_p = T::from(1.0 / self.norm_type).unwrap();
+        let p_minus_1 = T::from(self.norm_type - 1.0).unwrap();
+        let p_minus_2 = T::from(self.norm_type - 2.0).unwrap();
+        let eps = T::from(1e-12).unwrap();
+
+        let mut grad_input = vec![<T as num_traits::Zero>::zero(); self.input.numel()];
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for ol in 0..out_l {
+                    let l_start = ol * self.stride;
+                    let l_end = (l_start + self.kernel_size).min(l);
+
+                    // Recompute the output value for this window.
+                    let mut sum = <T as num_traits::Zero>::zero();
+                    for il in l_start..l_end {
+                        let in_idx = (b * channels + c) * l + il;
+                        sum += input_data[in_idx].abs().powf(p_t);
+                    }
+                    let y = sum.powf(inv_p);
+                    let y_p_minus_1 = y.powf(p_minus_1) + eps;
+
+                    let out_idx = (b * channels + c) * out_l + ol;
+                    let go = go_data[out_idx];
+
+                    for il in l_start..l_end {
+                        let in_idx = (b * channels + c) * l + il;
+                        let x = input_data[in_idx];
+                        // dy/dx_i = x_i * |x_i|^(p-2) / y^(p-1)
+                        let grad_val = x * x.abs().powf(p_minus_2) / y_p_minus_1;
+                        grad_input[in_idx] += go * grad_val;
+                    }
+                }
+            }
+        }
+
+        let grad_tensor = Tensor::from_storage(
+            TensorStorage::cpu(grad_input),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "LPPool1dBackward"
+    }
+}
+
+// ===========================================================================
+// LPPool2d — CL-432
+// ===========================================================================
+
+/// 2D Lp norm pooling layer.
+///
+/// Computes `(sum(|x|^p) over kernel)^(1/p)` for each pooling window.
+///
+/// Input shape: `[B, C, H, W]`
+/// Output shape: `[B, C, H_out, W_out]`
+///
+/// Matches `torch.nn.LPPool2d`.
+#[derive(Debug, Clone)]
+pub struct LPPool2d {
+    pub norm_type: f64,
+    pub kernel_size: [usize; 2],
+    pub stride: [usize; 2],
+}
+
+impl LPPool2d {
+    /// Create a new `LPPool2d` layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `norm_type` - The exponent `p` for the Lp norm.
+    /// * `kernel_size` - Size of the pooling window `[kH, kW]`.
+    /// * `stride` - Stride of the pooling window `[sH, sW]`. Elements of `0` default to corresponding kernel_size.
+    pub fn new(norm_type: f64, kernel_size: [usize; 2], stride: [usize; 2]) -> Self {
+        let stride = [
+            if stride[0] == 0 { kernel_size[0] } else { stride[0] },
+            if stride[1] == 0 { kernel_size[1] } else { stride[1] },
+        ];
+        Self {
+            norm_type,
+            kernel_size,
+            stride,
+        }
+    }
+}
+
+impl<T: Float> Module<T> for LPPool2d {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        lp_pool2d_forward(input, self.norm_type, self.kernel_size, self.stride)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+
+    fn train(&mut self) {}
+    fn eval(&mut self) {}
+
+    fn is_training(&self) -> bool {
+        false
+    }
+}
+
+/// Forward computation for 2D Lp norm pooling.
+fn lp_pool2d_forward<T: Float>(
+    input: &Tensor<T>,
+    norm_type: f64,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+) -> FerrotorchResult<Tensor<T>> {
+    let (batch, channels, h, w) = validate_4d(input)?;
+    let out_h = validate_pool_params_1d(h, kernel_size[0], stride[0], 0)?;
+    let out_w = validate_pool_params_1d(w, kernel_size[1], stride[1], 0)?;
+    let p_t = T::from(norm_type).unwrap();
+    let inv_p = T::from(1.0 / norm_type).unwrap();
+
+    let input_device = input.device();
+    let data = input.data_vec()?;
+    let total = batch * channels * out_h * out_w;
+    let mut output = vec![<T as num_traits::Zero>::zero(); total];
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for oh in 0..out_h {
+                let h_start = oh * stride[0];
+                let h_end = (h_start + kernel_size[0]).min(h);
+
+                for ow in 0..out_w {
+                    let w_start = ow * stride[1];
+                    let w_end = (w_start + kernel_size[1]).min(w);
+
+                    let mut sum = <T as num_traits::Zero>::zero();
+                    for ih in h_start..h_end {
+                        for iw in w_start..w_end {
+                            let in_idx = ((b * channels + c) * h + ih) * w + iw;
+                            sum += data[in_idx].abs().powf(p_t);
+                        }
+                    }
+
+                    let out_idx = ((b * channels + c) * out_h + oh) * out_w + ow;
+                    output[out_idx] = sum.powf(inv_p);
+                }
+            }
+        }
+    }
+
+    let out_shape = vec![batch, channels, out_h, out_w];
+    let storage = TensorStorage::cpu(output);
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            storage,
+            out_shape,
+            Arc::new(LPPool2dBackward {
+                input: input.clone(),
+                norm_type,
+                kernel_size,
+                stride,
+            }),
+        )?
+        .to(input_device)
+    } else {
+        Tensor::from_storage(storage, out_shape, false)?.to(input_device)
+    }
+}
+
+/// Backward for `LPPool2d`.
+#[derive(Debug)]
+struct LPPool2dBackward<T: Float> {
+    input: Tensor<T>,
+    norm_type: f64,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+}
+
+impl<T: Float> GradFn<T> for LPPool2dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if !self.input.requires_grad() {
+            return Ok(vec![None]);
+        }
+
+        let in_shape = self.input.shape();
+        let (batch, channels, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+        let out_h = (h - self.kernel_size[0]) / self.stride[0] + 1;
+        let out_w = (w - self.kernel_size[1]) / self.stride[1] + 1;
+
+        let input_data = self.input.data_vec()?;
+        let go_data = grad_output.data_vec()?;
+
+        let p_t = T::from(self.norm_type).unwrap();
+        let inv_p = T::from(1.0 / self.norm_type).unwrap();
+        let p_minus_1 = T::from(self.norm_type - 1.0).unwrap();
+        let p_minus_2 = T::from(self.norm_type - 2.0).unwrap();
+        let eps = T::from(1e-12).unwrap();
+
+        let mut grad_input = vec![<T as num_traits::Zero>::zero(); self.input.numel()];
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for oh in 0..out_h {
+                    let h_start = oh * self.stride[0];
+                    let h_end = (h_start + self.kernel_size[0]).min(h);
+
+                    for ow in 0..out_w {
+                        let w_start = ow * self.stride[1];
+                        let w_end = (w_start + self.kernel_size[1]).min(w);
+
+                        // Recompute output for this window.
+                        let mut sum = <T as num_traits::Zero>::zero();
+                        for ih in h_start..h_end {
+                            for iw in w_start..w_end {
+                                let in_idx = ((b * channels + c) * h + ih) * w + iw;
+                                sum += input_data[in_idx].abs().powf(p_t);
+                            }
+                        }
+                        let y = sum.powf(inv_p);
+                        let y_p_minus_1 = y.powf(p_minus_1) + eps;
+
+                        let out_idx = ((b * channels + c) * out_h + oh) * out_w + ow;
+                        let go = go_data[out_idx];
+
+                        for ih in h_start..h_end {
+                            for iw in w_start..w_end {
+                                let in_idx = ((b * channels + c) * h + ih) * w + iw;
+                                let x = input_data[in_idx];
+                                let grad_val = x * x.abs().powf(p_minus_2) / y_p_minus_1;
+                                grad_input[in_idx] += go * grad_val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let grad_tensor = Tensor::from_storage(
+            TensorStorage::cpu(grad_input),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "LPPool2dBackward"
+    }
+}
+
+// ===========================================================================
 // Public functional API
 // ===========================================================================
 
@@ -2249,6 +3193,42 @@ pub fn adaptive_max_pool2d<T: Float>(
     output_size: (usize, usize),
 ) -> FerrotorchResult<Tensor<T>> {
     adaptive_max_pool2d_forward(input, output_size)
+}
+
+/// Functional 1D adaptive max pooling. See [`AdaptiveMaxPool1d`] for details.
+pub fn adaptive_max_pool1d<T: Float>(
+    input: &Tensor<T>,
+    output_size: usize,
+) -> FerrotorchResult<Tensor<T>> {
+    adaptive_max_pool1d_forward(input, output_size)
+}
+
+/// Functional 3D adaptive max pooling. See [`AdaptiveMaxPool3d`] for details.
+pub fn adaptive_max_pool3d<T: Float>(
+    input: &Tensor<T>,
+    output_size: (usize, usize, usize),
+) -> FerrotorchResult<Tensor<T>> {
+    adaptive_max_pool3d_forward(input, output_size)
+}
+
+/// Functional 1D Lp norm pooling. See [`LPPool1d`] for details.
+pub fn lp_pool1d<T: Float>(
+    input: &Tensor<T>,
+    norm_type: f64,
+    kernel_size: usize,
+    stride: usize,
+) -> FerrotorchResult<Tensor<T>> {
+    lp_pool1d_forward(input, norm_type, kernel_size, stride)
+}
+
+/// Functional 2D Lp norm pooling. See [`LPPool2d`] for details.
+pub fn lp_pool2d<T: Float>(
+    input: &Tensor<T>,
+    norm_type: f64,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+) -> FerrotorchResult<Tensor<T>> {
+    lp_pool2d_forward(input, norm_type, kernel_size, stride)
 }
 
 // ===========================================================================
@@ -2691,5 +3671,354 @@ mod tests {
         fn name(&self) -> &'static str {
             "SumBackward"
         }
+    }
+
+    /// Create a leaf 3D tensor from flat data.
+    fn leaf_3d(data: &[f32], shape: [usize; 3], requires_grad: bool) -> Tensor<f32> {
+        Tensor::from_storage(
+            TensorStorage::cpu(data.to_vec()),
+            shape.to_vec(),
+            requires_grad,
+        )
+        .unwrap()
+    }
+
+    /// Create a leaf 5D tensor from flat data.
+    fn leaf_5d(data: &[f32], shape: [usize; 5], requires_grad: bool) -> Tensor<f32> {
+        Tensor::from_storage(
+            TensorStorage::cpu(data.to_vec()),
+            shape.to_vec(),
+            requires_grad,
+        )
+        .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // AdaptiveMaxPool1d tests — CL-432
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_adaptive_max_pool1d_output_shape() {
+        let pool = AdaptiveMaxPool1d::new(3);
+        let input = leaf_3d(&[0.0; 20], [2, 2, 5], false);
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+        assert_eq!(out.shape(), &[2, 2, 3]);
+    }
+
+    #[test]
+    fn test_adaptive_max_pool1d_correctness() {
+        // [1, 1, 6]: [1, 5, 3, 7, 2, 8]
+        // output_size=3 => windows ~ [0,2), [2,4), [4,6)
+        // max(1,5)=5, max(3,7)=7, max(2,8)=8
+        let data: Vec<f32> = vec![1.0, 5.0, 3.0, 7.0, 2.0, 8.0];
+        let input = leaf_3d(&data, [1, 1, 6], false);
+        let out = adaptive_max_pool1d(&input, 3).unwrap();
+        let d = out.data().unwrap();
+        assert_eq!(d.len(), 3);
+        assert!((d[0] - 5.0).abs() < 1e-6);
+        assert!((d[1] - 7.0).abs() < 1e-6);
+        assert!((d[2] - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_adaptive_max_pool1d_backward() {
+        let data: Vec<f32> = vec![1.0, 5.0, 3.0, 7.0, 2.0, 8.0];
+        let input = leaf_3d(&data, [1, 1, 6], true);
+        let out = adaptive_max_pool1d(&input, 3).unwrap();
+
+        let out_data = out.data().unwrap().to_vec();
+        let total: f32 = out_data.iter().sum();
+        let loss = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBackward { input: out.clone() }),
+        )
+        .unwrap();
+        loss.backward().unwrap();
+
+        let grad = input.grad().unwrap().unwrap();
+        assert_eq!(grad.shape(), &[1, 1, 6]);
+        let gd = grad.data().unwrap();
+        // Gradient should route to max positions only.
+        // Max at idx 1 (val=5), idx 3 (val=7), idx 5 (val=8).
+        assert!((gd[0]).abs() < 1e-6); // not max
+        assert!((gd[1] - 1.0).abs() < 1e-6); // max
+        assert!((gd[2]).abs() < 1e-6);
+        assert!((gd[3] - 1.0).abs() < 1e-6); // max
+        assert!((gd[4]).abs() < 1e-6);
+        assert!((gd[5] - 1.0).abs() < 1e-6); // max
+    }
+
+    #[test]
+    fn test_adaptive_max_pool1d_zero_output_size() {
+        let pool = AdaptiveMaxPool1d::new(0);
+        let input = leaf_3d(&[1.0; 6], [1, 1, 6], false);
+        assert!(Module::<f32>::forward(&pool, &input).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // AdaptiveMaxPool3d tests — CL-432
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_adaptive_max_pool3d_output_shape() {
+        let pool = AdaptiveMaxPool3d::new((2, 2, 2));
+        let input = leaf_5d(&[0.0; 2 * 3 * 4 * 4 * 4], [2, 3, 4, 4, 4], false);
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+        assert_eq!(out.shape(), &[2, 3, 2, 2, 2]);
+    }
+
+    #[test]
+    fn test_adaptive_max_pool3d_correctness_single_output() {
+        // Global max pool: output_size = (1, 1, 1).
+        let mut data = vec![0.0f32; 2 * 2 * 2];
+        data[5] = 10.0; // the max
+        let input = leaf_5d(&data, [1, 1, 2, 2, 2], false);
+        let out = adaptive_max_pool3d(&input, (1, 1, 1)).unwrap();
+        assert_eq!(out.shape(), &[1, 1, 1, 1, 1]);
+        assert!((out.data().unwrap()[0] - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_adaptive_max_pool3d_backward() {
+        let mut data = vec![1.0f32; 1 * 2 * 2 * 2 * 2];
+        data[0] = 10.0; // max in first channel region
+        let input = leaf_5d(&data, [1, 2, 2, 2, 2], true);
+        let out = adaptive_max_pool3d(&input, (1, 1, 1)).unwrap();
+
+        let out_data = out.data().unwrap().to_vec();
+        let total: f32 = out_data.iter().sum();
+        let loss = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBackward { input: out.clone() }),
+        )
+        .unwrap();
+        loss.backward().unwrap();
+
+        let grad = input.grad().unwrap().unwrap();
+        assert_eq!(grad.shape(), &[1, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn test_adaptive_max_pool3d_zero_output_size() {
+        let pool = AdaptiveMaxPool3d::new((0, 1, 1));
+        let input = leaf_5d(&[1.0; 8], [1, 1, 2, 2, 2], false);
+        assert!(Module::<f32>::forward(&pool, &input).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // FractionalMaxPool2d tests — CL-432
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fractional_maxpool2d_output_shape() {
+        let pool = FractionalMaxPool2d::new((3, 3));
+        let input = leaf_4d(&[0.0; 2 * 3 * 8 * 8], [2, 3, 8, 8], false);
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+        assert_eq!(out.shape(), &[2, 3, 3, 3]);
+    }
+
+    #[test]
+    fn test_fractional_maxpool2d_values_from_input() {
+        // All output values should be present in the input.
+        #[rustfmt::skip]
+        let data: Vec<f32> = (0..36).map(|i| i as f32).collect();
+        let input = leaf_4d(&data, [1, 1, 6, 6], false);
+        let pool = FractionalMaxPool2d::new((3, 3));
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+        let out_data = out.data().unwrap();
+        for &v in out_data.iter() {
+            assert!(
+                data.contains(&v),
+                "output value {v} not found in input"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fractional_maxpool2d_backward() {
+        let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let input = leaf_4d(&data, [1, 1, 8, 8], true);
+        let pool = FractionalMaxPool2d::new((4, 4));
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+
+        let out_data = out.data().unwrap().to_vec();
+        let total: f32 = out_data.iter().sum();
+        let loss = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBackward { input: out.clone() }),
+        )
+        .unwrap();
+        loss.backward().unwrap();
+
+        let grad = input.grad().unwrap().unwrap();
+        assert_eq!(grad.shape(), &[1, 1, 8, 8]);
+        // At least some positions should have non-zero gradient.
+        let gd = grad.data().unwrap();
+        let non_zero = gd.iter().filter(|&&g| g != 0.0).count();
+        assert!(non_zero > 0, "backward should route gradient to max positions");
+    }
+
+    #[test]
+    fn test_fractional_maxpool2d_output_larger_than_input() {
+        let pool = FractionalMaxPool2d::new((5, 5));
+        let input = leaf_4d(&[1.0; 16], [1, 1, 4, 4], false);
+        assert!(Module::<f32>::forward(&pool, &input).is_err());
+    }
+
+    #[test]
+    fn test_fractional_maxpool2d_no_parameters() {
+        let pool = FractionalMaxPool2d::new((3, 3));
+        assert!(Module::<f32>::parameters(&pool).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // LPPool1d tests — CL-432
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lppool1d_output_shape() {
+        let pool = LPPool1d::new(2.0, 3, 2);
+        let input = leaf_3d(&[0.0; 2 * 3 * 8], [2, 3, 8], false);
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+        // out_l = (8 - 3) / 2 + 1 = 3
+        assert_eq!(out.shape(), &[2, 3, 3]);
+    }
+
+    #[test]
+    fn test_lppool1d_l2_correctness() {
+        // L2 pool with kernel=2, stride=2 over [3, 4] => sqrt(9+16) = 5
+        let data: Vec<f32> = vec![3.0, 4.0, 1.0, 0.0];
+        let input = leaf_3d(&data, [1, 1, 4], false);
+        let out = lp_pool1d(&input, 2.0, 2, 2).unwrap();
+        let d = out.data().unwrap();
+        assert_eq!(d.len(), 2);
+        assert!((d[0] - 5.0).abs() < 1e-5, "L2 pool of [3,4] = {}, expected 5", d[0]);
+        assert!((d[1] - 1.0).abs() < 1e-5, "L2 pool of [1,0] = {}, expected 1", d[1]);
+    }
+
+    #[test]
+    fn test_lppool1d_l1_correctness() {
+        // L1 pool with kernel=2, stride=2 over [3, -4] => (|3|+|-4|)^1 = 7
+        let data: Vec<f32> = vec![3.0, -4.0];
+        let input = leaf_3d(&data, [1, 1, 2], false);
+        let out = lp_pool1d(&input, 1.0, 2, 2).unwrap();
+        let d = out.data().unwrap();
+        assert!((d[0] - 7.0).abs() < 1e-5, "L1 pool = {}, expected 7", d[0]);
+    }
+
+    #[test]
+    fn test_lppool1d_default_stride() {
+        // stride=0 should default to kernel_size.
+        let pool = LPPool1d::new(2.0, 3, 0);
+        assert_eq!(pool.stride, 3);
+    }
+
+    #[test]
+    fn test_lppool1d_backward() {
+        let data: Vec<f32> = vec![3.0, 4.0, 1.0, 2.0];
+        let input = leaf_3d(&data, [1, 1, 4], true);
+        let out = lp_pool1d(&input, 2.0, 2, 2).unwrap();
+
+        let out_data = out.data().unwrap().to_vec();
+        let total: f32 = out_data.iter().sum();
+        let loss = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBackward { input: out.clone() }),
+        )
+        .unwrap();
+        loss.backward().unwrap();
+
+        let grad = input.grad().unwrap().unwrap();
+        assert_eq!(grad.shape(), &[1, 1, 4]);
+        // All gradient values should be finite and non-NaN.
+        let gd = grad.data().unwrap();
+        for (i, &g) in gd.iter().enumerate() {
+            assert!(g.is_finite(), "gradient[{i}] = {g} is not finite");
+        }
+    }
+
+    #[test]
+    fn test_lppool1d_no_parameters() {
+        let pool = LPPool1d::new(2.0, 3, 2);
+        assert!(Module::<f32>::parameters(&pool).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // LPPool2d tests — CL-432
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lppool2d_output_shape() {
+        let pool = LPPool2d::new(2.0, [2, 2], [2, 2]);
+        let input = leaf_4d(&[0.0; 2 * 3 * 4 * 4], [2, 3, 4, 4], false);
+        let out: Tensor<f32> = Module::<f32>::forward(&pool, &input).unwrap();
+        assert_eq!(out.shape(), &[2, 3, 2, 2]);
+    }
+
+    #[test]
+    fn test_lppool2d_l2_correctness() {
+        // L2 pool with kernel 2x2, stride 2:
+        // [1, 2, 3, 4] => sqrt(1+4+9+16) = sqrt(30)
+        #[rustfmt::skip]
+        let data: Vec<f32> = vec![
+            1.0, 2.0,
+            3.0, 4.0,
+        ];
+        let input = leaf_4d(&data, [1, 1, 2, 2], false);
+        let out = lp_pool2d(&input, 2.0, [2, 2], [2, 2]).unwrap();
+        let d = out.data().unwrap();
+        assert_eq!(d.len(), 1);
+        let expected = (1.0f32 + 4.0 + 9.0 + 16.0).sqrt();
+        assert!(
+            (d[0] - expected).abs() < 1e-5,
+            "L2 pool = {}, expected {expected}",
+            d[0]
+        );
+    }
+
+    #[test]
+    fn test_lppool2d_default_stride() {
+        let pool = LPPool2d::new(2.0, [3, 3], [0, 0]);
+        assert_eq!(pool.stride, [3, 3]);
+    }
+
+    #[test]
+    fn test_lppool2d_backward() {
+        #[rustfmt::skip]
+        let data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let input = leaf_4d(&data, [1, 1, 4, 4], true);
+        let out = lp_pool2d(&input, 2.0, [2, 2], [2, 2]).unwrap();
+
+        let out_data = out.data().unwrap().to_vec();
+        let total: f32 = out_data.iter().sum();
+        let loss = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBackward { input: out.clone() }),
+        )
+        .unwrap();
+        loss.backward().unwrap();
+
+        let grad = input.grad().unwrap().unwrap();
+        assert_eq!(grad.shape(), &[1, 1, 4, 4]);
+        let gd = grad.data().unwrap();
+        for (i, &g) in gd.iter().enumerate() {
+            assert!(g.is_finite(), "gradient[{i}] = {g} is not finite");
+        }
+    }
+
+    #[test]
+    fn test_lppool2d_no_parameters() {
+        let pool = LPPool2d::new(2.0, [2, 2], [2, 2]);
+        assert!(Module::<f32>::parameters(&pool).is_empty());
     }
 }

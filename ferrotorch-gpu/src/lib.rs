@@ -27,6 +27,7 @@ pub mod backend_impl;
 pub mod blas;
 pub mod buffer;
 pub mod conv;
+pub mod cusolver;
 pub mod device;
 pub mod error;
 pub mod flash_attention;

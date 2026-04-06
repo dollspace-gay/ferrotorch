@@ -1129,6 +1129,520 @@ impl<T: Float> Module<T> for TransformerDecoderLayer<T> {
 }
 
 // ===========================================================================
+// TransformerEncoder
+// ===========================================================================
+
+/// A stack of N [`TransformerEncoderLayer`] modules with an optional final
+/// layer normalization.
+///
+/// This mirrors `torch.nn.TransformerEncoder`: it iterates the input through
+/// `num_layers` identical (but independently parameterized) encoder layers,
+/// then optionally applies a final `LayerNorm`.
+///
+/// # Shape contract
+///
+/// - Input: `[batch, seq_len, d_model]`
+/// - Output: `[batch, seq_len, d_model]`
+#[derive(Debug)]
+pub struct TransformerEncoder<T: Float> {
+    layers: Vec<TransformerEncoderLayer<T>>,
+    norm: Option<LayerNorm<T>>,
+    training: bool,
+}
+
+impl<T: Float> TransformerEncoder<T> {
+    /// Create a new transformer encoder.
+    ///
+    /// Each layer is constructed fresh with the same hyperparameters (not
+    /// cloned), so they have independent initial weights.
+    ///
+    /// # Arguments
+    ///
+    /// - `d_model` - The model dimension (embedding size).
+    /// - `num_heads` - Number of attention heads.
+    /// - `num_layers` - Number of encoder layers to stack.
+    /// - `d_ff` - Hidden dimension of the SwiGLU feedforward network.
+    /// - `dropout_p` - Dropout probability.
+    /// - `layer_norm_eps` - Epsilon for layer normalization.
+    /// - `bias` - Whether to use bias in attention and FFN projections.
+    /// - `final_norm` - Whether to add a final `LayerNorm` after the last layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        d_model: usize,
+        num_heads: usize,
+        num_layers: usize,
+        d_ff: usize,
+        dropout_p: f64,
+        layer_norm_eps: f64,
+        bias: bool,
+        final_norm: bool,
+    ) -> FerrotorchResult<Self> {
+        if num_layers == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "TransformerEncoder: num_layers must be > 0".into(),
+            });
+        }
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(TransformerEncoderLayer::new(
+                d_model,
+                num_heads,
+                d_ff,
+                dropout_p,
+                layer_norm_eps,
+                bias,
+            )?);
+        }
+
+        let norm = if final_norm {
+            Some(LayerNorm::new(vec![d_model], layer_norm_eps, true)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            layers,
+            norm,
+            training: true,
+        })
+    }
+
+    /// The number of stacked encoder layers.
+    #[inline]
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+impl<T: Float> Module<T> for TransformerEncoder<T> {
+    /// Forward pass: iterate through all encoder layers, then apply final norm.
+    ///
+    /// Input shape: `[batch, seq_len, d_model]`.
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let mut output = input.clone();
+        for layer in &self.layers {
+            output = layer.forward(&output)?;
+        }
+        if let Some(ref norm) = self.norm {
+            output = norm.forward(&output)?;
+        }
+        Ok(output)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        let mut params = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let _ = i; // layer index not needed for unnamed params
+            params.extend(layer.parameters());
+        }
+        if let Some(ref norm) = self.norm {
+            params.extend(norm.parameters());
+        }
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        let mut params = Vec::new();
+        for layer in &mut self.layers {
+            params.extend(layer.parameters_mut());
+        }
+        if let Some(ref mut norm) = self.norm {
+            params.extend(norm.parameters_mut());
+        }
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        let mut params = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            for (name, param) in layer.named_parameters() {
+                params.push((format!("layers.{i}.{name}"), param));
+            }
+        }
+        if let Some(ref norm) = self.norm {
+            for (name, param) in norm.named_parameters() {
+                params.push((format!("norm.{name}"), param));
+            }
+        }
+        params
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+        for layer in &mut self.layers {
+            layer.train();
+        }
+        if let Some(ref mut norm) = self.norm {
+            norm.train();
+        }
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+        for layer in &mut self.layers {
+            layer.eval();
+        }
+        if let Some(ref mut norm) = self.norm {
+            norm.eval();
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ===========================================================================
+// TransformerDecoder
+// ===========================================================================
+
+/// A stack of N [`TransformerDecoderLayer`] modules with an optional final
+/// layer normalization.
+///
+/// This mirrors `torch.nn.TransformerDecoder`: it iterates the target input
+/// through `num_layers` identical (but independently parameterized) decoder
+/// layers, each attending to the encoder `memory`, then optionally applies a
+/// final `LayerNorm`.
+///
+/// # Shape contract
+///
+/// - `input` (decoder): `[batch, tgt_seq, d_model]`
+/// - `memory` (encoder output): `[batch, src_seq, d_model]`
+/// - Output: `[batch, tgt_seq, d_model]`
+#[derive(Debug)]
+pub struct TransformerDecoder<T: Float> {
+    layers: Vec<TransformerDecoderLayer<T>>,
+    norm: Option<LayerNorm<T>>,
+    training: bool,
+}
+
+impl<T: Float> TransformerDecoder<T> {
+    /// Create a new transformer decoder.
+    ///
+    /// Each layer is constructed fresh with the same hyperparameters (not
+    /// cloned), so they have independent initial weights.
+    ///
+    /// # Arguments
+    ///
+    /// - `d_model` - The model dimension (embedding size).
+    /// - `num_heads` - Number of attention heads.
+    /// - `num_layers` - Number of decoder layers to stack.
+    /// - `d_ff` - Hidden dimension of the SwiGLU feedforward network.
+    /// - `dropout_p` - Dropout probability.
+    /// - `layer_norm_eps` - Epsilon for layer normalization.
+    /// - `bias` - Whether to use bias in attention and FFN projections.
+    /// - `final_norm` - Whether to add a final `LayerNorm` after the last layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        d_model: usize,
+        num_heads: usize,
+        num_layers: usize,
+        d_ff: usize,
+        dropout_p: f64,
+        layer_norm_eps: f64,
+        bias: bool,
+        final_norm: bool,
+    ) -> FerrotorchResult<Self> {
+        if num_layers == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "TransformerDecoder: num_layers must be > 0".into(),
+            });
+        }
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(TransformerDecoderLayer::new(
+                d_model,
+                num_heads,
+                d_ff,
+                dropout_p,
+                layer_norm_eps,
+                bias,
+            )?);
+        }
+
+        let norm = if final_norm {
+            Some(LayerNorm::new(vec![d_model], layer_norm_eps, true)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            layers,
+            norm,
+            training: true,
+        })
+    }
+
+    /// Forward pass with encoder memory.
+    ///
+    /// # Arguments
+    ///
+    /// - `input` - Decoder input: `[batch, tgt_seq, d_model]`.
+    /// - `memory` - Encoder output: `[batch, src_seq, d_model]`.
+    ///
+    /// # Returns
+    ///
+    /// Output tensor of shape `[batch, tgt_seq, d_model]`.
+    pub fn forward_with_memory(
+        &self,
+        input: &Tensor<T>,
+        memory: &Tensor<T>,
+    ) -> FerrotorchResult<Tensor<T>> {
+        let mut output = input.clone();
+        for layer in &self.layers {
+            output = layer.forward_with_memory(&output, memory)?;
+        }
+        if let Some(ref norm) = self.norm {
+            output = norm.forward(&output)?;
+        }
+        Ok(output)
+    }
+
+    /// The number of stacked decoder layers.
+    #[inline]
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+impl<T: Float> Module<T> for TransformerDecoder<T> {
+    /// Forward pass using `input` as both decoder input and memory.
+    ///
+    /// For the typical decoder use case with separate encoder output, call
+    /// [`forward_with_memory`](Self::forward_with_memory) directly.
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        self.forward_with_memory(input, input)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        let mut params = Vec::new();
+        for layer in &self.layers {
+            params.extend(layer.parameters());
+        }
+        if let Some(ref norm) = self.norm {
+            params.extend(norm.parameters());
+        }
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        let mut params = Vec::new();
+        for layer in &mut self.layers {
+            params.extend(layer.parameters_mut());
+        }
+        if let Some(ref mut norm) = self.norm {
+            params.extend(norm.parameters_mut());
+        }
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        let mut params = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            for (name, param) in layer.named_parameters() {
+                params.push((format!("layers.{i}.{name}"), param));
+            }
+        }
+        if let Some(ref norm) = self.norm {
+            for (name, param) in norm.named_parameters() {
+                params.push((format!("norm.{name}"), param));
+            }
+        }
+        params
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+        for layer in &mut self.layers {
+            layer.train();
+        }
+        if let Some(ref mut norm) = self.norm {
+            norm.train();
+        }
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+        for layer in &mut self.layers {
+            layer.eval();
+        }
+        if let Some(ref mut norm) = self.norm {
+            norm.eval();
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ===========================================================================
+// Transformer
+// ===========================================================================
+
+/// Full encoder-decoder transformer model.
+///
+/// Combines a [`TransformerEncoder`] and [`TransformerDecoder`] into a single
+/// module, matching `torch.nn.Transformer`.
+///
+/// # Shape contract
+///
+/// - `src` (encoder input): `[batch, src_seq, d_model]`
+/// - `tgt` (decoder input): `[batch, tgt_seq, d_model]`
+/// - Output: `[batch, tgt_seq, d_model]`
+///
+/// # Example
+///
+/// ```ignore
+/// let transformer = Transformer::<f32>::new(64, 4, 3, 3, 128, 0.1, 1e-5, true)?;
+/// let src = ferrotorch_core::randn::<f32>(&[2, 10, 64])?;
+/// let tgt = ferrotorch_core::randn::<f32>(&[2, 5, 64])?;
+/// let output = transformer.forward_transformer(&src, &tgt)?;
+/// assert_eq!(output.shape(), &[2, 5, 64]);
+/// ```
+#[derive(Debug)]
+pub struct Transformer<T: Float> {
+    encoder: TransformerEncoder<T>,
+    decoder: TransformerDecoder<T>,
+    training: bool,
+}
+
+impl<T: Float> Transformer<T> {
+    /// Create a new full encoder-decoder transformer.
+    ///
+    /// # Arguments
+    ///
+    /// - `d_model` - The model dimension (embedding size).
+    /// - `num_heads` - Number of attention heads.
+    /// - `num_encoder_layers` - Number of encoder layers (default: 6).
+    /// - `num_decoder_layers` - Number of decoder layers (default: 6).
+    /// - `d_ff` - Hidden dimension of the SwiGLU feedforward network (default: 2048).
+    /// - `dropout_p` - Dropout probability (default: 0.1).
+    /// - `layer_norm_eps` - Epsilon for layer normalization.
+    /// - `bias` - Whether to use bias in attention and FFN projections.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        d_model: usize,
+        num_heads: usize,
+        num_encoder_layers: usize,
+        num_decoder_layers: usize,
+        d_ff: usize,
+        dropout_p: f64,
+        layer_norm_eps: f64,
+        bias: bool,
+    ) -> FerrotorchResult<Self> {
+        let encoder = TransformerEncoder::new(
+            d_model,
+            num_heads,
+            num_encoder_layers,
+            d_ff,
+            dropout_p,
+            layer_norm_eps,
+            bias,
+            true, // final norm on encoder
+        )?;
+        let decoder = TransformerDecoder::new(
+            d_model,
+            num_heads,
+            num_decoder_layers,
+            d_ff,
+            dropout_p,
+            layer_norm_eps,
+            bias,
+            true, // final norm on decoder
+        )?;
+
+        Ok(Self {
+            encoder,
+            decoder,
+            training: true,
+        })
+    }
+
+    /// Forward pass: encode `src`, then decode `tgt` using the encoded memory.
+    ///
+    /// # Arguments
+    ///
+    /// - `src` - Encoder input: `[batch, src_seq, d_model]`.
+    /// - `tgt` - Decoder input: `[batch, tgt_seq, d_model]`.
+    ///
+    /// # Returns
+    ///
+    /// Output tensor of shape `[batch, tgt_seq, d_model]`.
+    pub fn forward_transformer(
+        &self,
+        src: &Tensor<T>,
+        tgt: &Tensor<T>,
+    ) -> FerrotorchResult<Tensor<T>> {
+        let memory = self.encoder.forward(src)?;
+        self.decoder.forward_with_memory(tgt, &memory)
+    }
+
+    /// The number of encoder layers.
+    #[inline]
+    pub fn num_encoder_layers(&self) -> usize {
+        self.encoder.num_layers()
+    }
+
+    /// The number of decoder layers.
+    #[inline]
+    pub fn num_decoder_layers(&self) -> usize {
+        self.decoder.num_layers()
+    }
+}
+
+impl<T: Float> Module<T> for Transformer<T> {
+    /// Forward pass using `input` as both source and target.
+    ///
+    /// For the typical encoder-decoder use case with separate src/tgt, call
+    /// [`forward_transformer`](Self::forward_transformer) directly.
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        self.forward_transformer(input, input)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        let mut params = self.encoder.parameters();
+        params.extend(self.decoder.parameters());
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        let mut params = self.encoder.parameters_mut();
+        params.extend(self.decoder.parameters_mut());
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        let mut params = Vec::new();
+        for (name, param) in self.encoder.named_parameters() {
+            params.push((format!("encoder.{name}"), param));
+        }
+        for (name, param) in self.decoder.named_parameters() {
+            params.push((format!("decoder.{name}"), param));
+        }
+        params
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+        self.encoder.train();
+        self.decoder.train();
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+        self.encoder.eval();
+        self.decoder.eval();
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1701,5 +2215,247 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TransformerDecoderLayer<f32>>();
         assert_send_sync::<TransformerDecoderLayer<f64>>();
+    }
+
+    // -----------------------------------------------------------------------
+    // TransformerEncoder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encoder_construction() {
+        let enc = TransformerEncoder::<f32>::new(16, 4, 3, 32, 0.0, 1e-5, true, true);
+        assert!(enc.is_ok());
+        assert_eq!(enc.unwrap().num_layers(), 3);
+    }
+
+    #[test]
+    fn test_encoder_zero_layers_rejected() {
+        assert!(TransformerEncoder::<f32>::new(16, 4, 0, 32, 0.0, 1e-5, true, true).is_err());
+    }
+
+    #[test]
+    fn test_encoder_forward_shape() {
+        let enc = TransformerEncoder::<f32>::new(16, 4, 2, 32, 0.0, 1e-5, false, true).unwrap();
+        let input = ferrotorch_core::zeros::<f32>(&[2, 5, 16]).unwrap();
+        let output = enc.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[2, 5, 16]);
+    }
+
+    #[test]
+    fn test_encoder_forward_no_final_norm() {
+        let enc = TransformerEncoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, false, false).unwrap();
+        let input = ferrotorch_core::zeros::<f32>(&[1, 3, 8]).unwrap();
+        let output = enc.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 3, 8]);
+    }
+
+    #[test]
+    fn test_encoder_forward_values_finite() {
+        let enc = TransformerEncoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, true, true).unwrap();
+        let input = ferrotorch_core::ones::<f32>(&[1, 3, 8]).unwrap();
+        let output = enc.forward(&input).unwrap();
+        for &v in output.data().unwrap() {
+            assert!(
+                v.is_finite(),
+                "TransformerEncoder produced non-finite value: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encoder_parameters_with_final_norm() {
+        let enc = TransformerEncoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, true, true).unwrap();
+        // Each encoder layer: 18 params (see test_encoder_layer_parameters_count)
+        // Final norm: 2 params (weight + bias)
+        // Total: 2 * 18 + 2 = 38
+        assert_eq!(enc.parameters().len(), 38);
+    }
+
+    #[test]
+    fn test_encoder_named_parameters_have_layer_prefix() {
+        let enc = TransformerEncoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, true, true).unwrap();
+        let named = enc.named_parameters();
+        // Verify layer indexing in names.
+        let has_layer_0 = named.iter().any(|(n, _)| n.starts_with("layers.0."));
+        let has_layer_1 = named.iter().any(|(n, _)| n.starts_with("layers.1."));
+        let has_norm = named.iter().any(|(n, _)| n.starts_with("norm."));
+        assert!(has_layer_0, "missing layers.0.* in named_parameters");
+        assert!(has_layer_1, "missing layers.1.* in named_parameters");
+        assert!(has_norm, "missing norm.* in named_parameters");
+    }
+
+    #[test]
+    fn test_encoder_train_eval() {
+        let mut enc = TransformerEncoder::<f32>::new(8, 2, 2, 16, 0.1, 1e-5, false, false).unwrap();
+        assert!(enc.is_training());
+        enc.eval();
+        assert!(!enc.is_training());
+        enc.train();
+        assert!(enc.is_training());
+    }
+
+    #[test]
+    fn test_encoder_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TransformerEncoder<f32>>();
+        assert_send_sync::<TransformerEncoder<f64>>();
+    }
+
+    // -----------------------------------------------------------------------
+    // TransformerDecoder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decoder_construction() {
+        let dec = TransformerDecoder::<f32>::new(16, 4, 3, 32, 0.0, 1e-5, true, true);
+        assert!(dec.is_ok());
+        assert_eq!(dec.unwrap().num_layers(), 3);
+    }
+
+    #[test]
+    fn test_decoder_zero_layers_rejected() {
+        assert!(TransformerDecoder::<f32>::new(16, 4, 0, 32, 0.0, 1e-5, true, true).is_err());
+    }
+
+    #[test]
+    fn test_decoder_forward_with_memory_shape() {
+        let dec = TransformerDecoder::<f32>::new(16, 4, 2, 32, 0.0, 1e-5, false, true).unwrap();
+        let tgt = ferrotorch_core::zeros::<f32>(&[2, 4, 16]).unwrap();
+        let memory = ferrotorch_core::zeros::<f32>(&[2, 6, 16]).unwrap();
+        let output = dec.forward_with_memory(&tgt, &memory).unwrap();
+        assert_eq!(output.shape(), &[2, 4, 16]);
+    }
+
+    #[test]
+    fn test_decoder_forward_values_finite() {
+        let dec = TransformerDecoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, true, true).unwrap();
+        let tgt = ferrotorch_core::ones::<f32>(&[1, 3, 8]).unwrap();
+        let mem = ferrotorch_core::ones::<f32>(&[1, 5, 8]).unwrap();
+        let output = dec.forward_with_memory(&tgt, &mem).unwrap();
+        for &v in output.data().unwrap() {
+            assert!(
+                v.is_finite(),
+                "TransformerDecoder produced non-finite value: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decoder_parameters_with_final_norm() {
+        let dec = TransformerDecoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, true, true).unwrap();
+        // Each decoder layer: 28 params (see test_decoder_layer_parameters_count)
+        // Final norm: 2 params (weight + bias)
+        // Total: 2 * 28 + 2 = 58
+        assert_eq!(dec.parameters().len(), 58);
+    }
+
+    #[test]
+    fn test_decoder_named_parameters_have_layer_prefix() {
+        let dec = TransformerDecoder::<f32>::new(8, 2, 2, 16, 0.0, 1e-5, true, true).unwrap();
+        let named = dec.named_parameters();
+        let has_layer_0 = named.iter().any(|(n, _)| n.starts_with("layers.0."));
+        let has_layer_1 = named.iter().any(|(n, _)| n.starts_with("layers.1."));
+        let has_norm = named.iter().any(|(n, _)| n.starts_with("norm."));
+        assert!(has_layer_0, "missing layers.0.* in named_parameters");
+        assert!(has_layer_1, "missing layers.1.* in named_parameters");
+        assert!(has_norm, "missing norm.* in named_parameters");
+    }
+
+    #[test]
+    fn test_decoder_train_eval() {
+        let mut dec = TransformerDecoder::<f32>::new(8, 2, 2, 16, 0.1, 1e-5, false, false).unwrap();
+        assert!(dec.is_training());
+        dec.eval();
+        assert!(!dec.is_training());
+        dec.train();
+        assert!(dec.is_training());
+    }
+
+    #[test]
+    fn test_decoder_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TransformerDecoder<f32>>();
+        assert_send_sync::<TransformerDecoder<f64>>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Transformer (full encoder-decoder)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_transformer_construction() {
+        let t = Transformer::<f32>::new(16, 4, 2, 2, 32, 0.0, 1e-5, true);
+        assert!(t.is_ok());
+        let t = t.unwrap();
+        assert_eq!(t.num_encoder_layers(), 2);
+        assert_eq!(t.num_decoder_layers(), 2);
+    }
+
+    #[test]
+    fn test_transformer_forward_shape() {
+        let t = Transformer::<f32>::new(16, 4, 2, 2, 32, 0.0, 1e-5, false).unwrap();
+        let src = ferrotorch_core::zeros::<f32>(&[2, 10, 16]).unwrap();
+        let tgt = ferrotorch_core::zeros::<f32>(&[2, 5, 16]).unwrap();
+        let output = t.forward_transformer(&src, &tgt).unwrap();
+        assert_eq!(output.shape(), &[2, 5, 16]);
+    }
+
+    #[test]
+    fn test_transformer_self_forward_shape() {
+        // Module::forward uses input as both src and tgt.
+        let t = Transformer::<f32>::new(8, 2, 1, 1, 16, 0.0, 1e-5, false).unwrap();
+        let input = ferrotorch_core::zeros::<f32>(&[1, 3, 8]).unwrap();
+        let output = t.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 3, 8]);
+    }
+
+    #[test]
+    fn test_transformer_forward_values_finite() {
+        let t = Transformer::<f32>::new(8, 2, 2, 2, 16, 0.0, 1e-5, true).unwrap();
+        let src = ferrotorch_core::ones::<f32>(&[1, 4, 8]).unwrap();
+        let tgt = ferrotorch_core::ones::<f32>(&[1, 3, 8]).unwrap();
+        let output = t.forward_transformer(&src, &tgt).unwrap();
+        for &v in output.data().unwrap() {
+            assert!(
+                v.is_finite(),
+                "Transformer produced non-finite value: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transformer_parameters_count() {
+        let t = Transformer::<f32>::new(8, 2, 2, 2, 16, 0.0, 1e-5, true).unwrap();
+        // Encoder: 2 layers * 18 params + 2 (final norm) = 38
+        // Decoder: 2 layers * 28 params + 2 (final norm) = 58
+        // Total: 96
+        assert_eq!(t.parameters().len(), 96);
+    }
+
+    #[test]
+    fn test_transformer_named_parameters_prefixed() {
+        let t = Transformer::<f32>::new(8, 2, 1, 1, 16, 0.0, 1e-5, true).unwrap();
+        let named = t.named_parameters();
+        let has_encoder = named.iter().any(|(n, _)| n.starts_with("encoder."));
+        let has_decoder = named.iter().any(|(n, _)| n.starts_with("decoder."));
+        assert!(has_encoder, "missing encoder.* in named_parameters");
+        assert!(has_decoder, "missing decoder.* in named_parameters");
+    }
+
+    #[test]
+    fn test_transformer_train_eval() {
+        let mut t = Transformer::<f32>::new(8, 2, 1, 1, 16, 0.1, 1e-5, false).unwrap();
+        assert!(t.is_training());
+        t.eval();
+        assert!(!t.is_training());
+        t.train();
+        assert!(t.is_training());
+    }
+
+    #[test]
+    fn test_transformer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Transformer<f32>>();
+        assert_send_sync::<Transformer<f64>>();
     }
 }

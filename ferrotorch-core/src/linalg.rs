@@ -88,6 +88,11 @@ fn is_f32<T: Float>() -> bool {
     std::mem::size_of::<T>() == 4
 }
 
+/// True when `T` is f64 (8-byte float).
+fn is_f64<T: Float>() -> bool {
+    std::mem::size_of::<T>() == 8
+}
+
 /// Guard: linalg decompositions are CPU-only. Return an explicit error for
 /// GPU tensors instead of silently downloading data to host.
 fn require_cpu<T: Float>(t: &Tensor<T>, op: &str) -> FerrotorchResult<()> {
@@ -136,7 +141,7 @@ pub fn svd<T: Float>(input: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Tensor<T
             Tensor::from_storage(TensorStorage::cpu(s_data), s_shape, false)?,
             Tensor::from_storage(TensorStorage::cpu(vh_data), vh_shape, false)?,
         ))
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_array2_f64(input)?;
         let (u, s, vh) = ferray_linalg::svd(&arr, false).map_err(FerrotorchError::Ferray)?;
         let u_data = slice_to_vec::<T>(u.as_slice().unwrap());
@@ -150,6 +155,8 @@ pub fn svd<T: Float>(input: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Tensor<T
             Tensor::from_storage(TensorStorage::cpu(s_data), s_shape, false)?,
             Tensor::from_storage(TensorStorage::cpu(vh_data), vh_shape, false)?,
         ))
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -189,13 +196,15 @@ pub fn solve<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<
         let x_data = slice_f32_to_vec::<T>(x.as_slice().unwrap());
         let x_shape = x.shape().to_vec();
         Tensor::from_storage(TensorStorage::cpu(x_data), x_shape, false)
-    } else {
+    } else if is_f64::<T>() {
         let a_arr = tensor_to_array2_f64(a)?;
         let b_arr = tensor_to_arraydyn_f64(b)?;
         let x = ferray_linalg::solve(&a_arr, &b_arr).map_err(FerrotorchError::Ferray)?;
         let x_data = slice_to_vec::<T>(x.as_slice().unwrap());
         let x_shape = x.shape().to_vec();
         Tensor::from_storage(TensorStorage::cpu(x_data), x_shape, false)
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -223,11 +232,13 @@ pub fn det<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let d: f32 = ferray_linalg::det(&arr).map_err(FerrotorchError::Ferray)?;
         let val = T::from(d).unwrap();
         Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], false)
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_array2_f64(input)?;
         let d: f64 = ferray_linalg::det(&arr).map_err(FerrotorchError::Ferray)?;
         let val = T::from(d).unwrap();
         Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], false)
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -255,11 +266,13 @@ pub fn inv<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let r = ferray_linalg::inv(&arr).map_err(FerrotorchError::Ferray)?;
         let data = slice_f32_to_vec::<T>(r.as_slice().unwrap());
         Tensor::from_storage(TensorStorage::cpu(data), vec![n, n], false)
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_array2_f64(input)?;
         let r = ferray_linalg::inv(&arr).map_err(FerrotorchError::Ferray)?;
         let data = slice_to_vec::<T>(r.as_slice().unwrap());
         Tensor::from_storage(TensorStorage::cpu(data), vec![n, n], false)
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -294,7 +307,7 @@ pub fn qr<T: Float>(input: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Tensor<T>
             Tensor::from_storage(TensorStorage::cpu(q_data), q_shape, false)?,
             Tensor::from_storage(TensorStorage::cpu(r_data), r_shape, false)?,
         ))
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_array2_f64(input)?;
         let (q, r) = ferray_linalg::qr(&arr, ferray_linalg::QrMode::Reduced)
             .map_err(FerrotorchError::Ferray)?;
@@ -306,6 +319,8 @@ pub fn qr<T: Float>(input: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Tensor<T>
             Tensor::from_storage(TensorStorage::cpu(q_data), q_shape, false)?,
             Tensor::from_storage(TensorStorage::cpu(r_data), r_shape, false)?,
         ))
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -335,11 +350,13 @@ pub fn cholesky<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let l = ferray_linalg::cholesky(&arr).map_err(FerrotorchError::Ferray)?;
         let data = slice_f32_to_vec::<T>(l.as_slice().unwrap());
         Tensor::from_storage(TensorStorage::cpu(data), vec![n, n], false)
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_array2_f64(input)?;
         let l = ferray_linalg::cholesky(&arr).map_err(FerrotorchError::Ferray)?;
         let data = slice_to_vec::<T>(l.as_slice().unwrap());
         Tensor::from_storage(TensorStorage::cpu(data), vec![n, n], false)
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -368,12 +385,14 @@ pub fn matrix_norm<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
             .map_err(FerrotorchError::Ferray)?;
         let val = T::from(n).unwrap();
         Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], false)
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_arraydyn_f64(input)?;
         let n: f64 = ferray_linalg::norm(&arr, ferray_linalg::NormOrder::Fro)
             .map_err(FerrotorchError::Ferray)?;
         let val = T::from(n).unwrap();
         Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], false)
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 
@@ -400,12 +419,14 @@ pub fn pinv<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let data = slice_f32_to_vec::<T>(r.as_slice().unwrap());
         let r_shape = r.shape().to_vec();
         Tensor::from_storage(TensorStorage::cpu(data), r_shape, false)
-    } else {
+    } else if is_f64::<T>() {
         let arr = tensor_to_array2_f64(input)?;
         let r = ferray_linalg::pinv(&arr, None).map_err(FerrotorchError::Ferray)?;
         let data = slice_to_vec::<T>(r.as_slice().unwrap());
         let r_shape = r.shape().to_vec();
         Tensor::from_storage(TensorStorage::cpu(data), r_shape, false)
+    } else {
+        Err(FerrotorchError::InvalidArgument { message: "linalg op requires f32 or f64".into() })
     }
 }
 

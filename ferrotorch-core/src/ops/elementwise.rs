@@ -238,6 +238,135 @@ pub fn fast_mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tens
     binary_map(a, b, |x, y| x * y)
 }
 
+/// SIMD-accelerated sub with rayon parallelism for large tensors.
+///
+/// Same-shape fast path uses a simple vectorizable loop that LLVM
+/// auto-vectorizes to SIMD. Falls back to `binary_map` for broadcasting.
+pub fn fast_sub<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if a.shape() == b.shape() {
+        let a_data = a.data()?;
+        let b_data = b.data()?;
+        let n = a_data.len();
+        if std::mem::size_of::<T>() == 4 {
+            let a_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f32, n) };
+            let b_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f32, n) };
+            let mut out = pool_alloc_cpu_uninit_f32(n);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        let a_s = &a_f32[offset..offset + len];
+                        let b_s = &b_f32[offset..offset + len];
+                        for i in 0..len {
+                            chunk[i] = a_s[i] - b_s[i];
+                        }
+                    });
+            } else {
+                for i in 0..n {
+                    out[i] = a_f32[i] - b_f32[i];
+                }
+            }
+            let result = unsafe { transmute_vec_f32_to_t(out) };
+            return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
+        } else if std::mem::size_of::<T>() == 8 {
+            let a_f64: &[f64] =
+                unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f64, n) };
+            let b_f64: &[f64] =
+                unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f64, n) };
+            let mut out = pool_alloc_cpu_uninit_f64(n);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        let a_s = &a_f64[offset..offset + len];
+                        let b_s = &b_f64[offset..offset + len];
+                        for i in 0..len {
+                            chunk[i] = a_s[i] - b_s[i];
+                        }
+                    });
+            } else {
+                for i in 0..n {
+                    out[i] = a_f64[i] - b_f64[i];
+                }
+            }
+            let result = unsafe { transmute_vec_f64_to_t(out) };
+            return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
+        }
+    }
+    binary_map(a, b, |x, y| x - y)
+}
+
+/// SIMD-accelerated div with rayon parallelism for large tensors.
+pub fn fast_div<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if a.shape() == b.shape() {
+        let a_data = a.data()?;
+        let b_data = b.data()?;
+        let n = a_data.len();
+        if std::mem::size_of::<T>() == 4 {
+            let a_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f32, n) };
+            let b_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f32, n) };
+            let mut out = pool_alloc_cpu_uninit_f32(n);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        let a_s = &a_f32[offset..offset + len];
+                        let b_s = &b_f32[offset..offset + len];
+                        for i in 0..len {
+                            chunk[i] = a_s[i] / b_s[i];
+                        }
+                    });
+            } else {
+                for i in 0..n {
+                    out[i] = a_f32[i] / b_f32[i];
+                }
+            }
+            let result = unsafe { transmute_vec_f32_to_t(out) };
+            return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
+        } else if std::mem::size_of::<T>() == 8 {
+            let a_f64: &[f64] =
+                unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const f64, n) };
+            let b_f64: &[f64] =
+                unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const f64, n) };
+            let mut out = pool_alloc_cpu_uninit_f64(n);
+            if n >= PARALLEL_THRESHOLD {
+                let chunk_size = (n / rayon::current_num_threads()).max(4096);
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let offset = ci * chunk_size;
+                        let len = chunk.len();
+                        let a_s = &a_f64[offset..offset + len];
+                        let b_s = &b_f64[offset..offset + len];
+                        for i in 0..len {
+                            chunk[i] = a_s[i] / b_s[i];
+                        }
+                    });
+            } else {
+                for i in 0..n {
+                    out[i] = a_f64[i] / b_f64[i];
+                }
+            }
+            let result = unsafe { transmute_vec_f64_to_t(out) };
+            return Tensor::from_storage(TensorStorage::cpu(result), a.shape().to_vec(), false);
+        }
+    }
+    binary_map(a, b, |x, y| x / y)
+}
+
 /// Vectorizable f32 exp kernel — polynomial range reduction that LLVM
 /// auto-vectorizes to vexpps (AVX2) or equivalent SIMD.
 ///
@@ -655,20 +784,14 @@ pub fn scalar_map<T: Float>(
     scalar: T,
     f: impl Fn(T, T) -> T,
 ) -> FerrotorchResult<Tensor<T>> {
-    // GPU fallback: transfer to CPU, compute, transfer back.
-    let (cpu_input, device) = if input.is_cuda() {
-        (input.cpu()?, input.device())
-    } else {
-        (input.clone(), input.device())
-    };
-    let data = cpu_input.data()?;
-    let result: Vec<T> = data.iter().map(|&x| f(x, scalar)).collect();
-    let out = Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+            op: "scalar_map",
+        });
     }
+    let data = input.data()?;
+    let result: Vec<T> = data.iter().map(|&x| f(x, scalar)).collect();
+    Tensor::from_storage(TensorStorage::cpu(result), input.shape().to_vec(), false)
 }
 
 /// Precompute per-dimension `(a_stride, b_stride, out_dim)` triples for a
@@ -782,24 +905,167 @@ pub fn sum_axis<T: Float>(input: &Tensor<T>, axis: usize) -> FerrotorchResult<Te
 
 /// Mean of all elements, returning a scalar.
 pub fn mean<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    // GPU fallback: transfer to CPU, compute, transfer back.
-    let (cpu_input, device) = if input.is_cuda() {
-        (input.cpu()?, input.device())
-    } else {
-        (input.clone(), input.device())
-    };
-    let data = cpu_input.data()?;
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+            op: "mean",
+        });
+    }
+    let data = input.data()?;
     let n = T::from(data.len()).unwrap();
     let total = data
         .iter()
         .copied()
         .fold(<T as num_traits::Zero>::zero(), |a, b| a + b);
-    let out = Tensor::from_storage(TensorStorage::cpu(vec![total / n]), vec![], false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
+    Tensor::from_storage(TensorStorage::cpu(vec![total / n]), vec![], false)
+}
+
+/// Sum of all non-NaN elements.
+///
+/// NaN values are treated as zero. Returns a scalar tensor.
+/// Matches PyTorch's `torch.nansum`.
+pub fn nansum<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda { op: "nansum" });
     }
+    let data = input.data()?;
+    let total = data
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan())
+        .fold(<T as num_traits::Zero>::zero(), |a, b| a + b);
+    Tensor::from_storage(TensorStorage::cpu(vec![total]), vec![], false)
+}
+
+/// Mean of all non-NaN elements.
+///
+/// NaN values are excluded from both the sum and the count.
+/// Returns a scalar tensor. Returns NaN if all elements are NaN.
+/// Matches PyTorch's `torch.nanmean`.
+pub fn nanmean<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda { op: "nanmean" });
+    }
+    let data = input.data()?;
+    let mut total = <T as num_traits::Zero>::zero();
+    let mut count = 0usize;
+    for &v in data.iter() {
+        if !v.is_nan() {
+            total = total + v;
+            count += 1;
+        }
+    }
+    let result = if count == 0 {
+        T::nan()
+    } else {
+        total / T::from(count).unwrap()
+    };
+    Tensor::from_storage(TensorStorage::cpu(vec![result]), vec![], false)
+}
+
+/// Log-sum-exp: `log(sum(exp(input)))`.
+///
+/// Numerically stable: subtracts the max before exponentiating.
+/// Returns a scalar tensor.
+/// Matches PyTorch's `torch.logsumexp`.
+pub fn logsumexp<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda { op: "logsumexp" });
+    }
+    let data = input.data()?;
+    if data.is_empty() {
+        return Tensor::from_storage(
+            TensorStorage::cpu(vec![T::neg_infinity()]),
+            vec![],
+            false,
+        );
+    }
+
+    // Find max for numerical stability.
+    let max_val = data
+        .iter()
+        .copied()
+        .fold(T::neg_infinity(), |a, b| if b > a { b } else { a });
+
+    if max_val.is_infinite() && max_val < <T as num_traits::Zero>::zero() {
+        // All -inf → result is -inf
+        return Tensor::from_storage(
+            TensorStorage::cpu(vec![T::neg_infinity()]),
+            vec![],
+            false,
+        );
+    }
+
+    let sum_exp = data
+        .iter()
+        .copied()
+        .fold(<T as num_traits::Zero>::zero(), |acc, v| {
+            acc + (v - max_val).exp()
+        });
+
+    let result = max_val + sum_exp.ln();
+    Tensor::from_storage(TensorStorage::cpu(vec![result]), vec![], false)
+}
+
+/// Log-sum-exp along a dimension.
+///
+/// `logsumexp_dim(input, dim, keepdim)` computes `log(sum(exp(input), dim))`.
+/// Numerically stable.
+/// Matches PyTorch's `torch.logsumexp(input, dim)`.
+pub fn logsumexp_dim<T: Float>(
+    input: &Tensor<T>,
+    dim: usize,
+    keepdim: bool,
+) -> FerrotorchResult<Tensor<T>> {
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+            op: "logsumexp_dim",
+        });
+    }
+    let shape = input.shape();
+    if dim >= shape.len() {
+        return Err(crate::error::FerrotorchError::InvalidArgument {
+            message: format!("logsumexp_dim: dim {dim} out of range for shape {shape:?}"),
+        });
+    }
+
+    let data = input.data()?;
+    let dim_size = shape[dim];
+    let outer: usize = shape[..dim].iter().product();
+    let inner: usize = shape[dim + 1..].iter().product();
+    let out_numel = outer * inner;
+
+    let mut result = Vec::with_capacity(out_numel);
+
+    for o in 0..outer {
+        for i in 0..inner {
+            // Find max along this dim slice.
+            let mut max_val = T::neg_infinity();
+            for d in 0..dim_size {
+                let idx = o * dim_size * inner + d * inner + i;
+                if data[idx] > max_val {
+                    max_val = data[idx];
+                }
+            }
+
+            // Sum exp(x - max).
+            let mut sum_exp = <T as num_traits::Zero>::zero();
+            for d in 0..dim_size {
+                let idx = o * dim_size * inner + d * inner + i;
+                sum_exp = sum_exp + (data[idx] - max_val).exp();
+            }
+
+            result.push(max_val + sum_exp.ln());
+        }
+    }
+
+    let mut out_shape = shape.to_vec();
+    if keepdim {
+        out_shape[dim] = 1;
+    } else {
+        out_shape.remove(dim);
+    }
+
+    Tensor::from_storage(TensorStorage::cpu(result), out_shape, false)
 }
 
 #[cfg(test)]
@@ -1172,5 +1438,72 @@ mod tests {
             "tanh(50) should be ~1.0, got {}",
             d[0]
         );
+    }
+
+    #[test]
+    fn test_nansum_skips_nan() {
+        let a = t(&[1.0, f32::NAN, 3.0, f32::NAN, 5.0], &[5]);
+        let s = nansum(&a).unwrap();
+        let d = s.data().unwrap();
+        assert!((d[0] - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nansum_no_nan() {
+        let a = t(&[1.0, 2.0, 3.0], &[3]);
+        let s = nansum(&a).unwrap();
+        assert!((s.data().unwrap()[0] - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nanmean_skips_nan() {
+        let a = t(&[1.0, f32::NAN, 3.0], &[3]);
+        let m = nanmean(&a).unwrap();
+        assert!((m.data().unwrap()[0] - 2.0).abs() < 1e-6); // (1+3)/2
+    }
+
+    #[test]
+    fn test_nanmean_all_nan() {
+        let a = t(&[f32::NAN, f32::NAN], &[2]);
+        let m = nanmean(&a).unwrap();
+        assert!(m.data().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_logsumexp_basic() {
+        let a = t(&[1.0, 2.0, 3.0], &[3]);
+        let r = logsumexp(&a).unwrap();
+        let expected = (1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln();
+        assert!((r.data().unwrap()[0] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_logsumexp_large_values() {
+        // Numerical stability: large values shouldn't overflow.
+        let a = t(&[1000.0, 1001.0, 1002.0], &[3]);
+        let r = logsumexp(&a).unwrap();
+        let d = r.data().unwrap()[0];
+        assert!(!d.is_nan() && !d.is_infinite(), "logsumexp should be finite, got {d}");
+        // Should be approximately 1002 + ln(exp(-2)+exp(-1)+1) ≈ 1002.41
+        assert!((d - 1002.408).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_logsumexp_dim() {
+        let a = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let r = logsumexp_dim(&a, 1, false).unwrap();
+        assert_eq!(r.shape(), &[2]);
+        let d = r.data().unwrap();
+        let expected0 = (1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln();
+        let expected1 = (4.0f32.exp() + 5.0f32.exp() + 6.0f32.exp()).ln();
+        assert!((d[0] - expected0).abs() < 1e-5);
+        assert!((d[1] - expected1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_logsumexp_dim_keepdim() {
+        let a = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let r = logsumexp_dim(&a, 0, true).unwrap();
+        assert_eq!(r.shape(), &[1, 2]);
     }
 }

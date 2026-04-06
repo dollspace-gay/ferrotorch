@@ -64,6 +64,8 @@ pub use methods::{chunk_t, contiguous_t, permute_t, split_t, view_t};
 pub use nested::{NestedTensor, nested_scaled_dot_product_attention};
 pub use ops::cumulative::CumExtremeResult;
 pub use ops::indexing::{gather, scatter, scatter_add, where_cond};
+pub use ops::search::{bucketize, histc, meshgrid, searchsorted, topk, unique, unique_consecutive};
+pub use ops::tensor_ops::{cdist, diag, diagflat, roll, tril, triu};
 pub use pruning::{apply_2_4_mask, magnitude_prune, sparsity_ratio};
 pub use quantize::{
     FakeQuantize, HistogramObserver, MinMaxObserver, Observer, PerChannelMinMaxObserver, QParams,

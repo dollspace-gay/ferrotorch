@@ -250,6 +250,374 @@ impl<T: Float> Module<T> for Flatten {
 }
 
 // ===========================================================================
+// Unflatten
+// ===========================================================================
+
+/// Unflattens a dimension, expanding it into multiple dimensions.
+///
+/// The inverse of [`Flatten`]. Given an input where dimension `dim` has
+/// size equal to the product of `unflattened_size`, reshapes that
+/// dimension into the specified shape.
+///
+/// Matches PyTorch's `nn.Unflatten`.
+#[derive(Debug, Clone)]
+pub struct Unflatten {
+    /// The dimension to unflatten.
+    pub dim: usize,
+    /// The target shape for the unflattened dimension.
+    pub unflattened_size: Vec<usize>,
+    training: bool,
+}
+
+impl Unflatten {
+    pub fn new(dim: usize, unflattened_size: Vec<usize>) -> Self {
+        Self {
+            dim,
+            unflattened_size,
+            training: true,
+        }
+    }
+
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        let shape = input.shape();
+        if self.dim >= shape.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "Unflatten: dim {} out of range for input with {} dims",
+                    self.dim,
+                    shape.len()
+                ),
+            });
+        }
+
+        let expected_size: usize = self.unflattened_size.iter().product();
+        if expected_size != shape[self.dim] {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "Unflatten: unflattened_size {:?} (product={}) doesn't match dim {} size {}",
+                    self.unflattened_size,
+                    expected_size,
+                    self.dim,
+                    shape[self.dim]
+                ),
+            });
+        }
+
+        let mut new_shape = Vec::with_capacity(shape.len() - 1 + self.unflattened_size.len());
+        new_shape.extend_from_slice(&shape[..self.dim]);
+        new_shape.extend_from_slice(&self.unflattened_size);
+        new_shape.extend_from_slice(&shape[self.dim + 1..]);
+
+        input.view_reshape(new_shape)
+    }
+}
+
+impl<T: Float> Module<T> for Unflatten {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        Unflatten::forward(self, input)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+    fn train(&mut self) {
+        self.training = true;
+    }
+    fn eval(&mut self) {
+        self.training = false;
+    }
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ===========================================================================
+// ChannelShuffle
+// ===========================================================================
+
+/// Rearranges channels in a [N, C, H, W] tensor by dividing them into
+/// groups and interleaving.
+///
+/// Used in ShuffleNet architectures. With `groups=g`, the channel
+/// dimension is reshaped to `[g, C/g]`, transposed to `[C/g, g]`,
+/// then flattened back to `[C]`.
+///
+/// Matches PyTorch's `nn.ChannelShuffle`.
+#[derive(Debug, Clone)]
+pub struct ChannelShuffle {
+    pub groups: usize,
+    training: bool,
+}
+
+impl ChannelShuffle {
+    pub fn new(groups: usize) -> Self {
+        Self {
+            groups,
+            training: true,
+        }
+    }
+
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() < 2 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "ChannelShuffle: input must have at least 2 dims, got {:?}",
+                    input.shape()
+                ),
+            });
+        }
+        if input.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "ChannelShuffle",
+            });
+        }
+
+        let shape = input.shape();
+        let channels = shape[1];
+        if channels % self.groups != 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "ChannelShuffle: channels ({}) must be divisible by groups ({})",
+                    channels, self.groups
+                ),
+            });
+        }
+
+        let g = self.groups;
+        let cpg = channels / g; // channels per group
+        let batch = shape[0];
+        let spatial: usize = shape[2..].iter().product();
+        let data = input.data()?;
+
+        // Reshape [N, C, *] → [N, g, cpg, *] → transpose → [N, cpg, g, *] → [N, C, *]
+        let mut out = vec![<T as num_traits::Zero>::zero(); data.len()];
+        for n in 0..batch {
+            for c_out in 0..channels {
+                // c_out in the shuffled order: group index = c_out % g, within-group = c_out / g
+                let c_in = (c_out % g) * cpg + (c_out / g);
+                for s in 0..spatial {
+                    out[n * channels * spatial + c_out * spatial + s] =
+                        data[n * channels * spatial + c_in * spatial + s];
+                }
+            }
+        }
+
+        Tensor::from_storage(
+            ferrotorch_core::storage::TensorStorage::cpu(out),
+            shape.to_vec(),
+            false,
+        )
+    }
+}
+
+impl<T: Float> Module<T> for ChannelShuffle {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        ChannelShuffle::forward(self, input)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![]
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![]
+    }
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![]
+    }
+    fn train(&mut self) {
+        self.training = true;
+    }
+    fn eval(&mut self) {
+        self.training = false;
+    }
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ===========================================================================
+// CosineSimilarity
+// ===========================================================================
+
+/// Computes cosine similarity between two tensors along a dimension.
+///
+/// `cos(x1, x2) = (x1 . x2) / (||x1|| * ||x2||)`
+///
+/// Matches PyTorch's `nn.CosineSimilarity`.
+#[derive(Debug, Clone)]
+pub struct CosineSimilarity {
+    /// Dimension along which to compute cosine similarity.
+    pub dim: usize,
+    /// Small value to avoid division by zero.
+    pub eps: f64,
+}
+
+impl CosineSimilarity {
+    pub fn new(dim: usize, eps: f64) -> Self {
+        Self { dim, eps }
+    }
+
+    pub fn forward<T: Float>(&self, x1: &Tensor<T>, x2: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if x1.shape() != x2.shape() {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "CosineSimilarity: shapes must match, got {:?} and {:?}",
+                    x1.shape(), x2.shape()
+                ),
+            });
+        }
+        if x1.is_cuda() || x2.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "CosineSimilarity" });
+        }
+
+        let shape = x1.shape();
+        if self.dim >= shape.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("CosineSimilarity: dim {} out of range for shape {:?}", self.dim, shape),
+            });
+        }
+
+        let d1 = x1.data()?;
+        let d2 = x2.data()?;
+        let dim_size = shape[self.dim];
+        let outer: usize = shape[..self.dim].iter().product();
+        let inner: usize = shape[self.dim + 1..].iter().product();
+        let eps_t = T::from(self.eps).unwrap();
+
+        let out_numel = outer * inner;
+        let mut result = Vec::with_capacity(out_numel);
+
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut dot = <T as num_traits::Zero>::zero();
+                let mut n1 = <T as num_traits::Zero>::zero();
+                let mut n2 = <T as num_traits::Zero>::zero();
+                for d in 0..dim_size {
+                    let idx = o * dim_size * inner + d * inner + i;
+                    dot = dot + d1[idx] * d2[idx];
+                    n1 = n1 + d1[idx] * d1[idx];
+                    n2 = n2 + d2[idx] * d2[idx];
+                }
+                let denom = (n1.sqrt() * n2.sqrt()).max(eps_t);
+                result.push(dot / denom);
+            }
+        }
+
+        let mut out_shape = shape.to_vec();
+        out_shape.remove(self.dim);
+        if out_shape.is_empty() {
+            out_shape.push(1);
+        }
+        Tensor::from_storage(
+            ferrotorch_core::storage::TensorStorage::cpu(result),
+            out_shape,
+            false,
+        )
+    }
+}
+
+impl Default for CosineSimilarity {
+    fn default() -> Self {
+        Self::new(1, 1e-8)
+    }
+}
+
+// ===========================================================================
+// PairwiseDistance
+// ===========================================================================
+
+/// Computes the pairwise distance between two tensors using the p-norm.
+///
+/// `d(x1, x2) = ||x1 - x2||_p`
+///
+/// Matches PyTorch's `nn.PairwiseDistance`.
+#[derive(Debug, Clone)]
+pub struct PairwiseDistance {
+    /// The norm degree (default: 2.0 for Euclidean).
+    pub p: f64,
+    /// Small value to avoid division by zero.
+    pub eps: f64,
+    /// Whether to keep the output dimension.
+    pub keepdim: bool,
+}
+
+impl PairwiseDistance {
+    pub fn new(p: f64, eps: f64, keepdim: bool) -> Self {
+        Self { p, eps, keepdim }
+    }
+
+    pub fn forward<T: Float>(&self, x1: &Tensor<T>, x2: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if x1.shape() != x2.shape() {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "PairwiseDistance: shapes must match, got {:?} and {:?}",
+                    x1.shape(), x2.shape()
+                ),
+            });
+        }
+        if x1.is_cuda() || x2.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "PairwiseDistance" });
+        }
+
+        let shape = x1.shape();
+        let ndim = shape.len();
+        if ndim == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "PairwiseDistance: input must have at least 1 dimension".into(),
+            });
+        }
+
+        let d1 = x1.data()?;
+        let d2 = x2.data()?;
+        let last_dim = shape[ndim - 1];
+        let outer: usize = d1.len() / last_dim;
+        let p_t = T::from(self.p).unwrap();
+        let inv_p = T::from(1.0 / self.p).unwrap();
+        let eps_t = T::from(self.eps).unwrap();
+
+        let mut result = Vec::with_capacity(outer);
+        for o in 0..outer {
+            let mut norm = <T as num_traits::Zero>::zero();
+            for i in 0..last_dim {
+                let diff = d1[o * last_dim + i] - d2[o * last_dim + i];
+                let abs_diff = if diff < <T as num_traits::Zero>::zero() {
+                    <T as num_traits::Zero>::zero() - diff
+                } else {
+                    diff
+                };
+                norm = norm + (abs_diff + eps_t).powf(p_t);
+            }
+            result.push(norm.powf(inv_p));
+        }
+
+        let mut out_shape: Vec<usize> = shape[..ndim - 1].to_vec();
+        if self.keepdim {
+            out_shape.push(1);
+        }
+        if out_shape.is_empty() {
+            out_shape.push(1);
+        }
+        Tensor::from_storage(
+            ferrotorch_core::storage::TensorStorage::cpu(result),
+            out_shape,
+            false,
+        )
+    }
+}
+
+impl Default for PairwiseDistance {
+    fn default() -> Self {
+        Self::new(2.0, 1e-6, false)
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 

@@ -39,18 +39,18 @@ pub struct CumsumBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for CumsumBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let go_cpu = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let go_data = go_cpu.data()?;
-        let shape = go_cpu.shape();
+        if grad_output.is_cuda() {
+            return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+                op: "CumsumBackward",
+            });
+        }
+        let go_data = grad_output.data()?;
+        let shape = grad_output.shape();
 
         let grad_data = reverse_cumsum(go_data, shape, self.dim);
 
-        let grad_cpu = Tensor::from_storage(TensorStorage::cpu(grad_data), shape.to_vec(), false)?;
-        let grad_input = grad_cpu.to(self.input.device())?;
+        let grad_input =
+            Tensor::from_storage(TensorStorage::cpu(grad_data), shape.to_vec(), false)?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -108,26 +108,16 @@ pub struct CumprodBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for CumprodBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let go_cpu = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_cpu = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let output_cpu = if self.output.is_cuda() {
-            self.output.cpu()?
-        } else {
-            self.output.clone()
-        };
+        if grad_output.is_cuda() || self.input.is_cuda() || self.output.is_cuda() {
+            return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+                op: "CumprodBackward",
+            });
+        }
 
-        let go_data = go_cpu.data()?;
-        let in_data = input_cpu.data()?;
-        let out_data = output_cpu.data()?;
-        let shape = input_cpu.shape();
+        let go_data = grad_output.data()?;
+        let in_data = self.input.data()?;
+        let out_data = self.output.data()?;
+        let shape = self.input.shape();
 
         let (outer, dim_size, inner) = dim_strides(shape, self.dim);
         let numel = in_data.len();
@@ -190,8 +180,8 @@ impl<T: Float> GradFn<T> for CumprodBackward<T> {
             }
         }
 
-        let grad_cpu = Tensor::from_storage(TensorStorage::cpu(grad_input), shape.to_vec(), false)?;
-        let result = grad_cpu.to(self.input.device())?;
+        let result =
+            Tensor::from_storage(TensorStorage::cpu(grad_input), shape.to_vec(), false)?;
         Ok(vec![Some(result)])
     }
 
@@ -280,26 +270,16 @@ pub struct LogcumsumexpBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for LogcumsumexpBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let go_cpu = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_cpu = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let output_cpu = if self.output.is_cuda() {
-            self.output.cpu()?
-        } else {
-            self.output.clone()
-        };
+        if grad_output.is_cuda() || self.input.is_cuda() || self.output.is_cuda() {
+            return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+                op: "LogcumsumexpBackward",
+            });
+        }
 
-        let go_data = go_cpu.data()?;
-        let in_data = input_cpu.data()?;
-        let out_data = output_cpu.data()?;
-        let shape = input_cpu.shape();
+        let go_data = grad_output.data()?;
+        let in_data = self.input.data()?;
+        let out_data = self.output.data()?;
+        let shape = self.input.shape();
 
         // Compute: product[i] = grad_output[i] * exp(-output[i])
         let product: Vec<T> = go_data
@@ -318,8 +298,8 @@ impl<T: Float> GradFn<T> for LogcumsumexpBackward<T> {
             .map(|(&x, &r)| x.exp() * r)
             .collect();
 
-        let grad_cpu = Tensor::from_storage(TensorStorage::cpu(grad_data), shape.to_vec(), false)?;
-        let grad_input = grad_cpu.to(self.input.device())?;
+        let grad_input =
+            Tensor::from_storage(TensorStorage::cpu(grad_data), shape.to_vec(), false)?;
         Ok(vec![Some(grad_input)])
     }
 

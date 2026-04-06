@@ -1588,6 +1588,7 @@ dependencies = [
  "ferrotorch-gpu",
  "ferrotorch-nn",
  "ferrotorch-serialize",
+ "libc",
  "num-traits",
  "safetensors",
  "serde",

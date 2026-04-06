@@ -106,12 +106,13 @@ pub fn fft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<Te
         });
     }
 
-    let device = input.device();
+    if input.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "fft" });
+    }
     let data = input.data_vec()?;
     let batch_shape = &shape[..ndim - 2];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
 
-    // Parse complex pairs from the flat data.
     let mut complex_data = Vec::with_capacity(batch_size * fft_n);
     for b in 0..batch_size {
         let src_offset = b * input_n * 2;
@@ -121,7 +122,6 @@ pub fn fft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<Te
             let im = data[src_offset + i * 2 + 1].to_f64().unwrap();
             complex_data.push(Complex::new(re, im));
         }
-        // Zero-pad if needed.
         for _ in copy_len..fft_n {
             complex_data.push(Complex::new(0.0, 0.0));
         }
@@ -134,12 +134,7 @@ pub fn fft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<Te
     out_shape.push(fft_n);
     out_shape.push(2);
 
-    let out = Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
-    }
+    Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)
 }
 
 /// 1-D inverse FFT along the last dimension.
@@ -173,7 +168,9 @@ pub fn ifft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<T
         });
     }
 
-    let device = input.device();
+    if input.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "ifft" });
+    }
     let data = input.data_vec()?;
     let batch_shape = &shape[..ndim - 2];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
@@ -199,12 +196,7 @@ pub fn ifft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<T
     out_shape.push(fft_n);
     out_shape.push(2);
 
-    let out = Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
-    }
+    Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)
 }
 
 /// 1-D real-to-complex FFT along the last dimension.
@@ -228,7 +220,9 @@ pub fn rfft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<T
         });
     }
 
-    let device = input.device();
+    if input.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "rfft" });
+    }
     let data = input.data_vec()?;
     let batch_shape = &shape[..ndim - 1];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
@@ -265,12 +259,7 @@ pub fn rfft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<T
     out_shape.push(half_n);
     out_shape.push(2);
 
-    let out = Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
-    }
+    Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)
 }
 
 /// 1-D complex-to-real inverse FFT.
@@ -305,7 +294,9 @@ pub fn irfft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<
         });
     }
 
-    let device = input.device();
+    if input.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "irfft" });
+    }
     let data = input.data_vec()?;
     let batch_shape = &shape[..ndim - 2];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
@@ -347,12 +338,7 @@ pub fn irfft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<
     let mut out_shape = batch_shape.to_vec();
     out_shape.push(output_n);
 
-    let out = Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
-    }
+    Tensor::from_storage(TensorStorage::cpu(result_data), out_shape, false)
 }
 
 /// 2-D FFT (complex-to-complex) along the last two spatial dimensions.
@@ -431,7 +417,9 @@ fn fft_2d_row_pass<T: Float>(
     inverse: bool,
 ) -> FerrotorchResult<Tensor<T>> {
     let shape = input.shape();
-    let device = input.device();
+    if input.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "fft2" });
+    }
     let ndim = shape.len();
     let batch_shape = &shape[..ndim - 3];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
@@ -485,12 +473,7 @@ fn fft_2d_row_pass<T: Float>(
     out_shape.push(cols);
     out_shape.push(2);
 
-    let out = Tensor::from_storage(TensorStorage::cpu(result), out_shape, false)?;
-    if device.is_cuda() {
-        out.to(device)
-    } else {
-        Ok(out)
-    }
+    Tensor::from_storage(TensorStorage::cpu(result), out_shape, false)
 }
 
 // ---------------------------------------------------------------------------

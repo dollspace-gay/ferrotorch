@@ -1,6 +1,7 @@
-//! Convolution layers: 1-D, 2-D, and transposed 2-D.
+//! Convolution layers: 1-D, 2-D, 3-D and their transposed variants.
 //!
-//! Implements `Conv1d<T>`, `Conv2d<T>`, and `ConvTranspose2d<T>`.
+//! Implements `Conv1d<T>`, `Conv2d<T>`, `Conv3d<T>`, `ConvTranspose1d<T>`,
+//! `ConvTranspose2d<T>`, and `ConvTranspose3d<T>`.
 //! Forward passes use the im2col + matmul approach; backward follows the
 //! same structure in reverse.
 
@@ -1686,6 +1687,1758 @@ impl<T: Float> GradFn<T> for ConvTranspose2dBackward<T> {
 }
 
 // ---------------------------------------------------------------------------
+// im2col_3d / col2im_3d helpers
+// ---------------------------------------------------------------------------
+
+/// Extract volume patches into columns for 3-D convolution.
+///
+/// Given a 5-D input `[B, C, D, H, W]`, produces a 3-D output
+/// `[B, C * kD * kH * kW, D_out * H_out * W_out]` where each column is one
+/// flattened receptive-field patch.
+#[allow(clippy::too_many_arguments)]
+fn im2col_3d<T: Float>(
+    input: &[T],
+    batch: usize,
+    channels: usize,
+    depth: usize,
+    height: usize,
+    width: usize,
+    kernel_d: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_d: usize,
+    pad_h: usize,
+    pad_w: usize,
+) -> (Vec<T>, usize, usize) {
+    let d_out = (depth + 2 * pad_d - kernel_d) / stride_d + 1;
+    let h_out = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    let w_out = (width + 2 * pad_w - kernel_w) / stride_w + 1;
+    let col_rows = channels * kernel_d * kernel_h * kernel_w;
+    let col_cols = d_out * h_out * w_out;
+
+    let zero = <T as num_traits::Zero>::zero();
+    let mut cols = vec![zero; batch * col_rows * col_cols];
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for kd in 0..kernel_d {
+                for kh in 0..kernel_h {
+                    for kw in 0..kernel_w {
+                        let row = c * kernel_d * kernel_h * kernel_w
+                            + kd * kernel_h * kernel_w
+                            + kh * kernel_w
+                            + kw;
+                        for od in 0..d_out {
+                            for oh in 0..h_out {
+                                for ow in 0..w_out {
+                                    let id = od * stride_d + kd;
+                                    let ih = oh * stride_h + kh;
+                                    let iw = ow * stride_w + kw;
+                                    let col = od * h_out * w_out + oh * w_out + ow;
+
+                                    let val = if id >= pad_d
+                                        && ih >= pad_h
+                                        && iw >= pad_w
+                                        && (id - pad_d) < depth
+                                        && (ih - pad_h) < height
+                                        && (iw - pad_w) < width
+                                    {
+                                        let real_d = id - pad_d;
+                                        let real_h = ih - pad_h;
+                                        let real_w = iw - pad_w;
+                                        input[b * channels * depth * height * width
+                                            + c * depth * height * width
+                                            + real_d * height * width
+                                            + real_h * width
+                                            + real_w]
+                                    } else {
+                                        zero
+                                    };
+
+                                    cols[b * col_rows * col_cols + row * col_cols + col] = val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (cols, col_rows, col_cols)
+}
+
+/// Scatter columns back into a volume tensor (adjoint of `im2col_3d`).
+///
+/// Given columns of shape `[B, C * kD * kH * kW, D_out * H_out * W_out]`,
+/// accumulates values back into a `[B, C, D, H, W]` tensor (with padding
+/// stripped).
+#[allow(clippy::too_many_arguments)]
+fn col2im_3d<T: Float>(
+    cols: &[T],
+    batch: usize,
+    channels: usize,
+    depth: usize,
+    height: usize,
+    width: usize,
+    kernel_d: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_d: usize,
+    pad_h: usize,
+    pad_w: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+) -> Vec<T> {
+    let zero = <T as num_traits::Zero>::zero();
+    let mut output = vec![zero; batch * channels * depth * height * width];
+
+    let col_rows = channels * kernel_d * kernel_h * kernel_w;
+    let col_cols = d_out * h_out * w_out;
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for kd in 0..kernel_d {
+                for kh in 0..kernel_h {
+                    for kw in 0..kernel_w {
+                        let row = c * kernel_d * kernel_h * kernel_w
+                            + kd * kernel_h * kernel_w
+                            + kh * kernel_w
+                            + kw;
+                        for od in 0..d_out {
+                            for oh in 0..h_out {
+                                for ow in 0..w_out {
+                                    let id = od * stride_d + kd;
+                                    let ih = oh * stride_h + kh;
+                                    let iw = ow * stride_w + kw;
+                                    let col = od * h_out * w_out + oh * w_out + ow;
+
+                                    if id >= pad_d
+                                        && ih >= pad_h
+                                        && iw >= pad_w
+                                        && (id - pad_d) < depth
+                                        && (ih - pad_h) < height
+                                        && (iw - pad_w) < width
+                                    {
+                                        let real_d = id - pad_d;
+                                        let real_h = ih - pad_h;
+                                        let real_w = iw - pad_w;
+                                        output[b * channels * depth * height * width
+                                            + c * depth * height * width
+                                            + real_d * height * width
+                                            + real_h * width
+                                            + real_w] +=
+                                            cols[b * col_rows * col_cols + row * col_cols + col];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    output
+}
+
+// ---------------------------------------------------------------------------
+// Conv3d
+// ---------------------------------------------------------------------------
+
+/// A 3-D convolution layer for volumetric data.
+///
+/// Applies a spatial convolution over an input `[B, C_in, D, H, W]` using
+/// the im2col + matmul algorithm. Equivalent to `torch.nn.Conv3d`.
+///
+/// # Shape
+///
+/// - Input: `[B, in_channels, D, H, W]`
+/// - Output: `[B, out_channels, D_out, H_out, W_out]`
+///
+/// where `D_out = (D + 2 * padding.0 - kernel_size.0) / stride.0 + 1` (and
+/// analogously for H and W).
+#[derive(Debug)]
+pub struct Conv3d<T: Float> {
+    /// Learnable kernel weights `[out_channels, in_channels, kD, kH, kW]`.
+    weight: Parameter<T>,
+    /// Optional learnable bias `[out_channels]`.
+    bias: Option<Parameter<T>>,
+    /// Number of input channels.
+    in_channels: usize,
+    /// Number of output channels (filters).
+    out_channels: usize,
+    /// Kernel spatial size `(kD, kH, kW)`.
+    kernel_size: (usize, usize, usize),
+    /// Stride `(sD, sH, sW)`.
+    stride: (usize, usize, usize),
+    /// Zero-padding `(pD, pH, pW)` applied to both sides.
+    padding: (usize, usize, usize),
+    /// Whether the module is in training mode.
+    training: bool,
+}
+
+impl<T: Float> Conv3d<T> {
+    /// Create a new `Conv3d` layer.
+    ///
+    /// Weight is initialized with Kaiming uniform (ReLU gain).
+    /// Bias, if enabled, is initialized to zeros.
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        bias: bool,
+    ) -> FerrotorchResult<Self> {
+        if in_channels == 0 || out_channels == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "in_channels and out_channels must be > 0".into(),
+            });
+        }
+        if kernel_size.0 == 0 || kernel_size.1 == 0 || kernel_size.2 == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "kernel_size must be > 0 in all dimensions".into(),
+            });
+        }
+        if stride.0 == 0 || stride.1 == 0 || stride.2 == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "stride must be > 0 in all dimensions".into(),
+            });
+        }
+
+        let (kd, kh, kw) = kernel_size;
+        let mut weight = Parameter::zeros(&[out_channels, in_channels, kd, kh, kw])?;
+        kaiming_uniform(&mut weight, NonLinearity::ReLU)?;
+
+        let bias_param = if bias {
+            let mut b = Parameter::zeros(&[out_channels])?;
+            zeros_init(&mut b)?;
+            Some(b)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            weight,
+            bias: bias_param,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            training: true,
+        })
+    }
+
+    /// The number of learnable scalar parameters.
+    pub fn num_parameters(&self) -> usize {
+        let w = self.out_channels
+            * self.in_channels
+            * self.kernel_size.0
+            * self.kernel_size.1
+            * self.kernel_size.2;
+        let b = if self.bias.is_some() {
+            self.out_channels
+        } else {
+            0
+        };
+        w + b
+    }
+}
+
+impl<T: Float> Module<T> for Conv3d<T> {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // Record autocast decision for conv3d.
+        let _autocast_cat = autocast_guard("conv3d");
+
+        // Validate input shape: [B, C_in, D, H, W].
+        if input.ndim() != 5 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "Conv3d expects 5-D input [B, C, D, H, W], got {:?}",
+                    input.shape()
+                ),
+            });
+        }
+
+        let batch = input.shape()[0];
+        let c_in = input.shape()[1];
+        let d = input.shape()[2];
+        let h = input.shape()[3];
+        let w = input.shape()[4];
+
+        if c_in != self.in_channels {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "Conv3d: expected {} input channels, got {}",
+                    self.in_channels, c_in
+                ),
+            });
+        }
+
+        let (kd, kh, kw) = self.kernel_size;
+        let (sd, sh, sw) = self.stride;
+        let (pd, ph, pw) = self.padding;
+
+        // Check that the kernel fits.
+        let d_padded = d + 2 * pd;
+        let h_padded = h + 2 * ph;
+        let w_padded = w + 2 * pw;
+        if d_padded < kd || h_padded < kh || w_padded < kw {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "Conv3d: padded input ({d_padded}, {h_padded}, {w_padded}) is smaller than kernel ({kd}, {kh}, {kw})"
+                ),
+            });
+        }
+
+        let d_out = (d_padded - kd) / sd + 1;
+        let h_out = (h_padded - kh) / sh + 1;
+        let w_out = (w_padded - kw) / sw + 1;
+
+        // Save the input device so we can restore it on the output.
+        let input_device = input.device();
+
+        // ---- CPU path ----
+        let input_data = input.data_vec()?;
+
+        // im2col_3d: [B, C_in * kD * kH * kW, D_out * H_out * W_out]
+        let (cols, col_rows, col_cols) = im2col_3d(
+            &input_data, batch, c_in, d, h, w, kd, kh, kw, sd, sh, sw, pd, ph, pw,
+        );
+
+        // Reshape weight to 2D: [C_out, C_in * kD * kH * kW]
+        let weight_data = self.weight.data_vec()?;
+        let weight_2d = Tensor::from_storage(
+            TensorStorage::cpu(weight_data),
+            vec![self.out_channels, col_rows],
+            false,
+        )?;
+
+        // Per-batch matmul: weight_2d @ cols_b -> [C_out, D_out * H_out * W_out]
+        let zero = <T as num_traits::Zero>::zero();
+        let spatial_out = d_out * h_out * w_out;
+        let mut output = vec![zero; batch * self.out_channels * spatial_out];
+
+        for b in 0..batch {
+            let col_start = b * col_rows * col_cols;
+            let col_end = col_start + col_rows * col_cols;
+            let cols_b = Tensor::from_storage(
+                TensorStorage::cpu(cols[col_start..col_end].to_vec()),
+                vec![col_rows, col_cols],
+                false,
+            )?;
+
+            let out_b = mm(&weight_2d, &cols_b)?;
+            let out_data = out_b.data()?;
+            let out_start = b * self.out_channels * spatial_out;
+            output[out_start..out_start + self.out_channels * spatial_out]
+                .copy_from_slice(out_data);
+        }
+
+        // Add bias if present: broadcast [C_out] over [B, C_out, D_out, H_out, W_out].
+        if let Some(ref bias) = self.bias {
+            let bias_data = bias.data_vec()?;
+            for b in 0..batch {
+                for c in 0..self.out_channels {
+                    let bval = bias_data[c];
+                    for s in 0..spatial_out {
+                        output[b * self.out_channels * spatial_out + c * spatial_out + s] += bval;
+                    }
+                }
+            }
+        }
+
+        let result = Tensor::from_storage(
+            TensorStorage::cpu(output),
+            vec![batch, self.out_channels, d_out, h_out, w_out],
+            false,
+        )?;
+
+        // Attach backward if gradients are enabled and any input/param requires grad.
+        if is_grad_enabled()
+            && (input.requires_grad()
+                || self.weight.requires_grad()
+                || self.bias.as_ref().is_some_and(|b| b.requires_grad()))
+        {
+            let grad_fn = Arc::new(Conv3dBackward {
+                input: input.clone(),
+                weight: self.weight.tensor().clone(),
+                bias: self.bias.as_ref().map(|b| b.tensor().clone()),
+                in_channels: self.in_channels,
+                out_channels: self.out_channels,
+                kernel_size: self.kernel_size,
+                stride: self.stride,
+                padding: self.padding,
+                cols,
+                col_rows,
+                col_cols,
+                d_out,
+                h_out,
+                w_out,
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(result.data()?.to_vec()),
+                result.shape().to_vec(),
+                grad_fn,
+            )?
+            .to(input_device) // restore device
+        } else {
+            result.to(input_device)
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        let mut params = vec![&self.weight];
+        if let Some(ref b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        let mut params = vec![&mut self.weight];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        let mut params = vec![("weight".to_string(), &self.weight)];
+        if let Some(ref b) = self.bias {
+            params.push(("bias".to_string(), b));
+        }
+        params
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conv3dBackward
+// ---------------------------------------------------------------------------
+
+/// Backward function for `Conv3d` forward pass.
+///
+/// Saved tensors:
+/// - `input`: the original 5-D input
+/// - `weight`: the 5-D kernel
+/// - `bias`: optional 1-D bias
+/// - `cols`: the im2col_3d columns from the forward pass (avoids recomputation)
+#[derive(Debug)]
+struct Conv3dBackward<T: Float> {
+    input: Tensor<T>,
+    weight: Tensor<T>,
+    bias: Option<Tensor<T>>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: (usize, usize, usize),
+    stride: (usize, usize, usize),
+    padding: (usize, usize, usize),
+    cols: Vec<T>,
+    col_rows: usize,
+    col_cols: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+}
+
+impl<T: Float> GradFn<T> for Conv3dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // grad_output shape: [B, C_out, D_out, H_out, W_out]
+        let go_data = grad_output.data_vec()?;
+        let batch = self.input.shape()[0];
+        let d = self.input.shape()[2];
+        let h = self.input.shape()[3];
+        let w = self.input.shape()[4];
+        let (kd, kh, kw) = self.kernel_size;
+        let (sd, sh, sw) = self.stride;
+        let (pd, ph, pw) = self.padding;
+        let spatial_out = self.d_out * self.h_out * self.w_out;
+
+        // --- grad_weight ---
+        // For each batch element:
+        //   grad_output_b: [C_out, D_out * H_out * W_out]
+        //   cols_b:        [col_rows, col_cols]
+        //   grad_weight += grad_output_b @ cols_b^T
+        let grad_weight = if self.weight.requires_grad() {
+            let zero = <T as num_traits::Zero>::zero();
+            let weight_numel = self.out_channels * self.col_rows;
+            let mut gw_accum = vec![zero; weight_numel];
+
+            for b in 0..batch {
+                let go_start = b * self.out_channels * spatial_out;
+                let go_end = go_start + self.out_channels * spatial_out;
+                let go_b = Tensor::from_storage(
+                    TensorStorage::cpu(go_data[go_start..go_end].to_vec()),
+                    vec![self.out_channels, spatial_out],
+                    false,
+                )?;
+
+                let col_start = b * self.col_rows * self.col_cols;
+                let col_end = col_start + self.col_rows * self.col_cols;
+                let cols_b = Tensor::from_storage(
+                    TensorStorage::cpu(self.cols[col_start..col_end].to_vec()),
+                    vec![self.col_rows, self.col_cols],
+                    false,
+                )?;
+
+                let cols_bt = transpose(&cols_b)?;
+                let gw_b = mm(&go_b, &cols_bt)?;
+                let gw_data = gw_b.data()?;
+
+                for i in 0..weight_numel {
+                    gw_accum[i] += gw_data[i];
+                }
+            }
+
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(gw_accum),
+                vec![self.out_channels, self.in_channels, kd, kh, kw],
+                false,
+            )?)
+        } else {
+            None
+        };
+
+        // --- grad_bias ---
+        let grad_bias = match &self.bias {
+            Some(b) if b.requires_grad() => {
+                let zero = <T as num_traits::Zero>::zero();
+                let mut gb = vec![zero; self.out_channels];
+                for batch_idx in 0..batch {
+                    for c in 0..self.out_channels {
+                        for s in 0..spatial_out {
+                            gb[c] += go_data
+                                [batch_idx * self.out_channels * spatial_out + c * spatial_out + s];
+                        }
+                    }
+                }
+                Some(Tensor::from_storage(
+                    TensorStorage::cpu(gb),
+                    vec![self.out_channels],
+                    false,
+                )?)
+            }
+            _ => None,
+        };
+
+        // --- grad_input ---
+        let grad_input = if self.input.requires_grad() {
+            let weight_data = self.weight.data_vec()?;
+            let weight_2d = Tensor::from_storage(
+                TensorStorage::cpu(weight_data),
+                vec![self.out_channels, self.col_rows],
+                false,
+            )?;
+            let weight_2d_t = transpose(&weight_2d)?;
+
+            let zero = <T as num_traits::Zero>::zero();
+            let mut grad_cols = vec![zero; batch * self.col_rows * self.col_cols];
+
+            for b in 0..batch {
+                let go_start = b * self.out_channels * spatial_out;
+                let go_end = go_start + self.out_channels * spatial_out;
+                let go_b = Tensor::from_storage(
+                    TensorStorage::cpu(go_data[go_start..go_end].to_vec()),
+                    vec![self.out_channels, spatial_out],
+                    false,
+                )?;
+
+                let gc_b = mm(&weight_2d_t, &go_b)?;
+                let gc_data = gc_b.data()?;
+
+                let gc_start = b * self.col_rows * self.col_cols;
+                grad_cols[gc_start..gc_start + self.col_rows * self.col_cols]
+                    .copy_from_slice(gc_data);
+            }
+
+            // col2im_3d to scatter back to [B, C_in, D, H, W]
+            let gi = col2im_3d(
+                &grad_cols,
+                batch,
+                self.in_channels,
+                d,
+                h,
+                w,
+                kd,
+                kh,
+                kw,
+                sd,
+                sh,
+                sw,
+                pd,
+                ph,
+                pw,
+                self.d_out,
+                self.h_out,
+                self.w_out,
+            );
+
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(gi),
+                self.input.shape().to_vec(),
+                false,
+            )?)
+        } else {
+            None
+        };
+
+        // Return exactly as many gradients as inputs() returns.
+        let mut grads = vec![grad_input, grad_weight];
+        if self.bias.is_some() {
+            grads.push(grad_bias);
+        }
+        Ok(grads)
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        let mut v = vec![&self.input, &self.weight];
+        if let Some(ref b) = self.bias {
+            v.push(b);
+        }
+        v
+    }
+
+    fn name(&self) -> &'static str {
+        "Conv3dBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConvTranspose1d
+// ---------------------------------------------------------------------------
+
+/// A 1-D transposed convolution (deconvolution) layer.
+///
+/// Applies a transposed temporal convolution over an input `[B, C_in, L]`.
+/// Used for upsampling in generative models and decoder networks.
+/// Equivalent to `torch.nn.ConvTranspose1d`.
+///
+/// # Implementation
+///
+/// Delegates to the 2-D transposed convolution by adding a dummy spatial
+/// dimension (H=1), then squeezes the output back to 3-D.
+///
+/// # Shape
+///
+/// - Input: `[B, in_channels, L]`
+/// - Output: `[B, out_channels, L_out]`
+///
+/// where `L_out = (L - 1) * stride - 2 * padding + kernel_size + output_padding`.
+#[derive(Debug)]
+pub struct ConvTranspose1d<T: Float> {
+    /// Learnable kernel weights `[in_channels, out_channels, kernel_size]`.
+    ///
+    /// Note: the channel ordering is transposed compared to `Conv1d`.
+    weight: Parameter<T>,
+    /// Optional learnable bias `[out_channels]`.
+    bias: Option<Parameter<T>>,
+    /// Number of input channels.
+    in_channels: usize,
+    /// Number of output channels.
+    out_channels: usize,
+    /// Kernel length.
+    kernel_size: usize,
+    /// Stride.
+    stride: usize,
+    /// Zero-padding removed from both sides of the output.
+    padding: usize,
+    /// Additional size added to one side of the output.
+    output_padding: usize,
+    /// Whether the module is in training mode.
+    training: bool,
+}
+
+impl<T: Float> ConvTranspose1d<T> {
+    /// Create a new `ConvTranspose1d` layer.
+    ///
+    /// Weight is initialized with Kaiming uniform (ReLU gain).
+    /// Bias, if enabled, is initialized to zeros.
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        bias: bool,
+    ) -> FerrotorchResult<Self> {
+        if in_channels == 0 || out_channels == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "in_channels and out_channels must be > 0".into(),
+            });
+        }
+        if kernel_size == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "kernel_size must be > 0".into(),
+            });
+        }
+        if stride == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "stride must be > 0".into(),
+            });
+        }
+        if output_padding >= stride {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "output_padding must be strictly less than stride".into(),
+            });
+        }
+
+        // Weight shape: [in_channels, out_channels, kernel_size]
+        let mut weight = Parameter::zeros(&[in_channels, out_channels, kernel_size])?;
+        kaiming_uniform(&mut weight, NonLinearity::ReLU)?;
+
+        let bias_param = if bias {
+            let mut b = Parameter::zeros(&[out_channels])?;
+            zeros_init(&mut b)?;
+            Some(b)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            weight,
+            bias: bias_param,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            training: true,
+        })
+    }
+
+    /// The number of learnable scalar parameters.
+    pub fn num_parameters(&self) -> usize {
+        let w = self.in_channels * self.out_channels * self.kernel_size;
+        let b = if self.bias.is_some() {
+            self.out_channels
+        } else {
+            0
+        };
+        w + b
+    }
+}
+
+impl<T: Float> Module<T> for ConvTranspose1d<T> {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // Record autocast decision for conv_transpose1d.
+        let _autocast_cat = autocast_guard("conv_transpose1d");
+
+        // Validate input shape: [B, C_in, L].
+        if input.ndim() != 3 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "ConvTranspose1d expects 3-D input [B, C, L], got {:?}",
+                    input.shape()
+                ),
+            });
+        }
+
+        let batch = input.shape()[0];
+        let c_in = input.shape()[1];
+        let length = input.shape()[2];
+
+        if c_in != self.in_channels {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "ConvTranspose1d: expected {} input channels, got {}",
+                    self.in_channels, c_in
+                ),
+            });
+        }
+
+        let k = self.kernel_size;
+        let s = self.stride;
+        let p = self.padding;
+        let op = self.output_padding;
+
+        // Save the input device so we can restore it on the output.
+        let input_device = input.device();
+
+        // Step 1: Insert zeros between input elements (stride insertion).
+        // Treat [B, C, L] as [B, C, 1, L] for the 2-D helper.
+        let input_data = input.data_vec()?;
+        let (upsampled, _h_up, w_up) = stride_insert_zeros(&input_data, batch, c_in, 1, length, 1, s);
+
+        // Step 2: Flip the kernel and transpose channel dimensions.
+        // Weight: [in_channels, out_channels, k] -> treat as [in_channels, out_channels, 1, k]
+        let weight_data = self.weight.data_vec()?;
+        let flipped = flip_kernel(&weight_data, self.in_channels, self.out_channels, 1, k);
+
+        // Step 3: Apply a regular convolution on the upsampled input using the
+        // flipped kernel with internal padding.
+        let internal_pad_w = k - 1 - p;
+
+        // im2col on the upsampled input [B, C, 1, w_up] with kernel (1, k), stride (1, 1).
+        let (cols, col_rows, col_cols) = im2col(
+            &upsampled,
+            batch,
+            c_in,
+            1,
+            w_up,
+            1,
+            k,
+            1,
+            1,
+            0,
+            internal_pad_w,
+        );
+
+        // w_out_base from the internal convolution.
+        let w_out_base = (w_up + 2 * internal_pad_w - k) + 1;
+
+        // The final output size includes output_padding.
+        let l_out = w_out_base + op;
+
+        // Reshape flipped kernel to 2-D: [C_out, C_in * 1 * k]
+        let flipped_2d = Tensor::from_storage(
+            TensorStorage::cpu(flipped),
+            vec![self.out_channels, col_rows],
+            false,
+        )?;
+
+        // Per-batch matmul.
+        let zero = <T as num_traits::Zero>::zero();
+        let mut output = vec![zero; batch * self.out_channels * l_out];
+
+        for b in 0..batch {
+            let col_start = b * col_rows * col_cols;
+            let col_end = col_start + col_rows * col_cols;
+            let cols_b = Tensor::from_storage(
+                TensorStorage::cpu(cols[col_start..col_end].to_vec()),
+                vec![col_rows, col_cols],
+                false,
+            )?;
+
+            let out_b = mm(&flipped_2d, &cols_b)?;
+            let out_data = out_b.data()?;
+
+            // Copy the base convolution result; extra output_padding positions
+            // remain zero (which is correct by definition).
+            let out_start = b * self.out_channels * l_out;
+            for c in 0..self.out_channels {
+                for ow in 0..w_out_base {
+                    output[out_start + c * l_out + ow] = out_data[c * w_out_base + ow];
+                }
+            }
+        }
+
+        // Add bias if present.
+        if let Some(ref bias) = self.bias {
+            let bias_data = bias.data_vec()?;
+            for b in 0..batch {
+                for c in 0..self.out_channels {
+                    let bval = bias_data[c];
+                    for l in 0..l_out {
+                        output[b * self.out_channels * l_out + c * l_out + l] += bval;
+                    }
+                }
+            }
+        }
+
+        let result = Tensor::from_storage(
+            TensorStorage::cpu(output),
+            vec![batch, self.out_channels, l_out],
+            false,
+        )?;
+
+        // Attach backward if gradients are enabled.
+        if is_grad_enabled()
+            && (input.requires_grad()
+                || self.weight.requires_grad()
+                || self.bias.as_ref().is_some_and(|b| b.requires_grad()))
+        {
+            let grad_fn = Arc::new(ConvTranspose1dBackward {
+                input: input.clone(),
+                weight: self.weight.tensor().clone(),
+                bias: self.bias.as_ref().map(|b| b.tensor().clone()),
+                in_channels: self.in_channels,
+                out_channels: self.out_channels,
+                kernel_size: self.kernel_size,
+                stride: self.stride,
+                padding: self.padding,
+                _output_padding: self.output_padding,
+                l_out,
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(result.data()?.to_vec()),
+                result.shape().to_vec(),
+                grad_fn,
+            )?
+            .to(input_device) // restore device
+        } else {
+            result.to(input_device)
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        let mut params = vec![&self.weight];
+        if let Some(ref b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        let mut params = vec![&mut self.weight];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        let mut params = vec![("weight".to_string(), &self.weight)];
+        if let Some(ref b) = self.bias {
+            params.push(("bias".to_string(), b));
+        }
+        params
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConvTranspose1dBackward
+// ---------------------------------------------------------------------------
+
+/// Backward function for `ConvTranspose1d` forward pass.
+///
+/// The backward of a transposed convolution is a regular convolution.
+#[derive(Debug)]
+struct ConvTranspose1dBackward<T: Float> {
+    input: Tensor<T>,
+    weight: Tensor<T>,
+    bias: Option<Tensor<T>>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    _output_padding: usize,
+    l_out: usize,
+}
+
+impl<T: Float> GradFn<T> for ConvTranspose1dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // grad_output shape: [B, C_out, L_out]
+        let go_data = grad_output.data_vec()?;
+        let batch = self.input.shape()[0];
+        let l_in = self.input.shape()[2];
+        let k = self.kernel_size;
+        let s = self.stride;
+        let p = self.padding;
+
+        // --- grad_input ---
+        // The backward of ConvTranspose1d w.r.t. input is a regular Conv1d
+        // of grad_output with the original (non-flipped) weight.
+        // Weight is [C_in, C_out, k], treat as [C_in, C_out, 1, k].
+        let grad_input = if self.input.requires_grad() {
+            let weight_data = self.weight.data_vec()?;
+            let col_rows = self.out_channels * k;
+
+            // Reshape weight to [C_in, C_out * k]
+            let weight_2d = Tensor::from_storage(
+                TensorStorage::cpu(weight_data),
+                vec![self.in_channels, col_rows],
+                false,
+            )?;
+
+            // im2col on grad_output [B, C_out, L_out] treated as [B, C_out, 1, L_out]
+            let (go_cols, _go_col_rows, go_col_cols) = im2col(
+                &go_data,
+                batch,
+                self.out_channels,
+                1,
+                self.l_out,
+                1,
+                k,
+                1,
+                s,
+                0,
+                p,
+            );
+
+            let zero = <T as num_traits::Zero>::zero();
+            let mut gi = vec![zero; batch * self.in_channels * l_in];
+
+            for b in 0..batch {
+                let col_start = b * col_rows * go_col_cols;
+                let col_end = col_start + col_rows * go_col_cols;
+                let go_cols_b = Tensor::from_storage(
+                    TensorStorage::cpu(go_cols[col_start..col_end].to_vec()),
+                    vec![col_rows, go_col_cols],
+                    false,
+                )?;
+
+                let gi_b = mm(&weight_2d, &go_cols_b)?;
+                let gi_data = gi_b.data()?;
+
+                let out_start = b * self.in_channels * l_in;
+                let copy_len = self.in_channels * l_in;
+                gi[out_start..out_start + copy_len].copy_from_slice(&gi_data[..copy_len]);
+            }
+
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(gi),
+                self.input.shape().to_vec(),
+                false,
+            )?)
+        } else {
+            None
+        };
+
+        // --- grad_weight ---
+        // grad_weight[c_in, c_out, kw] = sum_b input_b cross-correlated with grad_output_b
+        let grad_weight = if self.weight.requires_grad() {
+            let zero = <T as num_traits::Zero>::zero();
+            let weight_numel = self.in_channels * self.out_channels * k;
+            let mut gw = vec![zero; weight_numel];
+            let input_data = self.input.data_vec()?;
+
+            for b in 0..batch {
+                for ci in 0..self.in_channels {
+                    for co in 0..self.out_channels {
+                        for dw in 0..k {
+                            let mut acc = zero;
+                            for il in 0..l_in {
+                                let ow = il * s + dw;
+                                if ow >= p && (ow - p) < self.l_out {
+                                    let go_idx = b * self.out_channels * self.l_out
+                                        + co * self.l_out
+                                        + (ow - p);
+                                    let in_idx =
+                                        b * self.in_channels * l_in + ci * l_in + il;
+                                    acc += input_data[in_idx] * go_data[go_idx];
+                                }
+                            }
+                            gw[ci * self.out_channels * k + co * k + dw] += acc;
+                        }
+                    }
+                }
+            }
+
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(gw),
+                vec![self.in_channels, self.out_channels, k],
+                false,
+            )?)
+        } else {
+            None
+        };
+
+        // --- grad_bias ---
+        let grad_bias = match &self.bias {
+            Some(b) if b.requires_grad() => {
+                let zero = <T as num_traits::Zero>::zero();
+                let mut gb = vec![zero; self.out_channels];
+                for batch_idx in 0..batch {
+                    for c in 0..self.out_channels {
+                        for l in 0..self.l_out {
+                            gb[c] += go_data
+                                [batch_idx * self.out_channels * self.l_out + c * self.l_out + l];
+                        }
+                    }
+                }
+                Some(Tensor::from_storage(
+                    TensorStorage::cpu(gb),
+                    vec![self.out_channels],
+                    false,
+                )?)
+            }
+            _ => None,
+        };
+
+        let mut grads = vec![grad_input, grad_weight];
+        if self.bias.is_some() {
+            grads.push(grad_bias);
+        }
+        Ok(grads)
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        let mut v = vec![&self.input, &self.weight];
+        if let Some(ref b) = self.bias {
+            v.push(b);
+        }
+        v
+    }
+
+    fn name(&self) -> &'static str {
+        "ConvTranspose1dBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConvTranspose3d
+// ---------------------------------------------------------------------------
+
+/// A 3-D transposed convolution (deconvolution) layer.
+///
+/// Applies a transposed volumetric convolution over an input `[B, C_in, D, H, W]`.
+/// Used for upsampling in generative models and 3-D decoder networks.
+/// Equivalent to `torch.nn.ConvTranspose3d`.
+///
+/// # Implementation
+///
+/// The forward pass inserts `(stride - 1)` zeros between each input element
+/// along all three spatial axes (fractionally-strided convolution), then applies
+/// a standard 3-D convolution with the kernel flipped along all spatial axes.
+///
+/// # Shape
+///
+/// - Input: `[B, in_channels, D, H, W]`
+/// - Output: `[B, out_channels, D_out, H_out, W_out]`
+///
+/// where `D_out = (D - 1) * stride.0 - 2 * padding.0 + kernel_size.0 + output_padding.0`
+/// (and analogously for H and W).
+#[derive(Debug)]
+pub struct ConvTranspose3d<T: Float> {
+    /// Learnable kernel weights `[in_channels, out_channels, kD, kH, kW]`.
+    ///
+    /// Note: the channel ordering is transposed compared to `Conv3d`.
+    weight: Parameter<T>,
+    /// Optional learnable bias `[out_channels]`.
+    bias: Option<Parameter<T>>,
+    /// Number of input channels.
+    in_channels: usize,
+    /// Number of output channels.
+    out_channels: usize,
+    /// Kernel spatial size `(kD, kH, kW)`.
+    kernel_size: (usize, usize, usize),
+    /// Stride `(sD, sH, sW)`.
+    stride: (usize, usize, usize),
+    /// Zero-padding `(pD, pH, pW)` removed from both sides of the output.
+    padding: (usize, usize, usize),
+    /// Additional size added to one side of the output `(opD, opH, opW)`.
+    output_padding: (usize, usize, usize),
+    /// Whether the module is in training mode.
+    training: bool,
+}
+
+impl<T: Float> ConvTranspose3d<T> {
+    /// Create a new `ConvTranspose3d` layer.
+    ///
+    /// Weight is initialized with Kaiming uniform (ReLU gain).
+    /// Bias, if enabled, is initialized to zeros.
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        output_padding: (usize, usize, usize),
+        bias: bool,
+    ) -> FerrotorchResult<Self> {
+        if in_channels == 0 || out_channels == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "in_channels and out_channels must be > 0".into(),
+            });
+        }
+        if kernel_size.0 == 0 || kernel_size.1 == 0 || kernel_size.2 == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "kernel_size must be > 0 in all dimensions".into(),
+            });
+        }
+        if stride.0 == 0 || stride.1 == 0 || stride.2 == 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "stride must be > 0 in all dimensions".into(),
+            });
+        }
+        if output_padding.0 >= stride.0
+            || output_padding.1 >= stride.1
+            || output_padding.2 >= stride.2
+        {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "output_padding must be strictly less than stride in all dimensions"
+                    .into(),
+            });
+        }
+
+        // Weight shape: [in_channels, out_channels, kD, kH, kW]
+        let (kd, kh, kw) = kernel_size;
+        let mut weight = Parameter::zeros(&[in_channels, out_channels, kd, kh, kw])?;
+        kaiming_uniform(&mut weight, NonLinearity::ReLU)?;
+
+        let bias_param = if bias {
+            let mut b = Parameter::zeros(&[out_channels])?;
+            zeros_init(&mut b)?;
+            Some(b)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            weight,
+            bias: bias_param,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            training: true,
+        })
+    }
+
+    /// The number of learnable scalar parameters.
+    pub fn num_parameters(&self) -> usize {
+        let w = self.in_channels
+            * self.out_channels
+            * self.kernel_size.0
+            * self.kernel_size.1
+            * self.kernel_size.2;
+        let b = if self.bias.is_some() {
+            self.out_channels
+        } else {
+            0
+        };
+        w + b
+    }
+}
+
+/// Insert `(stride - 1)` zeros between each element along three spatial axes.
+///
+/// Given input `[B, C, D, H, W]`, produces `[B, C, D_up, H_up, W_up]` where
+/// `D_up = (D - 1) * stride_d + 1` (and analogously for H, W).
+fn stride_insert_zeros_3d<T: Float>(
+    input: &[T],
+    batch: usize,
+    channels: usize,
+    d: usize,
+    h: usize,
+    w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+) -> (Vec<T>, usize, usize, usize) {
+    let d_up = (d - 1) * stride_d + 1;
+    let h_up = (h - 1) * stride_h + 1;
+    let w_up = (w - 1) * stride_w + 1;
+    let zero = <T as num_traits::Zero>::zero();
+    let mut out = vec![zero; batch * channels * d_up * h_up * w_up];
+
+    for b in 0..batch {
+        for c in 0..channels {
+            for id in 0..d {
+                for ih in 0..h {
+                    for iw in 0..w {
+                        let od = id * stride_d;
+                        let oh = ih * stride_h;
+                        let ow = iw * stride_w;
+                        out[b * channels * d_up * h_up * w_up
+                            + c * d_up * h_up * w_up
+                            + od * h_up * w_up
+                            + oh * w_up
+                            + ow] = input[b * channels * d * h * w
+                            + c * d * h * w
+                            + id * h * w
+                            + ih * w
+                            + iw];
+                    }
+                }
+            }
+        }
+    }
+
+    (out, d_up, h_up, w_up)
+}
+
+/// Flip a 3-D kernel along all spatial axes and transpose channel dimensions:
+/// `kernel[c_in, c_out, kD, kH, kW]` ->
+/// `kernel[c_out, c_in, kD-1-kd, kH-1-kh, kW-1-kw]`.
+fn flip_kernel_3d<T: Float>(
+    kernel: &[T],
+    c_in: usize,
+    c_out: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+) -> Vec<T> {
+    let zero = <T as num_traits::Zero>::zero();
+    let mut flipped = vec![zero; c_out * c_in * kd * kh * kw];
+
+    for ci in 0..c_in {
+        for co in 0..c_out {
+            for dd in 0..kd {
+                for dh in 0..kh {
+                    for dw in 0..kw {
+                        // Source: [c_in, c_out, dd, dh, dw]
+                        let src = ci * c_out * kd * kh * kw
+                            + co * kd * kh * kw
+                            + dd * kh * kw
+                            + dh * kw
+                            + dw;
+                        // Dest: [c_out, c_in, kD-1-dd, kH-1-dh, kW-1-dw]
+                        let dst = co * c_in * kd * kh * kw
+                            + ci * kd * kh * kw
+                            + (kd - 1 - dd) * kh * kw
+                            + (kh - 1 - dh) * kw
+                            + (kw - 1 - dw);
+                        flipped[dst] = kernel[src];
+                    }
+                }
+            }
+        }
+    }
+
+    flipped
+}
+
+impl<T: Float> Module<T> for ConvTranspose3d<T> {
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // Record autocast decision for conv_transpose3d.
+        let _autocast_cat = autocast_guard("conv_transpose3d");
+
+        // Validate input shape: [B, C_in, D, H, W].
+        if input.ndim() != 5 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "ConvTranspose3d expects 5-D input [B, C, D, H, W], got {:?}",
+                    input.shape()
+                ),
+            });
+        }
+
+        let batch = input.shape()[0];
+        let c_in = input.shape()[1];
+        let d = input.shape()[2];
+        let h = input.shape()[3];
+        let w = input.shape()[4];
+
+        if c_in != self.in_channels {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "ConvTranspose3d: expected {} input channels, got {}",
+                    self.in_channels, c_in
+                ),
+            });
+        }
+
+        let (kd, kh, kw) = self.kernel_size;
+        let (sd, sh, sw) = self.stride;
+        let (pd, ph, pw) = self.padding;
+        let (opd, oph, opw) = self.output_padding;
+
+        // Save the input device so we can restore it on the output.
+        let input_device = input.device();
+
+        // Step 1: Insert zeros between input elements (stride insertion).
+        let input_data = input.data_vec()?;
+        let (upsampled, d_up, h_up, w_up) =
+            stride_insert_zeros_3d(&input_data, batch, c_in, d, h, w, sd, sh, sw);
+
+        // Step 2: Flip the kernel and transpose channel dimensions.
+        let weight_data = self.weight.data_vec()?;
+        let flipped = flip_kernel_3d(&weight_data, self.in_channels, self.out_channels, kd, kh, kw);
+
+        // Step 3: Apply a regular 3-D convolution on the upsampled input using the
+        // flipped kernel. The "padding" for this internal convolution is
+        // `kernel_size - 1 - padding` to achieve the correct output size.
+        let internal_pad_d = kd - 1 - pd;
+        let internal_pad_h = kh - 1 - ph;
+        let internal_pad_w = kw - 1 - pw;
+
+        // im2col_3d on the upsampled input with stride=1.
+        let (cols, col_rows, col_cols) = im2col_3d(
+            &upsampled,
+            batch,
+            c_in,
+            d_up,
+            h_up,
+            w_up,
+            kd,
+            kh,
+            kw,
+            1,
+            1,
+            1,
+            internal_pad_d,
+            internal_pad_h,
+            internal_pad_w,
+        );
+
+        // Base output sizes from the internal convolution.
+        let d_out_base = (d_up + 2 * internal_pad_d - kd) + 1;
+        let h_out_base = (h_up + 2 * internal_pad_h - kh) + 1;
+        let w_out_base = (w_up + 2 * internal_pad_w - kw) + 1;
+
+        // The final output size includes output_padding.
+        let d_out = d_out_base + opd;
+        let h_out = h_out_base + oph;
+        let w_out = w_out_base + opw;
+
+        // Reshape flipped kernel to 2-D: [C_out, C_in * kD * kH * kW]
+        let flipped_2d = Tensor::from_storage(
+            TensorStorage::cpu(flipped),
+            vec![self.out_channels, col_rows],
+            false,
+        )?;
+
+        // Per-batch matmul.
+        let zero = <T as num_traits::Zero>::zero();
+        let spatial_out = d_out * h_out * w_out;
+        let spatial_base = d_out_base * h_out_base * w_out_base;
+        let mut output = vec![zero; batch * self.out_channels * spatial_out];
+
+        for b in 0..batch {
+            let col_start = b * col_rows * col_cols;
+            let col_end = col_start + col_rows * col_cols;
+            let cols_b = Tensor::from_storage(
+                TensorStorage::cpu(cols[col_start..col_end].to_vec()),
+                vec![col_rows, col_cols],
+                false,
+            )?;
+
+            let out_b = mm(&flipped_2d, &cols_b)?;
+            let out_data = out_b.data()?;
+
+            // Copy the base convolution result; extra output_padding positions
+            // remain zero (which is correct by definition).
+            let out_start = b * self.out_channels * spatial_out;
+            for c in 0..self.out_channels {
+                for od in 0..d_out_base {
+                    for oh in 0..h_out_base {
+                        for ow in 0..w_out_base {
+                            output[out_start
+                                + c * spatial_out
+                                + od * h_out * w_out
+                                + oh * w_out
+                                + ow] = out_data
+                                [c * spatial_base + od * h_out_base * w_out_base + oh * w_out_base + ow];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add bias if present.
+        if let Some(ref bias) = self.bias {
+            let bias_data = bias.data_vec()?;
+            for b in 0..batch {
+                for c in 0..self.out_channels {
+                    let bval = bias_data[c];
+                    for s in 0..spatial_out {
+                        output[b * self.out_channels * spatial_out + c * spatial_out + s] += bval;
+                    }
+                }
+            }
+        }
+
+        let result = Tensor::from_storage(
+            TensorStorage::cpu(output),
+            vec![batch, self.out_channels, d_out, h_out, w_out],
+            false,
+        )?;
+
+        // Attach backward if gradients are enabled.
+        if is_grad_enabled()
+            && (input.requires_grad()
+                || self.weight.requires_grad()
+                || self.bias.as_ref().is_some_and(|b| b.requires_grad()))
+        {
+            let grad_fn = Arc::new(ConvTranspose3dBackward {
+                input: input.clone(),
+                weight: self.weight.tensor().clone(),
+                bias: self.bias.as_ref().map(|b| b.tensor().clone()),
+                in_channels: self.in_channels,
+                out_channels: self.out_channels,
+                kernel_size: self.kernel_size,
+                stride: self.stride,
+                padding: self.padding,
+                _output_padding: self.output_padding,
+                d_out,
+                h_out,
+                w_out,
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(result.data()?.to_vec()),
+                result.shape().to_vec(),
+                grad_fn,
+            )?
+            .to(input_device) // restore device
+        } else {
+            result.to(input_device)
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        let mut params = vec![&self.weight];
+        if let Some(ref b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        let mut params = vec![&mut self.weight];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        let mut params = vec![("weight".to_string(), &self.weight)];
+        if let Some(ref b) = self.bias {
+            params.push(("bias".to_string(), b));
+        }
+        params
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConvTranspose3dBackward
+// ---------------------------------------------------------------------------
+
+/// Backward function for `ConvTranspose3d` forward pass.
+///
+/// The backward of a transposed 3-D convolution is a regular 3-D convolution.
+#[derive(Debug)]
+struct ConvTranspose3dBackward<T: Float> {
+    input: Tensor<T>,
+    weight: Tensor<T>,
+    bias: Option<Tensor<T>>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: (usize, usize, usize),
+    stride: (usize, usize, usize),
+    padding: (usize, usize, usize),
+    _output_padding: (usize, usize, usize),
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+}
+
+impl<T: Float> GradFn<T> for ConvTranspose3dBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        // grad_output shape: [B, C_out, D_out, H_out, W_out]
+        let go_data = grad_output.data_vec()?;
+        let batch = self.input.shape()[0];
+        let d_in = self.input.shape()[2];
+        let h_in = self.input.shape()[3];
+        let w_in = self.input.shape()[4];
+        let (kd, kh, kw) = self.kernel_size;
+        let (sd, sh, sw) = self.stride;
+        let (pd, ph, pw) = self.padding;
+        let spatial_out = self.d_out * self.h_out * self.w_out;
+
+        // --- grad_input ---
+        // The backward of ConvTranspose3d w.r.t. input is a regular Conv3d
+        // of grad_output with the original (non-flipped) weight.
+        let grad_input = if self.input.requires_grad() {
+            let weight_data = self.weight.data_vec()?;
+            let col_rows = self.out_channels * kd * kh * kw;
+
+            // Reshape weight to [C_in, C_out * kD * kH * kW]
+            let weight_2d = Tensor::from_storage(
+                TensorStorage::cpu(weight_data),
+                vec![self.in_channels, col_rows],
+                false,
+            )?;
+
+            // im2col_3d on grad_output with the conv parameters
+            let (go_cols, _go_col_rows, go_col_cols) = im2col_3d(
+                &go_data,
+                batch,
+                self.out_channels,
+                self.d_out,
+                self.h_out,
+                self.w_out,
+                kd,
+                kh,
+                kw,
+                sd,
+                sh,
+                sw,
+                pd,
+                ph,
+                pw,
+            );
+
+            let zero = <T as num_traits::Zero>::zero();
+            let spatial_in = d_in * h_in * w_in;
+            let mut gi = vec![zero; batch * self.in_channels * spatial_in];
+
+            for b in 0..batch {
+                let col_start = b * col_rows * go_col_cols;
+                let col_end = col_start + col_rows * go_col_cols;
+                let go_cols_b = Tensor::from_storage(
+                    TensorStorage::cpu(go_cols[col_start..col_end].to_vec()),
+                    vec![col_rows, go_col_cols],
+                    false,
+                )?;
+
+                let gi_b = mm(&weight_2d, &go_cols_b)?;
+                let gi_data = gi_b.data()?;
+
+                let out_start = b * self.in_channels * spatial_in;
+                let copy_len = self.in_channels * spatial_in;
+                gi[out_start..out_start + copy_len].copy_from_slice(&gi_data[..copy_len]);
+            }
+
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(gi),
+                self.input.shape().to_vec(),
+                false,
+            )?)
+        } else {
+            None
+        };
+
+        // --- grad_weight ---
+        // grad_weight[c_in, c_out, kd, kh, kw] = sum_b input_b (x) grad_output_b
+        let grad_weight = if self.weight.requires_grad() {
+            let zero = <T as num_traits::Zero>::zero();
+            let weight_numel = self.in_channels * self.out_channels * kd * kh * kw;
+            let mut gw = vec![zero; weight_numel];
+            let input_data = self.input.data_vec()?;
+            let spatial_in = d_in * h_in * w_in;
+
+            for b in 0..batch {
+                for ci in 0..self.in_channels {
+                    for co in 0..self.out_channels {
+                        for dd in 0..kd {
+                            for dh in 0..kh {
+                                for dw in 0..kw {
+                                    let mut acc = zero;
+                                    for id in 0..d_in {
+                                        for ih in 0..h_in {
+                                            for iw in 0..w_in {
+                                                let od = id * sd + dd;
+                                                let oh = ih * sh + dh;
+                                                let ow = iw * sw + dw;
+                                                if od >= pd
+                                                    && oh >= ph
+                                                    && ow >= pw
+                                                    && (od - pd) < self.d_out
+                                                    && (oh - ph) < self.h_out
+                                                    && (ow - pw) < self.w_out
+                                                {
+                                                    let go_idx = b * self.out_channels * spatial_out
+                                                        + co * spatial_out
+                                                        + (od - pd) * self.h_out * self.w_out
+                                                        + (oh - ph) * self.w_out
+                                                        + (ow - pw);
+                                                    let in_idx =
+                                                        b * self.in_channels * spatial_in
+                                                            + ci * spatial_in
+                                                            + id * h_in * w_in
+                                                            + ih * w_in
+                                                            + iw;
+                                                    acc += input_data[in_idx] * go_data[go_idx];
+                                                }
+                                            }
+                                        }
+                                    }
+                                    gw[ci * self.out_channels * kd * kh * kw
+                                        + co * kd * kh * kw
+                                        + dd * kh * kw
+                                        + dh * kw
+                                        + dw] += acc;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(gw),
+                vec![self.in_channels, self.out_channels, kd, kh, kw],
+                false,
+            )?)
+        } else {
+            None
+        };
+
+        // --- grad_bias ---
+        let grad_bias = match &self.bias {
+            Some(b) if b.requires_grad() => {
+                let zero = <T as num_traits::Zero>::zero();
+                let mut gb = vec![zero; self.out_channels];
+                for batch_idx in 0..batch {
+                    for c in 0..self.out_channels {
+                        for s in 0..spatial_out {
+                            gb[c] += go_data
+                                [batch_idx * self.out_channels * spatial_out + c * spatial_out + s];
+                        }
+                    }
+                }
+                Some(Tensor::from_storage(
+                    TensorStorage::cpu(gb),
+                    vec![self.out_channels],
+                    false,
+                )?)
+            }
+            _ => None,
+        };
+
+        let mut grads = vec![grad_input, grad_weight];
+        if self.bias.is_some() {
+            grads.push(grad_bias);
+        }
+        Ok(grads)
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        let mut v = vec![&self.input, &self.weight];
+        if let Some(ref b) = self.bias {
+            v.push(b);
+        }
+        v
+    }
+
+    fn name(&self) -> &'static str {
+        "ConvTranspose3dBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2526,6 +4279,663 @@ mod tests {
             ConvTranspose2d::<f32>::new(8, 16, (3, 3), (2, 2), (1, 1), (0, 0), true).unwrap();
         // weight: 8 * 16 * 3 * 3 = 1152, bias: 16, total: 1168
         assert_eq!(conv.num_parameters(), 1168);
+        assert_eq!(conv.parameters().len(), 2);
+    }
+
+    // ===================================================================
+    // Conv3d tests
+    // ===================================================================
+
+    // -----------------------------------------------------------------------
+    // Conv3d: output shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv3d_output_shape_no_padding() {
+        // Input: [1, 1, 5, 5, 5], kernel 3x3x3, stride 1, padding 0
+        // D_out = (5 - 3) / 1 + 1 = 3
+        let conv = Conv3d::<f32>::new(1, 4, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).unwrap();
+        let input = t(&vec![0.0; 1 * 1 * 5 * 5 * 5], &[1, 1, 5, 5, 5]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 4, 3, 3, 3]);
+    }
+
+    #[test]
+    fn test_conv3d_output_shape_with_padding() {
+        // Input: [2, 3, 8, 8, 8], kernel 3x3x3, stride 1, padding 1
+        // D_out = (8 + 2 - 3) / 1 + 1 = 8
+        let conv = Conv3d::<f32>::new(3, 16, (3, 3, 3), (1, 1, 1), (1, 1, 1), true).unwrap();
+        let input = t(&vec![0.0; 2 * 3 * 8 * 8 * 8], &[2, 3, 8, 8, 8]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[2, 16, 8, 8, 8]);
+    }
+
+    #[test]
+    fn test_conv3d_output_shape_with_stride() {
+        // Input: [1, 1, 6, 6, 6], kernel 3x3x3, stride 2, padding 0
+        // D_out = (6 - 3) / 2 + 1 = 2
+        let conv = Conv3d::<f32>::new(1, 4, (3, 3, 3), (2, 2, 2), (0, 0, 0), false).unwrap();
+        let input = t(&vec![0.0; 1 * 1 * 6 * 6 * 6], &[1, 1, 6, 6, 6]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 4, 2, 2, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv3d: 1x1x1 kernel correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv3d_1x1x1_kernel_correctness() {
+        // weight: [2, 1, 1, 1, 1] = [3.0, 5.0]
+        // input:  [1, 1, 2, 1, 1] = [1.0, 2.0]
+        // output: [1, 2, 2, 1, 1]
+        //   out_ch 0: [3.0, 6.0]
+        //   out_ch 1: [5.0, 10.0]
+        let weight_data = vec![3.0f32, 5.0];
+        let conv = Conv3d {
+            weight: Parameter::from_slice(&weight_data, &[2, 1, 1, 1, 1]).unwrap(),
+            bias: None,
+            in_channels: 1,
+            out_channels: 2,
+            kernel_size: (1, 1, 1),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            training: false,
+        };
+
+        let input = t(&[1.0, 2.0], &[1, 1, 2, 1, 1]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 2, 2, 1, 1]);
+        assert_close(
+            output.data().unwrap(),
+            &[3.0, 6.0, 5.0, 10.0],
+            1e-5,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv3d: forward correctness with a 3x3x3 kernel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv3d_3x3x3_kernel_forward() {
+        // Input: [1, 1, 3, 3, 3] (all ones), kernel: [1, 1, 3, 3, 3] (all ones)
+        // Output: [1, 1, 1, 1, 1] = sum of 27 ones = 27.0
+        let input_data = vec![1.0f32; 27];
+        let weight_data = vec![1.0f32; 27];
+        let conv = Conv3d {
+            weight: Parameter::from_slice(&weight_data, &[1, 1, 3, 3, 3]).unwrap(),
+            bias: None,
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: (3, 3, 3),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            training: false,
+        };
+
+        let input = t(&input_data, &[1, 1, 3, 3, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 1, 1, 1]);
+        assert_close(output.data().unwrap(), &[27.0], 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv3d: bias
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv3d_bias() {
+        let conv = Conv3d {
+            weight: Parameter::from_slice(&[1.0f32], &[1, 1, 1, 1, 1]).unwrap(),
+            bias: Some(Parameter::from_slice(&[10.0f32], &[1]).unwrap()),
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: (1, 1, 1),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            training: false,
+        };
+
+        let input = t(&[2.0, 3.0], &[1, 1, 2, 1, 1]);
+        let output = conv.forward(&input).unwrap();
+        assert_close(output.data().unwrap(), &[12.0, 13.0], 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv3d: backward produces correct shapes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv3d_backward_produces_correct_shapes() {
+        let weight_data = vec![1.0f32; 2 * 1 * 3 * 3 * 3]; // [2, 1, 3, 3, 3]
+        let input_data = vec![1.0f32; 1 * 1 * 5 * 5 * 5]; // [1, 1, 5, 5, 5]
+        let bias_data = vec![0.0f32; 2];
+
+        let conv = Conv3d {
+            weight: Parameter::from_slice(&weight_data, &[2, 1, 3, 3, 3]).unwrap(),
+            bias: Some(Parameter::from_slice(&bias_data, &[2]).unwrap()),
+            in_channels: 1,
+            out_channels: 2,
+            kernel_size: (3, 3, 3),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            training: false,
+        };
+
+        let input = leaf(&input_data, &[1, 1, 5, 5, 5]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 2, 3, 3, 3]);
+        assert!(output.grad_fn().is_some());
+        assert_eq!(output.grad_fn().unwrap().name(), "Conv3dBackward");
+
+        let grad_output = t(&vec![1.0; 2 * 3 * 3 * 3], &[1, 2, 3, 3, 3]);
+        let grads = output.grad_fn().unwrap().backward(&grad_output).unwrap();
+
+        assert!(grads[0].is_some());
+        assert_eq!(grads[0].as_ref().unwrap().shape(), &[1, 1, 5, 5, 5]);
+        assert!(grads[1].is_some());
+        assert_eq!(grads[1].as_ref().unwrap().shape(), &[2, 1, 3, 3, 3]);
+        assert!(grads[2].is_some());
+        assert_eq!(grads[2].as_ref().unwrap().shape(), &[2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv3d: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv3d_invalid_ndim() {
+        let conv = Conv3d::<f32>::new(1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).unwrap();
+        let input = t(&vec![0.0; 25], &[1, 1, 5, 5]);
+        assert!(conv.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_conv3d_channel_mismatch() {
+        let conv = Conv3d::<f32>::new(3, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).unwrap();
+        let input = t(&vec![0.0; 1 * 1 * 5 * 5 * 5], &[1, 1, 5, 5, 5]);
+        assert!(conv.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_conv3d_zero_channels_rejected() {
+        assert!(Conv3d::<f32>::new(0, 16, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).is_err());
+        assert!(Conv3d::<f32>::new(3, 0, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).is_err());
+    }
+
+    #[test]
+    fn test_conv3d_zero_kernel_rejected() {
+        assert!(Conv3d::<f32>::new(1, 1, (0, 3, 3), (1, 1, 1), (0, 0, 0), false).is_err());
+    }
+
+    #[test]
+    fn test_conv3d_zero_stride_rejected() {
+        assert!(Conv3d::<f32>::new(1, 1, (3, 3, 3), (0, 1, 1), (0, 0, 0), false).is_err());
+    }
+
+    #[test]
+    fn test_conv3d_parameter_count() {
+        let conv = Conv3d::<f32>::new(3, 8, (3, 3, 3), (1, 1, 1), (0, 0, 0), true).unwrap();
+        // weight: 8 * 3 * 3 * 3 * 3 = 648, bias: 8, total: 656
+        assert_eq!(conv.num_parameters(), 656);
+        assert_eq!(conv.parameters().len(), 2);
+    }
+
+    #[test]
+    fn test_conv3d_named_parameters() {
+        let conv = Conv3d::<f32>::new(1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), true).unwrap();
+        let named = conv.named_parameters();
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[0].0, "weight");
+        assert_eq!(named[1].0, "bias");
+    }
+
+    // ===================================================================
+    // ConvTranspose1d tests
+    // ===================================================================
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose1d: output shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose1d_output_shape_basic() {
+        // Input: [1, 1, 5], kernel 3, stride 1, padding 0, output_padding 0
+        // L_out = (5 - 1) * 1 - 0 + 3 + 0 = 7
+        let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 1, 0, 0, false).unwrap();
+        let input = t(&vec![0.0; 5], &[1, 1, 5]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 7]);
+    }
+
+    #[test]
+    fn test_conv_transpose1d_output_shape_stride2() {
+        // Input: [1, 1, 3], kernel 3, stride 2, padding 0, output_padding 0
+        // L_out = (3 - 1) * 2 - 0 + 3 + 0 = 7
+        let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 2, 0, 0, false).unwrap();
+        let input = t(&vec![0.0; 3], &[1, 1, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 7]);
+    }
+
+    #[test]
+    fn test_conv_transpose1d_output_shape_with_padding() {
+        // Input: [1, 1, 5], kernel 3, stride 2, padding 1, output_padding 0
+        // L_out = (5 - 1) * 2 - 2 + 3 + 0 = 9
+        let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 2, 1, 0, false).unwrap();
+        let input = t(&vec![0.0; 5], &[1, 1, 5]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 9]);
+    }
+
+    #[test]
+    fn test_conv_transpose1d_output_shape_with_output_padding() {
+        // Input: [1, 1, 5], kernel 3, stride 2, padding 1, output_padding 1
+        // L_out = (5 - 1) * 2 - 2 + 3 + 1 = 10
+        let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 2, 1, 1, false).unwrap();
+        let input = t(&vec![0.0; 5], &[1, 1, 5]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 10]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose1d: 1x1 kernel correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose1d_1x1_kernel() {
+        // With a kernel_size=1, stride 1, no padding, the transposed conv is
+        // a per-position linear transform with channels transposed.
+        // weight shape: [1, 2, 1] (in_channels=1, out_channels=2, k=1)
+        let weight_data = vec![3.0f32, 7.0]; // [1, 2, 1]
+        let conv = ConvTranspose1d {
+            weight: Parameter::from_slice(&weight_data, &[1, 2, 1]).unwrap(),
+            bias: None,
+            in_channels: 1,
+            out_channels: 2,
+            kernel_size: 1,
+            stride: 1,
+            padding: 0,
+            output_padding: 0,
+            training: false,
+        };
+
+        let input = t(&[1.0, 2.0, 3.0], &[1, 1, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 2, 3]);
+
+        // out_ch 0: input * 3 = [3, 6, 9]
+        // out_ch 1: input * 7 = [7, 14, 21]
+        assert_close(
+            output.data().unwrap(),
+            &[3.0, 6.0, 9.0, 7.0, 14.0, 21.0],
+            1e-5,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose1d: stride=2 correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose1d_stride2_correctness() {
+        // Input: [1, 1, 2] = [1, 2]
+        // Kernel: [1, 1, 2] = [1, 1] (all ones)
+        // Stride=2, padding=0, output_padding=0
+        // L_out = (2-1)*2 + 2 = 4
+        //
+        // Stride insertion produces [1, 0, 2]
+        // Flipped kernel (all ones): [1, 1]
+        // Internal conv with pad = 2-1 = 1, stride=1 on [1, 0, 2]:
+        // Padded to [0, 1, 0, 2, 0]
+        // Convolve with [1, 1] kernel, output 4:
+        //   pos 0: 0+1 = 1
+        //   pos 1: 1+0 = 1
+        //   pos 2: 0+2 = 2
+        //   pos 3: 2+0 = 2
+        let weight_data = vec![1.0f32; 2]; // [1, 1, 2]
+        let conv = ConvTranspose1d {
+            weight: Parameter::from_slice(&weight_data, &[1, 1, 2]).unwrap(),
+            bias: None,
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: 2,
+            stride: 2,
+            padding: 0,
+            output_padding: 0,
+            training: false,
+        };
+
+        let input = t(&[1.0, 2.0], &[1, 1, 2]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 4]);
+        assert_close(output.data().unwrap(), &[1.0, 1.0, 2.0, 2.0], 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose1d: bias
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose1d_bias() {
+        let conv = ConvTranspose1d {
+            weight: Parameter::from_slice(&[1.0f32], &[1, 1, 1]).unwrap(),
+            bias: Some(Parameter::from_slice(&[5.0f32], &[1]).unwrap()),
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: 1,
+            stride: 1,
+            padding: 0,
+            output_padding: 0,
+            training: false,
+        };
+
+        let input = t(&[1.0, 2.0, 3.0], &[1, 1, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_close(output.data().unwrap(), &[6.0, 7.0, 8.0], 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose1d: backward produces gradients
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose1d_backward_produces_gradients() {
+        let weight_data = vec![1.0f32; 1 * 1 * 3]; // [1, 1, 3]
+        let bias_data = vec![0.0f32; 1];
+
+        let conv = ConvTranspose1d {
+            weight: Parameter::from_slice(&weight_data, &[1, 1, 3]).unwrap(),
+            bias: Some(Parameter::from_slice(&bias_data, &[1]).unwrap()),
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: 3,
+            stride: 1,
+            padding: 0,
+            output_padding: 0,
+            training: false,
+        };
+
+        let input = leaf(&[1.0f32, 2.0, 3.0], &[1, 1, 3]);
+        let output = conv.forward(&input).unwrap();
+        // L_out = (3 - 1) * 1 - 0 + 3 + 0 = 5
+        assert_eq!(output.shape(), &[1, 1, 5]);
+        assert!(output.grad_fn().is_some());
+        assert_eq!(output.grad_fn().unwrap().name(), "ConvTranspose1dBackward");
+
+        let grad_output = t(&vec![1.0; 5], &[1, 1, 5]);
+        let grads = output.grad_fn().unwrap().backward(&grad_output).unwrap();
+
+        // grad_input shape: [1, 1, 3]
+        assert!(grads[0].is_some());
+        assert_eq!(grads[0].as_ref().unwrap().shape(), &[1, 1, 3]);
+        // grad_weight shape: [1, 1, 3]
+        assert!(grads[1].is_some());
+        assert_eq!(grads[1].as_ref().unwrap().shape(), &[1, 1, 3]);
+        // grad_bias shape: [1]
+        assert!(grads[2].is_some());
+        assert_eq!(grads[2].as_ref().unwrap().shape(), &[1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose1d: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose1d_invalid_ndim() {
+        let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 1, 0, 0, false).unwrap();
+        let input = t(&vec![0.0; 4], &[1, 1, 2, 2]);
+        assert!(conv.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_conv_transpose1d_channel_mismatch() {
+        let conv = ConvTranspose1d::<f32>::new(3, 1, 3, 1, 0, 0, false).unwrap();
+        let input = t(&vec![0.0; 10], &[1, 1, 10]);
+        assert!(conv.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_conv_transpose1d_zero_channels_rejected() {
+        assert!(ConvTranspose1d::<f32>::new(0, 1, 3, 1, 0, 0, false).is_err());
+        assert!(ConvTranspose1d::<f32>::new(1, 0, 3, 1, 0, 0, false).is_err());
+    }
+
+    #[test]
+    fn test_conv_transpose1d_output_padding_too_large() {
+        assert!(ConvTranspose1d::<f32>::new(1, 1, 3, 2, 0, 2, false).is_err());
+    }
+
+    #[test]
+    fn test_conv_transpose1d_parameter_count() {
+        let conv = ConvTranspose1d::<f32>::new(8, 16, 5, 2, 1, 0, true).unwrap();
+        // weight: 8 * 16 * 5 = 640, bias: 16, total: 656
+        assert_eq!(conv.num_parameters(), 656);
+        assert_eq!(conv.parameters().len(), 2);
+    }
+
+    // ===================================================================
+    // ConvTranspose3d tests
+    // ===================================================================
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose3d: output shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose3d_output_shape_basic() {
+        // Input: [1, 1, 3, 3, 3], kernel 3x3x3, stride 1, padding 0, output_padding 0
+        // D_out = (3 - 1) * 1 - 0 + 3 + 0 = 5
+        let conv = ConvTranspose3d::<f32>::new(
+            1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 27], &[1, 1, 3, 3, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 5, 5, 5]);
+    }
+
+    #[test]
+    fn test_conv_transpose3d_output_shape_stride2() {
+        // Input: [1, 1, 2, 2, 2], kernel 3x3x3, stride 2, padding 0, output_padding 0
+        // D_out = (2 - 1) * 2 - 0 + 3 + 0 = 5
+        let conv = ConvTranspose3d::<f32>::new(
+            1, 1, (3, 3, 3), (2, 2, 2), (0, 0, 0), (0, 0, 0), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 8], &[1, 1, 2, 2, 2]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 5, 5, 5]);
+    }
+
+    #[test]
+    fn test_conv_transpose3d_output_shape_with_padding() {
+        // Input: [1, 1, 3, 3, 3], kernel 3x3x3, stride 2, padding 1, output_padding 0
+        // D_out = (3 - 1) * 2 - 2 + 3 + 0 = 5
+        let conv = ConvTranspose3d::<f32>::new(
+            1, 1, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 27], &[1, 1, 3, 3, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 5, 5, 5]);
+    }
+
+    #[test]
+    fn test_conv_transpose3d_output_shape_with_output_padding() {
+        // Input: [1, 1, 3, 3, 3], kernel 3x3x3, stride 2, padding 1, output_padding 1
+        // D_out = (3 - 1) * 2 - 2 + 3 + 1 = 6
+        let conv = ConvTranspose3d::<f32>::new(
+            1, 1, (3, 3, 3), (2, 2, 2), (1, 1, 1), (1, 1, 1), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 27], &[1, 1, 3, 3, 3]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 6, 6, 6]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose3d: stride=2 upsamples (doubles spatial dims)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose3d_stride2_upsamples() {
+        // With stride=2, kernel=2x2x2, padding=0, output_padding=0:
+        // D_out = (D - 1) * 2 + 2 = 2 * D
+        let conv = ConvTranspose3d::<f32>::new(
+            1, 1, (2, 2, 2), (2, 2, 2), (0, 0, 0), (0, 0, 0), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 1 * 1 * 4 * 4 * 4], &[1, 1, 4, 4, 4]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 8, 8, 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose3d: 1x1x1 kernel correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose3d_1x1x1_kernel() {
+        // weight shape: [in=1, out=2, 1, 1, 1]
+        let weight_data = vec![3.0f32, 7.0]; // [1, 2, 1, 1, 1]
+        let conv = ConvTranspose3d {
+            weight: Parameter::from_slice(&weight_data, &[1, 2, 1, 1, 1]).unwrap(),
+            bias: None,
+            in_channels: 1,
+            out_channels: 2,
+            kernel_size: (1, 1, 1),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            output_padding: (0, 0, 0),
+            training: false,
+        };
+
+        let input = t(&[1.0, 2.0], &[1, 1, 2, 1, 1]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 2, 2, 1, 1]);
+        assert_close(
+            output.data().unwrap(),
+            &[3.0, 6.0, 7.0, 14.0],
+            1e-5,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose3d: bias
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose3d_bias() {
+        let conv = ConvTranspose3d {
+            weight: Parameter::from_slice(&[1.0f32], &[1, 1, 1, 1, 1]).unwrap(),
+            bias: Some(Parameter::from_slice(&[5.0f32], &[1]).unwrap()),
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: (1, 1, 1),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            output_padding: (0, 0, 0),
+            training: false,
+        };
+
+        let input = t(&[1.0, 2.0], &[1, 1, 2, 1, 1]);
+        let output = conv.forward(&input).unwrap();
+        assert_close(output.data().unwrap(), &[6.0, 7.0], 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose3d: backward produces gradients
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose3d_backward_produces_gradients() {
+        let weight_data = vec![1.0f32; 1 * 1 * 2 * 2 * 2]; // [1, 1, 2, 2, 2]
+        let bias_data = vec![0.0f32; 1];
+
+        let conv = ConvTranspose3d {
+            weight: Parameter::from_slice(&weight_data, &[1, 1, 2, 2, 2]).unwrap(),
+            bias: Some(Parameter::from_slice(&bias_data, &[1]).unwrap()),
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: (2, 2, 2),
+            stride: (1, 1, 1),
+            padding: (0, 0, 0),
+            output_padding: (0, 0, 0),
+            training: false,
+        };
+
+        // D_out = (2-1)*1 - 0 + 2 + 0 = 3
+        let input = leaf(&vec![1.0f32; 8], &[1, 1, 2, 2, 2]);
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 1, 3, 3, 3]);
+        assert!(output.grad_fn().is_some());
+        assert_eq!(output.grad_fn().unwrap().name(), "ConvTranspose3dBackward");
+
+        let grad_output = t(&vec![1.0; 27], &[1, 1, 3, 3, 3]);
+        let grads = output.grad_fn().unwrap().backward(&grad_output).unwrap();
+
+        assert!(grads[0].is_some());
+        assert_eq!(grads[0].as_ref().unwrap().shape(), &[1, 1, 2, 2, 2]);
+        assert!(grads[1].is_some());
+        assert_eq!(grads[1].as_ref().unwrap().shape(), &[1, 1, 2, 2, 2]);
+        assert!(grads[2].is_some());
+        assert_eq!(grads[2].as_ref().unwrap().shape(), &[1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvTranspose3d: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv_transpose3d_invalid_ndim() {
+        let conv = ConvTranspose3d::<f32>::new(
+            1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 25], &[1, 1, 5, 5]);
+        assert!(conv.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_conv_transpose3d_channel_mismatch() {
+        let conv = ConvTranspose3d::<f32>::new(
+            3, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
+        )
+        .unwrap();
+        let input = t(&vec![0.0; 1 * 1 * 5 * 5 * 5], &[1, 1, 5, 5, 5]);
+        assert!(conv.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_conv_transpose3d_zero_channels_rejected() {
+        assert!(
+            ConvTranspose3d::<f32>::new(0, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false)
+                .is_err()
+        );
+        assert!(
+            ConvTranspose3d::<f32>::new(1, 0, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_conv_transpose3d_output_padding_too_large() {
+        assert!(
+            ConvTranspose3d::<f32>::new(1, 1, (3, 3, 3), (2, 2, 2), (0, 0, 0), (2, 2, 2), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_conv_transpose3d_parameter_count() {
+        let conv = ConvTranspose3d::<f32>::new(
+            8, 16, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0), true,
+        )
+        .unwrap();
+        // weight: 8 * 16 * 3 * 3 * 3 = 3456, bias: 16, total: 3472
+        assert_eq!(conv.num_parameters(), 3472);
         assert_eq!(conv.parameters().len(), 2);
     }
 }

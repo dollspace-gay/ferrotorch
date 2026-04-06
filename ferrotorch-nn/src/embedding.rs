@@ -27,6 +27,12 @@ fn is_f32<T: Float>() -> bool {
     TypeId::of::<T>() == TypeId::of::<f32>()
 }
 
+/// Returns `true` if `T` is `f64`.
+#[inline]
+fn is_f64<T: Float>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<f64>()
+}
+
 /// Upload a CPU `&[f32]` slice to a GPU buffer on the given device ordinal.
 fn upload_f32_to_gpu(data: &[f32], ordinal: usize) -> FerrotorchResult<GpuBufferHandle> {
     let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
@@ -69,46 +75,35 @@ impl<T: Float> GradFn<T> for EmbeddingBackward<T> {
         }
 
         let dim = self.embedding_dim;
-        let device = self.weight.device();
 
-        // GPU fast path: scatter-add rows entirely on GPU for f32 tensors.
-        if grad_output.is_cuda() && is_f32::<T>() {
+        // GPU fast path: scatter-add rows entirely on GPU for f32/f64 tensors.
+        if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
-            let ordinal = match device {
+            let ordinal = match self.weight.device() {
                 Device::Cuda(o) => o,
                 _ => unreachable!(),
             };
 
-            // Upload indices as f32 to GPU (small: N * 4 bytes).
             let indices_f32: Vec<f32> = self.indices.iter().map(|&i| i as f32).collect();
             let idx_handle = upload_f32_to_gpu(&indices_f32, ordinal)?;
-
             let go_handle = grad_output.gpu_handle()?;
+            let f64_path = is_f64::<T>();
+            let elem_size: usize = if f64_path { 8 } else { 4 };
 
-            // Scatter-add rows on GPU: grad_weight[indices[i], :] += grad_output[i, :]
-            let mut gw_handle =
-                backend.scatter_add_rows_f32(go_handle, &idx_handle, self.num_embeddings, dim)?;
+            let mut gw_handle = if f64_path {
+                backend.scatter_add_rows_f64(go_handle, &idx_handle, self.num_embeddings, dim)?
+            } else {
+                backend.scatter_add_rows_f32(go_handle, &idx_handle, self.num_embeddings, dim)?
+            };
 
-            // If padding_idx is set, zero that row's gradient.
-            // Upload a zero row and overwrite via the backend.
             if let Some(pad_idx) = self.padding_idx {
-                // Zero out the padding row by downloading, zeroing, re-uploading.
-                // This is a single row (dim * 4 bytes), so acceptable.
                 let mut gw_bytes = backend.gpu_to_cpu(&gw_handle)?;
-                let gw_f32: &mut [f32] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        gw_bytes.as_mut_ptr() as *mut f32,
-                        gw_bytes.len() / 4,
-                    )
-                };
-                let start = pad_idx * dim;
-                for v in &mut gw_f32[start..start + dim] {
-                    *v = 0.0;
+                let start_byte = pad_idx * dim * elem_size;
+                let end_byte = start_byte + dim * elem_size;
+                for b in &mut gw_bytes[start_byte..end_byte] {
+                    *b = 0;
                 }
-                let upload_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(gw_f32.as_ptr() as *const u8, gw_f32.len() * 4)
-                };
-                gw_handle = backend.cpu_to_gpu(upload_bytes, 4, ordinal)?;
+                gw_handle = backend.cpu_to_gpu(&gw_bytes, elem_size, ordinal)?;
             }
 
             let grad_tensor = Tensor::from_storage(
@@ -119,7 +114,13 @@ impl<T: Float> GradFn<T> for EmbeddingBackward<T> {
             return Ok(vec![Some(grad_tensor)]);
         }
 
-        let go_data = grad_output.data_vec()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "EmbeddingBackward",
+            });
+        }
+
+        let go_data = grad_output.data()?;
 
         // Allocate a full-size gradient for the weight matrix, initialized to zero.
         let mut grad_weight = vec![<T as num_traits::Zero>::zero(); self.num_embeddings * dim];
@@ -142,18 +143,11 @@ impl<T: Float> GradFn<T> for EmbeddingBackward<T> {
             }
         }
 
-        let grad_tensor = Tensor::from_storage(
+        Ok(vec![Some(Tensor::from_storage(
             TensorStorage::cpu(grad_weight),
             vec![self.num_embeddings, dim],
             false,
-        )?;
-
-        // Return gradient on the same device as the weight.
-        if device.is_cuda() {
-            Ok(vec![Some(grad_tensor.to(device)?)])
-        } else {
-            Ok(vec![Some(grad_tensor)])
-        }
+        )?)])
     }
 
     fn inputs(&self) -> Vec<&Tensor<T>> {
@@ -312,9 +306,8 @@ impl<T: Float> Module<T> for Embedding<T> {
 
         let dim = self.embedding_dim;
 
-        // GPU fast path for f32 embeddings: gather rows entirely on GPU,
-        // avoiding the costly download of the full weight matrix to CPU.
-        if self.weight.tensor().is_cuda() && is_f32::<T>() {
+        // GPU fast path for f32/f64 embeddings: gather rows entirely on GPU.
+        if self.weight.tensor().is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
             let device = self.weight.tensor().device();
             let ordinal = match device {
@@ -322,11 +315,9 @@ impl<T: Float> Module<T> for Embedding<T> {
                 _ => unreachable!(),
             };
 
-            // Download input indices to CPU for validation (small: N floats).
             let input_data = input.data_vec()?;
             let n = input_data.len();
 
-            // Convert float indices to usize and validate bounds.
             let mut indices = Vec::with_capacity(n);
             let mut indices_f32 = Vec::with_capacity(n);
             for (i, &val) in input_data.iter().enumerate() {
@@ -348,15 +339,14 @@ impl<T: Float> Module<T> for Embedding<T> {
                 indices_f32.push(idx as f32);
             }
 
-            // Upload indices to GPU (tiny: N * 4 bytes).
             let idx_handle = upload_f32_to_gpu(&indices_f32, ordinal)?;
-
-            // Get weight GPU handle directly -- no download.
             let weight_handle = self.weight.tensor().gpu_handle()?;
 
-            // Batch gather on GPU: output [N, D].
-            let output_handle =
-                backend.embed_lookup_batch_f32(&idx_handle, weight_handle, n, dim)?;
+            let output_handle = if is_f64::<T>() {
+                backend.embed_lookup_batch_f64(&idx_handle, weight_handle, n, dim)?
+            } else {
+                backend.embed_lookup_batch_f32(&idx_handle, weight_handle, n, dim)?
+            };
 
             // Padding index: if set, zero the corresponding output rows on GPU.
             // For padding_idx, the weight row should already be zero, so output
@@ -381,13 +371,14 @@ impl<T: Float> Module<T> for Embedding<T> {
             }
         }
 
-        // CPU path (or non-f32 GPU tensors): download weight and gather on CPU.
+        // CPU path — non-f32 GPU tensors have no GPU kernel, error out.
+        if self.weight.tensor().is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "Embedding",
+            });
+        }
         let input_data = input.data_vec()?;
-        let cpu_weight = if self.weight.tensor().is_cuda() {
-            self.weight.tensor().cpu()?
-        } else {
-            self.weight.tensor().clone()
-        };
+        let cpu_weight = self.weight.tensor().clone();
         let weight_data = cpu_weight.data()?;
         let n = input_data.len();
 
@@ -467,6 +458,226 @@ impl<T: Float> Module<T> for Embedding<T> {
             Tensor::from_operation(storage, output_shape, grad_fn)
         } else {
             Tensor::from_storage(storage, output_shape, false)
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<T>> {
+        vec![&self.weight]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<T>> {
+        vec![&mut self.weight]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<T>)> {
+        vec![("weight".to_string(), &self.weight)]
+    }
+
+    fn train(&mut self) {
+        self.training = true;
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+    }
+
+    fn is_training(&self) -> bool {
+        self.training
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmbeddingBag — fused lookup + reduce
+// ---------------------------------------------------------------------------
+
+/// Reduction mode for [`EmbeddingBag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingBagMode {
+    /// Sum all embeddings in each bag.
+    Sum,
+    /// Mean of all embeddings in each bag.
+    Mean,
+    /// Element-wise max across embeddings in each bag.
+    Max,
+}
+
+/// Computes sums or means of bags of embeddings without instantiating the
+/// full intermediate embeddings. This is more efficient than `Embedding`
+/// followed by a reduction for variable-length sequences.
+///
+/// # Input format
+///
+/// - `input`: 1-D tensor of indices [total_indices]
+/// - `offsets`: 1-D tensor [num_bags] giving the start index of each bag
+///   in `input`. Must be sorted and non-negative. Example: if `input` has
+///   indices for 3 bags with lengths [2, 3, 1], then `offsets = [0, 2, 5]`.
+///
+/// # Modes
+///
+/// - `Sum`: output[b] = sum of weight[input[offsets[b]:offsets[b+1]]]
+/// - `Mean`: output[b] = mean of weight[input[offsets[b]:offsets[b+1]]]
+/// - `Max`: output[b] = element-wise max of weight[input[offsets[b]:offsets[b+1]]]
+#[derive(Debug)]
+pub struct EmbeddingBag<T: Float> {
+    weight: Parameter<T>,
+    num_embeddings: usize,
+    embedding_dim: usize,
+    mode: EmbeddingBagMode,
+    training: bool,
+}
+
+impl<T: Float> EmbeddingBag<T> {
+    /// Create a new EmbeddingBag.
+    pub fn new(
+        num_embeddings: usize,
+        embedding_dim: usize,
+        mode: EmbeddingBagMode,
+    ) -> FerrotorchResult<Self> {
+        let mut weight = Parameter::zeros(&[num_embeddings, embedding_dim])?;
+        init::normal(&mut weight, 0.0, 1.0)?;
+
+        Ok(Self {
+            weight,
+            num_embeddings,
+            embedding_dim,
+            mode,
+            training: true,
+        })
+    }
+
+    /// Forward pass: compute bag-reduced embeddings.
+    ///
+    /// `input`: 1-D tensor of indices [total_indices]
+    /// `offsets`: 1-D tensor [num_bags] giving start offsets
+    pub fn forward_bag(
+        &self,
+        input: &Tensor<T>,
+        offsets: &[usize],
+    ) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() != 1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("EmbeddingBag input must be 1-D, got {:?}", input.shape()),
+            });
+        }
+
+        let input_data = input.data_vec()?;
+        let weight_data = self.weight.tensor().data()?;
+        let dim = self.embedding_dim;
+        let num_bags = offsets.len();
+
+        // Validate indices
+        for (i, &val) in input_data.iter().enumerate() {
+            let idx = num_traits::ToPrimitive::to_usize(&val).ok_or_else(|| {
+                FerrotorchError::InvalidArgument {
+                    message: format!("EmbeddingBag index {i} invalid: {val:?}"),
+                }
+            })?;
+            if idx >= self.num_embeddings {
+                return Err(FerrotorchError::IndexOutOfBounds {
+                    index: idx,
+                    axis: 0,
+                    size: self.num_embeddings,
+                });
+            }
+        }
+
+        let total = input_data.len();
+        let mut output = vec![<T as num_traits::Zero>::zero(); num_bags * dim];
+
+        for b in 0..num_bags {
+            let start = offsets[b];
+            let end = if b + 1 < num_bags { offsets[b + 1] } else { total };
+            let bag_size = end - start;
+
+            if bag_size == 0 {
+                continue;
+            }
+
+            match self.mode {
+                EmbeddingBagMode::Sum | EmbeddingBagMode::Mean => {
+                    for i in start..end {
+                        let idx = num_traits::ToPrimitive::to_usize(&input_data[i]).unwrap();
+                        let row_start = idx * dim;
+                        let out_start = b * dim;
+                        for d in 0..dim {
+                            output[out_start + d] += weight_data[row_start + d];
+                        }
+                    }
+                    if self.mode == EmbeddingBagMode::Mean && bag_size > 0 {
+                        let scale = T::from(bag_size).unwrap();
+                        let out_start = b * dim;
+                        for d in 0..dim {
+                            output[out_start + d] = output[out_start + d] / scale;
+                        }
+                    }
+                }
+                EmbeddingBagMode::Max => {
+                    // Initialize with -inf
+                    let out_start = b * dim;
+                    for d in 0..dim {
+                        output[out_start + d] = T::neg_infinity();
+                    }
+                    for i in start..end {
+                        let idx = num_traits::ToPrimitive::to_usize(&input_data[i]).unwrap();
+                        let row_start = idx * dim;
+                        for d in 0..dim {
+                            let val = weight_data[row_start + d];
+                            if val > output[out_start + d] {
+                                output[out_start + d] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Tensor::from_storage(
+            TensorStorage::cpu(output),
+            vec![num_bags, dim],
+            false,
+        )
+    }
+
+    /// Number of embeddings in the table.
+    pub fn num_embeddings(&self) -> usize {
+        self.num_embeddings
+    }
+
+    /// Dimension of each embedding vector.
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    /// The reduction mode.
+    pub fn mode(&self) -> EmbeddingBagMode {
+        self.mode
+    }
+}
+
+impl<T: Float> Module<T> for EmbeddingBag<T> {
+    /// Forward pass using the input as both indices and offsets.
+    ///
+    /// If input is 2-D [num_bags, bag_size], each row is a bag.
+    /// If input is 1-D, treats the entire input as a single bag.
+    fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() == 2 {
+            // 2D input: [num_bags, bag_size] — each row is a bag
+            let shape = input.shape();
+            let num_bags = shape[0];
+            let bag_size = shape[1];
+            let offsets: Vec<usize> = (0..num_bags).map(|b| b * bag_size).collect();
+            let flat = input.view_reshape(vec![num_bags * bag_size])?;
+            self.forward_bag(&flat, &offsets)
+        } else if input.ndim() == 1 {
+            // 1D input: single bag
+            self.forward_bag(input, &[0])
+        } else {
+            Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "EmbeddingBag input must be 1-D or 2-D, got {:?}",
+                    input.shape()
+                ),
+            })
         }
     }
 

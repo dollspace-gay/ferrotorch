@@ -23,6 +23,8 @@
 //! | [`LambdaLR`] | User-provided lambda function per step |
 //! | [`LinearWarmup`] | Linear ramp from 0 to `base_lr` |
 //! | [`ReduceLROnPlateau`] | Reduce LR when a metric stops improving |
+//! | [`MultiplicativeLR`] | Multiply LR by a user-provided function each step |
+//! | [`ChainedScheduler`] | Apply multiple schedulers in order every step |
 //! | [`SequentialLr`] | Chain multiple schedulers with milestone switches |
 //!
 //! # Convenience constructors
@@ -32,6 +34,7 @@
 //!
 //! [CL-320]
 
+pub mod chained_scheduler;
 pub mod constant_lr;
 pub mod cosine;
 pub mod cosine_warm_restarts;
@@ -40,12 +43,14 @@ pub mod exponential_lr;
 pub mod lambda_lr;
 pub mod linear_lr;
 pub mod multi_step_lr;
+pub mod multiplicative_lr;
 pub mod one_cycle_lr;
 pub mod plateau;
 pub mod polynomial_lr;
 pub mod step;
 pub mod warmup;
 
+pub use chained_scheduler::ChainedScheduler;
 pub use constant_lr::ConstantLR;
 pub use cosine::CosineAnnealingLR;
 pub use cosine_warm_restarts::CosineAnnealingWarmRestarts;
@@ -54,6 +59,7 @@ pub use exponential_lr::ExponentialLR;
 pub use lambda_lr::LambdaLR;
 pub use linear_lr::LinearLR;
 pub use multi_step_lr::MultiStepLR;
+pub use multiplicative_lr::MultiplicativeLR;
 pub use one_cycle_lr::{AnnealStrategy, OneCycleLR};
 pub use plateau::{MetricScheduler, PlateauMode, ReduceLROnPlateau};
 pub use polynomial_lr::PolynomialLR;

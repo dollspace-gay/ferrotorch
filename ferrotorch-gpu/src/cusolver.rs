@@ -22,6 +22,11 @@ use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
 use crate::error::{GpuError, GpuResult};
 
+#[cfg(not(feature = "cuda"))]
+use crate::device::GpuDevice;
+#[cfg(not(feature = "cuda"))]
+use crate::error::{GpuError, GpuResult};
+
 // ---------------------------------------------------------------------------
 // Helper: transpose row-major <-> column-major in-place on CPU
 // ---------------------------------------------------------------------------
@@ -29,6 +34,17 @@ use crate::error::{GpuError, GpuResult};
 /// Transpose an m-by-n row-major flat array to column-major (or vice versa).
 fn transpose_f32(data: &[f32], m: usize, n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            out[j * m + i] = data[i * n + j];
+        }
+    }
+    out
+}
+
+/// Transpose an m-by-n row-major flat array to column-major (or vice versa) — f64 variant.
+fn transpose_f64(data: &[f64], m: usize, n: usize) -> Vec<f64> {
+    let mut out = vec![0.0f64; m * n];
     for i in 0..m {
         for j in 0..n {
             out[j * m + i] = data[i * n + j];
@@ -65,6 +81,18 @@ fn upload_f32(data: &[f32], device: &GpuDevice) -> GpuResult<CudaBuffer<f32>> {
 /// Download a `CudaBuffer<f32>` to host.
 #[cfg(feature = "cuda")]
 fn download_f32(buf: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<Vec<f32>> {
+    crate::transfer::gpu_to_cpu(buf, device)
+}
+
+/// Allocate a `CudaBuffer<f64>` from host data.
+#[cfg(feature = "cuda")]
+fn upload_f64(data: &[f64], device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    crate::transfer::cpu_to_gpu(data, device)
+}
+
+/// Download a `CudaBuffer<f64>` to host.
+#[cfg(feature = "cuda")]
+fn download_f64(buf: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<Vec<f64>> {
     crate::transfer::gpu_to_cpu(buf, device)
 }
 
@@ -129,12 +157,12 @@ pub fn gpu_svd_f32(
     // SAFETY: All device pointers are valid allocations of the required sizes.
     // The handle and stream are valid. We synchronize and check devInfo after.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
-        let (s_ptr, _s_sync) = d_s.inner_mut().device_ptr_mut(stream);
-        let (u_ptr, _u_sync) = d_u.inner_mut().device_ptr_mut(stream);
-        let (vt_ptr, _vt_sync) = d_vt.inner_mut().device_ptr_mut(stream);
-        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(stream);
-        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (s_ptr, _s_sync) = d_s.inner_mut().device_ptr_mut(&stream);
+        let (u_ptr, _u_sync) = d_u.inner_mut().device_ptr_mut(&stream);
+        let (vt_ptr, _vt_sync) = d_vt.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
 
         csys::cusolverDnSgesvd(
             dn.cu(),
@@ -195,6 +223,129 @@ pub fn gpu_svd_f32(
     Ok((u_host, s_host, vt_host))
 }
 
+/// Compute the thin SVD of an m-by-n matrix (row-major f64).
+///
+/// Returns `(U, S, Vh)` as flat row-major `Vec<f64>` with shapes:
+/// - U:  [m, k]  where k = min(m, n)
+/// - S:  [k]
+/// - Vh: [k, n]
+///
+/// cuSOLVER's `Dgesvd` operates on column-major data and produces
+/// column-major U and VT. We transpose on input and output.
+#[cfg(feature = "cuda")]
+pub fn gpu_svd_f64(
+    data: &[f64],
+    m: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if m == 0 || n == 0 {
+        return Ok((vec![], vec![], vec![]));
+    }
+
+    let k = m.min(n);
+    let stream = device.stream();
+
+    // Create cuSOLVER handle.
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Transpose input from row-major to column-major.
+    let col_major = transpose_f64(data, m, n);
+    let mut d_a = upload_f64(&col_major, device)?;
+
+    // Allocate output buffers on device.
+    let mut d_s = crate::transfer::alloc_zeros_f64(k, device)?;
+    let mut d_u = crate::transfer::alloc_zeros_f64(m * k, device)?;
+    let mut d_vt = crate::transfer::alloc_zeros_f64(k * n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    // Query workspace size.
+    let mut lwork: i32 = 0;
+    // SAFETY: dn.cu() is a valid cusolverDnHandle_t, m/n are valid dimensions.
+    unsafe {
+        csys::cusolverDnDgesvd_bufferSize(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    // cuSOLVER Dgesvd: jobu='S' (thin U), jobvt='S' (thin VT).
+    // SAFETY: All device pointers are valid allocations of the required sizes.
+    // The handle and stream are valid. We synchronize and check devInfo after.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (s_ptr, _s_sync) = d_s.inner_mut().device_ptr_mut(&stream);
+        let (u_ptr, _u_sync) = d_u.inner_mut().device_ptr_mut(&stream);
+        let (vt_ptr, _vt_sync) = d_vt.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDgesvd(
+            dn.cu(),
+            b'S' as i8,   // jobu: thin U
+            b'S' as i8,   // jobvt: thin VT
+            m as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            m as i32,      // lda = m (column-major)
+            s_ptr as *mut f64,
+            u_ptr as *mut f64,
+            m as i32,      // ldu = m
+            vt_ptr as *mut f64,
+            k as i32,      // ldvt = k (for thin SVD)
+            work_ptr as *mut f64,
+            lwork,
+            std::ptr::null_mut(), // rwork (unused for real)
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+
+    // Check devInfo.
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_svd_f64",
+            expected: vec![0],
+            got: vec![info_val as usize],
+        });
+    }
+
+    // Download results and transpose from column-major back to row-major.
+    let s_host = download_f64(&d_s, device)?;
+
+    // U is m-by-k column-major -> transpose to k columns, m rows row-major.
+    let u_col = download_f64(&d_u, device)?;
+    // Column-major m-by-k means the data is laid out as k columns of m elements.
+    // To convert to row-major m-by-k: out[i*k + j] = col[j*m + i].
+    let mut u_host = vec![0.0f64; m * k];
+    for i in 0..m {
+        for j in 0..k {
+            u_host[i * k + j] = u_col[j * m + i];
+        }
+    }
+
+    // VT is k-by-n column-major -> convert to row-major k-by-n.
+    let vt_col = download_f64(&d_vt, device)?;
+    let mut vt_host = vec![0.0f64; k * n];
+    for i in 0..k {
+        for j in 0..n {
+            vt_host[i * n + j] = vt_col[j * k + i];
+        }
+    }
+
+    Ok((u_host, s_host, vt_host))
+}
+
 // ---------------------------------------------------------------------------
 // Cholesky: A = L * L^T   (lower-triangular)
 // ---------------------------------------------------------------------------
@@ -228,7 +379,7 @@ pub fn gpu_cholesky_f32(
     let mut lwork: i32 = 0;
     // SAFETY: dn.cu() is valid, d_a points to n*n f32 elements.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
         csys::cusolverDnSpotrf_bufferSize(
             dn.cu(),
             csys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
@@ -245,9 +396,9 @@ pub fn gpu_cholesky_f32(
     // SAFETY: All device pointers are valid. We use LOWER fill mode.
     // devInfo is checked after synchronization.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
-        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(stream);
-        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
 
         csys::cusolverDnSpotrf(
             dn.cu(),
@@ -276,6 +427,99 @@ pub fn gpu_cholesky_f32(
     // Download column-major result and convert to row-major.
     let l_col = download_f32(&d_a, device)?;
     let mut l_host = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            l_host[i * n + j] = l_col[j * n + i];
+        }
+    }
+
+    // cuSOLVER only writes the lower triangle; zero the upper triangle explicitly.
+    for i in 0..n {
+        for j in (i + 1)..n {
+            l_host[i * n + j] = 0.0;
+        }
+    }
+
+    Ok(l_host)
+}
+
+/// Compute the Cholesky decomposition of an n-by-n SPD matrix (row-major f64).
+///
+/// Returns the lower-triangular factor L as a flat row-major `Vec<f64>` [n, n].
+///
+/// Upper-triangular entries are explicitly zeroed.
+#[cfg(feature = "cuda")]
+pub fn gpu_cholesky_f64(
+    data: &[f64],
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<Vec<f64>> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return Ok(vec![]);
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Transpose to column-major.
+    let col_major = transpose_f64(data, n, n);
+    let mut d_a = upload_f64(&col_major, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    // Query workspace size.
+    let mut lwork: i32 = 0;
+    // SAFETY: dn.cu() is valid, d_a points to n*n f64 elements.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnDpotrf_bufferSize(
+            dn.cu(),
+            csys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    // SAFETY: All device pointers are valid. We use LOWER fill mode.
+    // devInfo is checked after synchronization.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDpotrf(
+            dn.cu(),
+            csys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            work_ptr as *mut f64,
+            lwork,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_cholesky_f64: matrix is not positive-definite",
+            expected: vec![0],
+            got: vec![info_val as usize],
+        });
+    }
+
+    // Download column-major result and convert to row-major.
+    let l_col = download_f64(&d_a, device)?;
+    let mut l_host = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {
             l_host[i * n + j] = l_col[j * n + i];
@@ -333,7 +577,7 @@ pub fn gpu_solve_f32(
     let mut lwork: i32 = 0;
     // SAFETY: dn.cu() is valid, d_a contains n*n f32 elements.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
         csys::cusolverDnSgetrf_bufferSize(
             dn.cu(),
             n as i32,
@@ -350,10 +594,10 @@ pub fn gpu_solve_f32(
     // LU factorization: A = P * L * U.
     // SAFETY: All device pointers are valid allocations of the required sizes.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
-        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(stream);
-        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner_mut().device_ptr_mut(stream);
-        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
 
         csys::cusolverDnSgetrf(
             dn.cu(),
@@ -386,10 +630,10 @@ pub fn gpu_solve_f32(
     // SAFETY: d_a now contains the LU factors, d_ipiv the pivot indices,
     // d_b will be overwritten with the solution X. All are properly sized.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner().device_ptr(stream);
-        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner().device_ptr(stream);
-        let (b_ptr, _b_sync) = d_b.inner_mut().device_ptr_mut(stream);
-        let (info_ptr, _info_sync) = d_info2.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner().device_ptr(&stream);
+        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner().device_ptr(&stream);
+        let (b_ptr, _b_sync) = d_b.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info2.inner_mut().device_ptr_mut(&stream);
 
         csys::cusolverDnSgetrs(
             dn.cu(),
@@ -420,6 +664,139 @@ pub fn gpu_solve_f32(
     // Download solution (column-major) and convert to row-major.
     let x_col = download_f32(&d_b, device)?;
     let mut x_host = vec![0.0f32; n * nrhs];
+    for i in 0..n {
+        for j in 0..nrhs {
+            x_host[i * nrhs + j] = x_col[j * n + i];
+        }
+    }
+
+    Ok(x_host)
+}
+
+/// Solve A * X = B for X where A is n-by-n and B is n-by-nrhs (row-major f64).
+///
+/// Uses LU factorization (Dgetrf) followed by triangular solve (Dgetrs).
+///
+/// Returns X as flat row-major `Vec<f64>` with shape [n, nrhs] (or [n] if nrhs==1).
+#[cfg(feature = "cuda")]
+pub fn gpu_solve_f64(
+    a_data: &[f64],
+    b_data: &[f64],
+    n: usize,
+    nrhs: usize,
+    device: &GpuDevice,
+) -> GpuResult<Vec<f64>> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return Ok(vec![]);
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Convert A to column-major.
+    let a_col = transpose_f64(a_data, n, n);
+    let mut d_a = upload_f64(&a_col, device)?;
+
+    // Convert B to column-major (n-by-nrhs).
+    let b_col = transpose_f64(b_data, n, nrhs);
+    let mut d_b = upload_f64(&b_col, device)?;
+
+    let mut d_ipiv = alloc_zeros_i32(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    // Query workspace for getrf.
+    let mut lwork: i32 = 0;
+    // SAFETY: dn.cu() is valid, d_a contains n*n f64 elements.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnDgetrf_bufferSize(
+            dn.cu(),
+            n as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    // LU factorization: A = P * L * U.
+    // SAFETY: All device pointers are valid allocations of the required sizes.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDgetrf(
+            dn.cu(),
+            n as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            work_ptr as *mut f64,
+            ipiv_ptr as *mut i32,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_solve_f64: LU factorization failed (singular matrix)",
+            expected: vec![0],
+            got: vec![info_val as usize],
+        });
+    }
+
+    // Triangular solve: L * U * X = P * B.
+    // Reset devInfo for getrs.
+    let mut d_info2 = alloc_zeros_i32(1, device)?;
+
+    // SAFETY: d_a now contains the LU factors, d_ipiv the pivot indices,
+    // d_b will be overwritten with the solution X. All are properly sized.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner().device_ptr(&stream);
+        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner().device_ptr(&stream);
+        let (b_ptr, _b_sync) = d_b.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info2.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDgetrs(
+            dn.cu(),
+            csys::cublasOperation_t::CUBLAS_OP_N, // no transpose
+            n as i32,
+            nrhs as i32,
+            a_ptr as *const f64,
+            n as i32,
+            ipiv_ptr as *const i32,
+            b_ptr as *mut f64,
+            n as i32,  // ldb = n
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+
+    let info_val2 = read_dev_info(&d_info2, device)?;
+    if info_val2 != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_solve_f64: triangular solve failed",
+            expected: vec![0],
+            got: vec![info_val2 as usize],
+        });
+    }
+
+    // Download solution (column-major) and convert to row-major.
+    let x_col = download_f64(&d_b, device)?;
+    let mut x_host = vec![0.0f64; n * nrhs];
     for i in 0..n {
         for j in 0..nrhs {
             x_host[i * nrhs + j] = x_col[j * n + i];
@@ -467,7 +844,7 @@ pub fn gpu_qr_f32(
     let mut lwork: i32 = 0;
     // SAFETY: dn.cu() is valid, d_a contains m*n f32 elements.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
         csys::cusolverDnSgeqrf_bufferSize(
             dn.cu(),
             m as i32,
@@ -485,10 +862,10 @@ pub fn gpu_qr_f32(
     // SAFETY: All device pointers are valid. d_a is overwritten in-place
     // with Householder reflectors (lower triangle) and R (upper triangle).
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
-        let (tau_ptr, _tau_sync) = d_tau.inner_mut().device_ptr_mut(stream);
-        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(stream);
-        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (tau_ptr, _tau_sync) = d_tau.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
 
         csys::cusolverDnSgeqrf(
             dn.cu(),
@@ -535,8 +912,8 @@ pub fn gpu_qr_f32(
 
     // SAFETY: dn.cu() is valid, d_a and d_tau contain valid QR factorization data.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner().device_ptr(stream);
-        let (tau_ptr, _tau_sync) = d_tau.inner().device_ptr(stream);
+        let (a_ptr, _a_sync) = d_a.inner().device_ptr(&stream);
+        let (tau_ptr, _tau_sync) = d_tau.inner().device_ptr(&stream);
         csys::cusolverDnSorgqr_bufferSize(
             dn.cu(),
             m as i32,
@@ -556,10 +933,10 @@ pub fn gpu_qr_f32(
     // SAFETY: d_a contains the Householder reflectors from geqrf, d_tau the
     // scalar factors. Sorgqr overwrites the first k columns of d_a with Q.
     unsafe {
-        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(stream);
-        let (tau_ptr, _tau_sync) = d_tau.inner().device_ptr(stream);
-        let (work_ptr, _work_sync) = d_work2.inner_mut().device_ptr_mut(stream);
-        let (info_ptr, _info_sync) = d_info2.inner_mut().device_ptr_mut(stream);
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (tau_ptr, _tau_sync) = d_tau.inner().device_ptr(&stream);
+        let (work_ptr, _work_sync) = d_work2.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info2.inner_mut().device_ptr_mut(&stream);
 
         csys::cusolverDnSorgqr(
             dn.cu(),
@@ -598,6 +975,265 @@ pub fn gpu_qr_f32(
     }
 
     Ok((q_host, r_host))
+}
+
+/// Compute the reduced QR decomposition of an m-by-n matrix (row-major f64).
+///
+/// Returns `(Q, R)` as flat row-major `Vec<f64>` with shapes:
+/// - Q: [m, k]  where k = min(m, n)
+/// - R: [k, n]
+///
+/// Uses Dgeqrf (Householder QR) followed by Dorgqr (generate Q).
+#[cfg(feature = "cuda")]
+pub fn gpu_qr_f64(
+    data: &[f64],
+    m: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(Vec<f64>, Vec<f64>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if m == 0 || n == 0 {
+        return Ok((vec![], vec![]));
+    }
+
+    let k = m.min(n);
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Transpose to column-major.
+    let col_major = transpose_f64(data, m, n);
+    let mut d_a = upload_f64(&col_major, device)?;
+    let mut d_tau = crate::transfer::alloc_zeros_f64(k, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    // Query workspace for geqrf.
+    let mut lwork: i32 = 0;
+    // SAFETY: dn.cu() is valid, d_a contains m*n f64 elements.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnDgeqrf_bufferSize(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            m as i32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    // Compute QR factorization (Householder form).
+    // SAFETY: All device pointers are valid. d_a is overwritten in-place
+    // with Householder reflectors (lower triangle) and R (upper triangle).
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (tau_ptr, _tau_sync) = d_tau.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDgeqrf(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            m as i32,
+            tau_ptr as *mut f64,
+            work_ptr as *mut f64,
+            lwork,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_qr_f64: geqrf failed",
+            expected: vec![0],
+            got: vec![info_val as usize],
+        });
+    }
+
+    // Extract R from the upper triangle of d_a (column-major).
+    // R is k-by-n. We read the full m-by-n column-major buffer.
+    let qr_col = download_f64(&d_a, device)?;
+    let mut r_host = vec![0.0f64; k * n];
+    for i in 0..k {
+        for j in 0..n {
+            // In column-major m-by-n: element (i, j) is at index j*m + i.
+            if j >= i {
+                r_host[i * n + j] = qr_col[j * m + i]; // row-major output
+            }
+            // else: R[i,j] = 0 (already initialized)
+        }
+    }
+
+    // Generate explicit Q via Dorgqr.
+    // Dorgqr overwrites d_a in-place: the first k columns become Q (m-by-k, column-major).
+    let mut lwork_orgqr: i32 = 0;
+
+    // SAFETY: dn.cu() is valid, d_a and d_tau contain valid QR factorization data.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner().device_ptr(&stream);
+        let (tau_ptr, _tau_sync) = d_tau.inner().device_ptr(&stream);
+        csys::cusolverDnDorgqr_bufferSize(
+            dn.cu(),
+            m as i32,
+            k as i32,
+            k as i32,
+            a_ptr as *const f64,
+            m as i32,
+            tau_ptr as *const f64,
+            &mut lwork_orgqr,
+        )
+        .result()?;
+    }
+
+    let mut d_work2 = crate::transfer::alloc_zeros_f64(lwork_orgqr.max(1) as usize, device)?;
+    let mut d_info2 = alloc_zeros_i32(1, device)?;
+
+    // SAFETY: d_a contains the Householder reflectors from geqrf, d_tau the
+    // scalar factors. Dorgqr overwrites the first k columns of d_a with Q.
+    unsafe {
+        let (a_ptr, _a_sync) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (tau_ptr, _tau_sync) = d_tau.inner().device_ptr(&stream);
+        let (work_ptr, _work_sync) = d_work2.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info2.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDorgqr(
+            dn.cu(),
+            m as i32,
+            k as i32,
+            k as i32,
+            a_ptr as *mut f64,
+            m as i32,
+            tau_ptr as *const f64,
+            work_ptr as *mut f64,
+            lwork_orgqr,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+
+    let info_val2 = read_dev_info(&d_info2, device)?;
+    if info_val2 != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_qr_f64: orgqr failed",
+            expected: vec![0],
+            got: vec![info_val2 as usize],
+        });
+    }
+
+    // Download Q (m-by-k column-major from d_a, but d_a has n columns total;
+    // we only need the first k columns).
+    let q_full_col = download_f64(&d_a, device)?;
+    let mut q_host = vec![0.0f64; m * k];
+    for i in 0..m {
+        for j in 0..k {
+            q_host[i * k + j] = q_full_col[j * m + i]; // col-major -> row-major
+        }
+    }
+
+    Ok((q_host, r_host))
+}
+
+// ---------------------------------------------------------------------------
+// Stubs — always return [`GpuError::NoCudaFeature`] when `cuda` is disabled.
+// ---------------------------------------------------------------------------
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_svd_f32(
+    _data: &[f32],
+    _m: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_svd_f64(
+    _data: &[f64],
+    _m: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_cholesky_f32(
+    _data: &[f32],
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<Vec<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_cholesky_f64(
+    _data: &[f64],
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<Vec<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_solve_f32(
+    _a_data: &[f32],
+    _b_data: &[f32],
+    _n: usize,
+    _nrhs: usize,
+    _device: &GpuDevice,
+) -> GpuResult<Vec<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_solve_f64(
+    _a_data: &[f64],
+    _b_data: &[f64],
+    _n: usize,
+    _nrhs: usize,
+    _device: &GpuDevice,
+) -> GpuResult<Vec<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_qr_f32(
+    _data: &[f32],
+    _m: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(Vec<f32>, Vec<f32>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_qr_f64(
+    _data: &[f64],
+    _m: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(Vec<f64>, Vec<f64>)> {
+    Err(GpuError::NoCudaFeature)
 }
 
 // ---------------------------------------------------------------------------

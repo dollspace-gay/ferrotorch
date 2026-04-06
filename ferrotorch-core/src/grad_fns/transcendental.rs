@@ -22,6 +22,12 @@ fn is_f32<T: Float>() -> bool {
     TypeId::of::<T>() == TypeId::of::<f32>()
 }
 
+/// Returns `true` if `T` is `f64`.
+#[inline]
+fn is_f64<T: Float>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<f64>()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -86,9 +92,13 @@ impl<T: Float> GradFn<T> for ExpBackward<T> {
 
 /// Differentiable elementwise exponential: `c[i] = exp(x[i])`.
 pub fn exp<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    if input.is_cuda() && is_f32::<T>() {
+    if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
-        let handle = backend.exp_f32(input.gpu_handle()?)?;
+        let handle = if is_f32::<T>() {
+            backend.exp_f32(input.gpu_handle()?)?
+        } else {
+            backend.exp_f64(input.gpu_handle()?)?
+        };
         let storage = TensorStorage::gpu(handle);
         let shape = input.shape().to_vec();
 
@@ -173,9 +183,13 @@ impl<T: Float> GradFn<T> for LogBackward<T> {
 
 /// Differentiable elementwise natural log: `c[i] = ln(x[i])`.
 pub fn log<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    if input.is_cuda() && is_f32::<T>() {
+    if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
-        let handle = backend.log_f32(input.gpu_handle()?)?;
+        let handle = if is_f32::<T>() {
+            backend.log_f32(input.gpu_handle()?)?
+        } else {
+            backend.log_f64(input.gpu_handle()?)?
+        };
         let storage = TensorStorage::gpu(handle);
         let shape = input.shape().to_vec();
 
@@ -375,31 +389,10 @@ struct ClampBackward<T: Float> {
 impl<T: Float> GradFn<T> for ClampBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         let da = if self.input.requires_grad() {
-            if grad_output.is_cuda() {
-                // GPU path: build mask on CPU, move to GPU, multiply.
-                let input_cpu = self.input.cpu()?;
-                let x_data = input_cpu.data()?;
-                let zero = <T as num_traits::Zero>::zero();
-                let one = <T as num_traits::One>::one();
-                let mask_data: Vec<T> = x_data
-                    .iter()
-                    .map(|&x| {
-                        if x >= self.min && x <= self.max {
-                            one
-                        } else {
-                            zero
-                        }
-                    })
-                    .collect();
-                let mask_cpu = Tensor::from_storage(
-                    TensorStorage::cpu(mask_data),
-                    self.input.shape().to_vec(),
-                    false,
-                )?;
-                let mask_gpu = mask_cpu.to(grad_output.device())?;
-                Some(no_grad(|| {
-                    crate::grad_fns::arithmetic::mul(grad_output, &mask_gpu)
-                })?)
+            if grad_output.is_cuda() || self.input.is_cuda() {
+                return Err(FerrotorchError::NotImplementedOnCuda {
+                    op: "ClampBackward",
+                });
             } else {
                 // CPU path
                 let go_data = grad_output.data()?;
@@ -442,12 +435,18 @@ impl<T: Float> GradFn<T> for ClampBackward<T> {
 /// Gradient flows through only where `min <= x[i] <= max`; it is zero at
 /// the boundaries where the value was clamped.
 pub fn clamp<T: Float>(input: &Tensor<T>, min: T, max: T) -> FerrotorchResult<Tensor<T>> {
-    // GPU fast path for f32
-    if input.is_cuda() && is_f32::<T>() {
+    // GPU fast path for f32/f64
+    if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
-            let min_f32 = min.to_f32().unwrap_or(f32::MIN);
-            let max_f32 = max.to_f32().unwrap_or(f32::MAX);
-            let handle = backend.clamp_f32(input.gpu_handle()?, min_f32, max_f32)?;
+            let handle = if is_f32::<T>() {
+                let min_f32 = min.to_f32().unwrap_or(f32::MIN);
+                let max_f32 = max.to_f32().unwrap_or(f32::MAX);
+                backend.clamp_f32(input.gpu_handle()?, min_f32, max_f32)?
+            } else {
+                let min_f64 = min.to_f64().unwrap_or(f64::MIN);
+                let max_f64 = max.to_f64().unwrap_or(f64::MAX);
+                backend.clamp_f64(input.gpu_handle()?, min_f64, max_f64)?
+            };
             return if needs_grad_unary(input) {
                 Tensor::from_operation(
                     TensorStorage::gpu(handle),
