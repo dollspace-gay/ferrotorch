@@ -1,0 +1,10 @@
+{
+  "uuid": "d60bee5a-98ef-4cd2-8f05-af1a66b67175",
+  "issue_uuid": "bf98ba1a-58d9-4790-84f1-34a53c1d4a35",
+  "author": "y4rr",
+  "content": "[result] autocast_ops module already complete (463 lines, 6 functions: autocast_category, should_cast_to_reduced, should_keep_full_precision, autocast_guard, autocast_log, drain_autocast_events). Already wired into 6 call sites in grad_fns (mm, linear, etc.).",
+  "created_at": "2026-04-06T13:55:12.794926864Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwomzHEXXcj2rjhMm3n9/gsyA0pESGxNLfXdFDBl53mvSGWgR8Jt52a+6W2ybGPSDBei+ym3ul3nbjlyZOlBTCg=="
+}
