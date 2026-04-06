@@ -1,0 +1,10 @@
+{
+  "uuid": "57bdb8c3-f3fd-4339-b791-058ac884869f",
+  "issue_uuid": "702aede3-a5bc-45d6-953a-78650ce935b4",
+  "author": "y4rr",
+  "content": "[result] Implemented CosineSimilarity (dot product normalized by norms along a dim) and PairwiseDistance (Lp norm of difference along last dim). Both are stateless function objects with forward(x1, x2). Exported from ferrotorch-nn. 0 warnings.",
+  "created_at": "2026-04-06T04:17:23.016504273Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/amc3cum4ZEZKRqFNSFThXag/sKyyFoufcvIhh0cEyilg5dmC06IPmtP7/mkK3BbHtZt5ue9yb/CWUgHaH2uAA=="
+}
