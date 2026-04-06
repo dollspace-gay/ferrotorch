@@ -34,3 +34,8 @@ pub(crate) fn random_f64() -> f64 {
     state = state ^ (state >> 31);
     (state as f64) / (u64::MAX as f64)
 }
+
+/// Generate a random `usize` in `[0, upper)`.
+pub(crate) fn random_usize(upper: usize) -> usize {
+    (random_f64() * upper as f64) as usize % upper
+}

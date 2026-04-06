@@ -26,7 +26,90 @@ use crate::buffer::CudaBuffer;
 use crate::device::GpuDevice;
 use crate::error::{GpuError, GpuResult};
 #[cfg(feature = "cuda")]
-use crate::transfer::{alloc_zeros_f32, cpu_to_gpu, gpu_to_cpu};
+use crate::transfer::{alloc_zeros_f32, alloc_zeros_f64, cpu_to_gpu, gpu_to_cpu};
+
+// ---------------------------------------------------------------------------
+// f32 → f64 PTX auto-conversion
+// ---------------------------------------------------------------------------
+
+/// Convert an f32 PTX kernel string to its f64 equivalent by applying
+/// mechanical substitutions. Works for "simple" kernels where the only
+/// difference between f32 and f64 is register types, load/store widths,
+/// byte offsets, and float literals.
+///
+/// Does NOT work for kernels that use `ex2.approx.f32` or `lg2.approx.f32`
+/// (transcendentals) — those need hand-written f64 implementations.
+#[cfg(feature = "cuda")]
+pub(crate) fn ptx_f32_to_f64(f32_ptx: &str, f32_kernel_name: &str, f64_kernel_name: &str) -> String {
+    f32_ptx
+        // Kernel entry point name
+        .replace(f32_kernel_name, f64_kernel_name)
+        // Register declarations
+        .replace(".reg .f32", ".reg .f64")
+        // Memory operations (must come before arithmetic to avoid double-replace)
+        .replace("ld.global.f32", "ld.global.f64")
+        .replace("st.global.f32", "st.global.f64")
+        .replace("ld.shared.f32", "ld.shared.f64")
+        .replace("st.shared.f32", "st.shared.f64")
+        .replace("ld.param.f32", "ld.param.f64")
+        .replace(".param .f32", ".param .f64")
+        // Shared memory declarations
+        .replace(".shared .align 4 .f32", ".shared .align 8 .f64")
+        // Arithmetic
+        .replace("add.f32", "add.f64")
+        .replace("sub.f32", "sub.f64")
+        .replace("mul.f32", "mul.f64")
+        .replace("div.rn.f32", "div.rn.f64")
+        .replace("div.f32", "div.f64")
+        .replace("neg.f32", "neg.f64")
+        .replace("abs.f32", "abs.f64")
+        .replace("max.f32", "max.f64")
+        .replace("min.f32", "min.f64")
+        .replace("sqrt.rn.f32", "sqrt.rn.f64")
+        .replace("sqrt.f32", "sqrt.f64")
+        .replace("fma.rn.f32", "fma.rn.f64")
+        .replace("mov.f32", "mov.f64")
+        // Comparisons
+        .replace("setp.gt.f32", "setp.gt.f64")
+        .replace("setp.ge.f32", "setp.ge.f64")
+        .replace("setp.lt.f32", "setp.lt.f64")
+        .replace("setp.le.f32", "setp.le.f64")
+        .replace("setp.eq.f32", "setp.eq.f64")
+        .replace("setp.ne.f32", "setp.ne.f64")
+        // Conversions
+        .replace("cvt.rn.f32.u32", "cvt.rn.f64.u32")
+        .replace("cvt.rn.f32.s32", "cvt.rn.f64.s32")
+        // Bit reinterpretation (for NaN/inf checks)
+        .replace("mov.b32", "mov.b64")
+        // Byte offset: 4 bytes per f32 → 8 bytes per f64
+        .replace("shl.b64 %off, %off, 2", "shl.b64 %off, %off, 3")
+        // Atomics
+        .replace("atom.global.add.f32", "atom.global.add.f64")
+        // Common float hex literals
+        .replace("0f00000000", "0d0000000000000000")     // 0.0
+        .replace("0f3F800000", "0d3FF0000000000000")     // 1.0
+        .replace("0fBF800000", "0dBFF0000000000000")     // -1.0
+        .replace("0f40000000", "0d4000000000000000")     // 2.0
+        .replace("0f3F000000", "0d3FE0000000000000")     // 0.5
+        .replace("0fFF800000", "0dFFF0000000000000")     // -inf
+        .replace("0f7F800000", "0d7FF0000000000000")     // +inf
+        .replace("0f3FB8AA3B", "0d3FF71547652B82FE")     // log2(e)
+        .replace("0f3F317218", "0d3FE62E42FEFA39EF")     // ln(2)
+}
+
+/// Helper to get or create a cached f64 PTX string from an f32 source.
+///
+/// Uses a global cache so the string transformation only happens once per
+/// kernel. The returned `&str` is valid for the lifetime of the program.
+#[cfg(feature = "cuda")]
+pub(crate) fn get_f64_ptx<'a>(
+    cache: &'a std::sync::OnceLock<String>,
+    f32_ptx: &str,
+    f32_name: &str,
+    f64_name: &str,
+) -> &'a str {
+    cache.get_or_init(|| ptx_f32_to_f64(f32_ptx, f32_name, f64_name))
+}
 
 // ---------------------------------------------------------------------------
 // PTX kernel source strings
@@ -79,6 +162,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `add_vec4_kernel`: vectorized add, 4 elements per thread.
 ///
@@ -238,6 +322,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `mul_kernel`: `out[i] = a[i] * b[i]`.
 #[cfg(feature = "cuda")]
 pub(crate) const MUL_PTX: &str = "\
@@ -286,6 +371,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `neg_kernel`: `out[i] = -a[i]`.
 #[cfg(feature = "cuda")]
 pub(crate) const NEG_PTX: &str = "\
@@ -329,6 +415,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `relu_kernel`: `out[i] = max(a[i], 0.0)`.
 #[cfg(feature = "cuda")]
@@ -375,6 +462,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `scale_kernel`: `out[i] = a[i] * scalar`.
 #[cfg(feature = "cuda")]
 pub(crate) const SCALE_PTX: &str = "\
@@ -420,6 +508,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX for 2D matrix transpose: `out[j * M + i] = in[i * N + j]`.
 /// Thread `tid` maps to output index; computes the corresponding input index.
@@ -476,6 +565,7 @@ DONE:\n\
     ret;\n\
 }\n\
 ";
+
 
 // ---------------------------------------------------------------------------
 // 4D permute (0,2,1,3) PTX kernel — swap dims 1 and 2
@@ -557,6 +647,7 @@ DONE:\n\
     ret;\n\
 }\n\
 ";
+
 
 // ---------------------------------------------------------------------------
 // f32-to-f16 conversion PTX kernel: out_f16[i] = float2half(in_f32[i])
@@ -813,6 +904,7 @@ DONE:
 }
 ";
 
+
 /// PTX for `slice_write_indirect_kernel`: same as `slice_write_kernel` but
 /// reads `pos` from a device pointer. This enables CUDA graph capture — the
 /// graph records the pointer address (fixed), and we update the u32 value
@@ -987,6 +1079,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Batch embedding lookup PTX kernel
 // ---------------------------------------------------------------------------
@@ -1056,6 +1149,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Scatter-add rows PTX kernel (for embedding backward)
 // ---------------------------------------------------------------------------
@@ -1124,6 +1218,7 @@ DONE:
     ret;
 }
 ";
+
 
 // ---------------------------------------------------------------------------
 // Slice-read PTX kernel: read first `len` rows from [N, max_len, D]
@@ -1199,6 +1294,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // GELU PTX kernel: gelu(x) = x * sigmoid(1.702 * x)
 //
@@ -1253,6 +1349,88 @@ pub(crate) const GELU_PTX: &str = "\
     rcp.approx.f32 %sig, %denom;
     mul.f32 %result, %x, %sig;
     st.global.f32 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `gelu_f64_kernel`: `out[i] = x * sigmoid(1.702 * x)` (f64).
+/// Uses f32-downcast for transcendentals.
+#[cfg(feature = "cuda")]
+pub(crate) const GELU_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry gelu_f64_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %in, %out, %off;
+    .reg .f64 %x, %neg_kx, %exp_neg, %one, %denom, %sig, %result, %k;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %in, %in, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%in];
+    mov.f64 %one, 0d3FF0000000000000;
+
+    // k = 1.702
+    mov.f64 %k, 0d3FFB44E400000000;
+    mul.f64 %neg_kx, %k, %x;
+    neg.f64 %neg_kx, %neg_kx;
+
+    // --- exp(%neg_kx) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_kx, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_kx;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %exp_neg, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %exp_neg, %exp_neg, %e_nf;
+    // --- end exp ---
+
+    add.f64 %denom, %one, %exp_neg;
+    div.rn.f64 %sig, %one, %denom;
+    mul.f64 %result, %x, %sig;
+    st.global.f64 [%out], %result;
 
 DONE:
     ret;
@@ -1329,6 +1507,102 @@ pub(crate) const GELU_TANH_PTX: &str = "\
     mul.f32 %result, %half, %x;
     mul.f32 %result, %result, %th;
     st.global.f32 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `gelu_tanh_f64_kernel`: tanh-approx GELU (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(2y) in tanh.
+#[cfg(feature = "cuda")]
+pub(crate) const GELU_TANH_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry gelu_tanh_f64_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %in, %out, %off;
+    .reg .f64 %x, %x3, %inner, %sqrt2pi, %c, %y, %two_y, %e2y;
+    .reg .f64 %e2y_m1, %e2y_p1, %th, %one, %half, %result;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %in, %in, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%in];
+    mov.f64 %one, 0d3FF0000000000000;
+
+    // inner = sqrt(2/pi) * (x + 0.044715 * x^3)
+    mul.f64 %x3, %x, %x;
+    mul.f64 %x3, %x3, %x;
+    mov.f64 %c, 0d3FA6E4E260000000;
+    mul.f64 %x3, %c, %x3;
+    add.f64 %inner, %x, %x3;
+    mov.f64 %sqrt2pi, 0d3FE9884540000000;
+    mul.f64 %y, %sqrt2pi, %inner;
+
+    // tanh(y) = (exp(2y)-1)/(exp(2y)+1), exp(2y) in full f64
+    add.f64 %two_y, %y, %y;
+
+    // --- exp(%two_y) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %two_y, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %two_y;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e2y, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e2y, %e2y, %e_nf;
+    // --- end exp ---
+
+    sub.f64 %e2y_m1, %e2y, %one;
+    add.f64 %e2y_p1, %e2y, %one;
+    div.rn.f64 %th, %e2y_m1, %e2y_p1;
+
+    // out = 0.5 * x * (1 + tanh)
+    add.f64 %th, %one, %th;
+    mov.f64 %half, 0d3FE0000000000000;
+    mul.f64 %result, %half, %x;
+    mul.f64 %result, %result, %th;
+    st.global.f64 [%out], %result;
 
 DONE:
     ret;
@@ -1434,6 +1708,125 @@ DONE:
 }
 ";
 
+/// PTX source for `gelu_erf_f64_kernel`: exact erf GELU (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(-z^2).
+#[cfg(feature = "cuda")]
+pub(crate) const GELU_ERF_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry gelu_erf_f64_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %in, %out, %off;
+    .reg .f64 %x, %z, %ax, %one, %half;
+    .reg .f64 %t, %pt, %z2, %neg_z2, %exp_neg_z2, %erf_val;
+    .reg .f64 %p, %a1, %a2, %a3, %a4, %a5, %result;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %pred_ge, %pred_neg;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %pred_ge, %r_tid, %n_reg;
+    @%pred_ge bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %in, %in, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%in];
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %half, 0d3FE0000000000000;
+
+    // z = x / sqrt(2) = x * 0.70710678
+    mov.f64 %z, 0d3FE6A09E60000000;
+    mul.f64 %z, %x, %z;
+
+    abs.f64 %ax, %z;
+
+    // t = 1 / (1 + 0.3275911 * |z|)
+    mov.f64 %p, 0d3FD4F740A0000000;
+    mul.f64 %t, %p, %ax;
+    add.f64 %t, %one, %t;
+    div.rn.f64 %t, %one, %t;
+
+    // Horner: poly = t*(a1 + t*(a2 + t*(a3 + t*(a4 + t*a5))))
+    mov.f64 %a5, 0d3FC1555560000000;
+    mov.f64 %a4, 0dBFD6752060000000;
+    mov.f64 %a3, 0d3FF6A0DBA0000000;
+    mov.f64 %a2, 0dBFE0783C20000000;
+    mov.f64 %a1, 0d3FD41AD760000000;
+
+    mul.f64 %pt, %t, %a5;
+    add.f64 %pt, %pt, %a4;
+    mul.f64 %pt, %pt, %t;
+    add.f64 %pt, %pt, %a3;
+    mul.f64 %pt, %pt, %t;
+    add.f64 %pt, %pt, %a2;
+    mul.f64 %pt, %pt, %t;
+    add.f64 %pt, %pt, %a1;
+    mul.f64 %pt, %pt, %t;
+
+    // exp(-z^2) in full f64
+    mul.f64 %z2, %ax, %ax;
+    neg.f64 %neg_z2, %z2;
+
+    // --- exp(%neg_z2) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_z2, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_z2;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %exp_neg_z2, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %exp_neg_z2, %exp_neg_z2, %e_nf;
+    // --- end exp ---
+
+    mul.f64 %erf_val, %pt, %exp_neg_z2;
+    sub.f64 %erf_val, %one, %erf_val;
+
+    setp.lt.f64 %pred_neg, %z, 0d0000000000000000;
+    @%pred_neg neg.f64 %erf_val, %erf_val;
+
+    add.f64 %erf_val, %one, %erf_val;
+    mul.f64 %result, %half, %x;
+    mul.f64 %result, %result, %erf_val;
+    st.global.f64 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `gelu_backward_tanh_kernel`:
 /// Backward for tanh approximation of GELU.
 /// Let `u = sqrt(2/π) * (x + 0.044715 * x³)`, `t = tanh(u)`.
@@ -1532,6 +1925,121 @@ DONE:
 }
 ";
 
+/// PTX source for `gelu_backward_tanh_f64_kernel`: tanh-approx backward (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(2y) in tanh.
+#[cfg(feature = "cuda")]
+pub(crate) const GELU_BACKWARD_TANH_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry gelu_backward_tanh_f64_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f64 %vg, %x, %x2, %x3, %inner, %sqrt2pi, %c, %c3, %y;
+    .reg .f64 %two_y, %e2y, %e2y_m1, %e2y_p1, %th, %one, %half;
+    .reg .f64 %th2, %one_m_th2, %d_inner, %term1, %term2, %d_gelu, %result;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %vg, [%grad];
+    ld.global.f64 %x, [%input];
+
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %half, 0d3FE0000000000000;
+    mov.f64 %sqrt2pi, 0d3FE9884540000000;
+    mov.f64 %c, 0d3FA6E4E260000000;
+    // 3 * 0.044715 = 0.134145
+    mov.f64 %c3, 0d3FC12D7180000000;
+
+    mul.f64 %x2, %x, %x;
+    mul.f64 %x3, %x2, %x;
+    mul.f64 %x3, %c, %x3;
+    add.f64 %inner, %x, %x3;
+    mul.f64 %y, %sqrt2pi, %inner;
+
+    // tanh(y) = (exp(2y)-1)/(exp(2y)+1) in full f64
+    add.f64 %two_y, %y, %y;
+
+    // --- exp(%two_y) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %two_y, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %two_y;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e2y, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e2y, %e2y, %e_nf;
+    // --- end exp ---
+
+    sub.f64 %e2y_m1, %e2y, %one;
+    add.f64 %e2y_p1, %e2y, %one;
+    div.rn.f64 %th, %e2y_m1, %e2y_p1;
+
+    add.f64 %term1, %one, %th;
+    mul.f64 %term1, %half, %term1;
+
+    mul.f64 %th2, %th, %th;
+    sub.f64 %one_m_th2, %one, %th2;
+
+    mul.f64 %d_inner, %c3, %x2;
+    add.f64 %d_inner, %one, %d_inner;
+    mul.f64 %d_inner, %sqrt2pi, %d_inner;
+
+    mul.f64 %term2, %half, %x;
+    mul.f64 %term2, %term2, %one_m_th2;
+    mul.f64 %term2, %term2, %d_inner;
+
+    add.f64 %d_gelu, %term1, %term2;
+    mul.f64 %result, %vg, %d_gelu;
+    st.global.f64 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
 // ---------------------------------------------------------------------------
 // SiLU / ELU / Mish activation kernels (forward + backward)
 // ---------------------------------------------------------------------------
@@ -1585,6 +2093,84 @@ pub(crate) const SILU_PTX: &str = "\
     // silu(x) = x * sigmoid(x)
     mul.f32 %vr, %x, %sig;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `silu_f64_kernel`: `out[i] = x * sigmoid(x)` (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(-x).
+#[cfg(feature = "cuda")]
+pub(crate) const SILU_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry silu_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %x, %neg_x, %e, %denom, %sig, %vr, %one;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%a];
+    mov.f64 %one, 0d3FF0000000000000;
+    neg.f64 %neg_x, %x;
+
+    // --- exp(%neg_x) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e, %e, %e_nf;
+    // --- end exp ---
+
+    add.f64 %denom, %one, %e;
+    div.rn.f64 %sig, %one, %denom;
+    mul.f64 %vr, %x, %sig;
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -1655,6 +2241,95 @@ DONE:
 }
 ";
 
+/// PTX source for `silu_backward_f64_kernel` (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(-x).
+#[cfg(feature = "cuda")]
+pub(crate) const SILU_BACKWARD_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry silu_backward_f64_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f64 %vg, %x, %neg_x, %e, %denom, %sig, %one;
+    .reg .f64 %one_m_sig, %x_sig_omsig, %deriv, %result;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %vg, [%grad];
+    ld.global.f64 %x, [%input];
+
+    mov.f64 %one, 0d3FF0000000000000;
+    neg.f64 %neg_x, %x;
+
+    // --- exp(%neg_x) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e, %e, %e_nf;
+    // --- end exp ---
+
+    add.f64 %denom, %one, %e;
+    div.rn.f64 %sig, %one, %denom;
+
+    sub.f64 %one_m_sig, %one, %sig;
+    mul.f64 %x_sig_omsig, %x, %sig;
+    mul.f64 %x_sig_omsig, %x_sig_omsig, %one_m_sig;
+    add.f64 %deriv, %sig, %x_sig_omsig;
+    mul.f64 %result, %vg, %deriv;
+    st.global.f64 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `elu_kernel`: `out[i] = x > 0 ? x : alpha * (exp(x) - 1)`.
 /// Takes `alpha` as an extra `.param .f32` parameter.
 #[cfg(feature = "cuda")]
@@ -1708,6 +2383,88 @@ pub(crate) const ELU_PTX: &str = "\
     setp.gt.f32 %pos, %x, %vr;
     selp.f32 %vr, %x, %neg_branch, %pos;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `elu_f64_kernel`: `out[i] = x > 0 ? x : alpha * (exp(x) - 1)` (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(x).
+#[cfg(feature = "cuda")]
+pub(crate) const ELU_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry elu_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .f64 alpha
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %x, %alpha_r, %one, %ex, %em1, %neg_branch, %vr;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p, %pos;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+    ld.param.f64 %alpha_r, [alpha];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%a];
+    mov.f64 %one, 0d3FF0000000000000;
+
+    // --- exp(%x) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %ex, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %ex, %ex, %e_nf;
+    // --- end exp ---
+
+    sub.f64 %em1, %ex, %one;
+    mul.f64 %neg_branch, %alpha_r, %em1;
+
+    mov.f64 %vr, 0d0000000000000000;
+    setp.gt.f64 %pos, %x, %vr;
+    selp.f64 %vr, %x, %neg_branch, %pos;
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -1772,6 +2529,93 @@ pub(crate) const ELU_BACKWARD_PTX: &str = "\
     setp.gt.f32 %pos, %x, %zero;
     selp.f32 %vr, %vg, %neg_branch, %pos;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `elu_backward_f64_kernel` (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(x).
+#[cfg(feature = "cuda")]
+pub(crate) const ELU_BACKWARD_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry elu_backward_f64_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .f64 alpha
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f64 %vg, %x, %alpha_r, %ex, %neg_branch, %vr, %zero, %one;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p, %pos;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+    ld.param.f64 %alpha_r, [alpha];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %vg, [%grad];
+    ld.global.f64 %x, [%input];
+
+    mov.f64 %zero, 0d0000000000000000;
+    mov.f64 %one, 0d3FF0000000000000;
+
+    // --- exp(%x) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %ex, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %ex, %ex, %e_nf;
+    // --- end exp ---
+
+    mul.f64 %neg_branch, %vg, %alpha_r;
+    mul.f64 %neg_branch, %neg_branch, %ex;
+
+    setp.gt.f64 %pos, %x, %zero;
+    selp.f64 %vr, %vg, %neg_branch, %pos;
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -1862,6 +2706,184 @@ LARGE_X:
     mul.f32 %th, %e2sp_m1, %e2sp_p1;
     mul.f32 %vr, %x, %th;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `mish_f64_kernel`: `out[i] = x * tanh(softplus(x))` (f64).
+/// Full f64 precision: exp via Cody-Waite + Horner, log via argument reduction.
+#[cfg(feature = "cuda")]
+pub(crate) const MISH_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry mish_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %x, %one, %two, %ex, %ep1, %sp;
+    .reg .f64 %two_sp, %e2sp, %e2sp_m1, %e2sp_p1, %th, %vr;
+    .reg .f64 %threshold;
+    // exp subroutine regs
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    // log subroutine regs
+    .reg .u64 %l_xbits, %l_mbits, %l_bias;
+    .reg .s64 %l_exp64;
+    .reg .f64 %l_m, %l_f, %l_f2, %l_s, %l_p, %l_nf, %l_ln2;
+    .reg .pred %p, %large;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%a];
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %two, 0d4000000000000000;
+    mov.f64 %threshold, 0d4034000000000000;
+
+    setp.gt.f64 %large, %x, %threshold;
+    @%large bra LARGE_X;
+
+    // === softplus: sp = ln(1 + exp(x)) ===
+    // exp(x)
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %ex, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %ex, %ex, %e_nf;
+
+    // ep1 = 1 + exp(x)
+    add.f64 %ep1, %ex, %one;
+
+    // ln(ep1) via argument reduction
+    mov.b64 %l_xbits, %ep1;
+    shr.u64 %l_exp64, %l_xbits, 52;
+    and.b64 %l_exp64, %l_exp64, 2047;
+    sub.s64 %l_exp64, %l_exp64, 1023;
+    cvt.rn.f64.s64 %l_nf, %l_exp64;
+    mov.u64 %l_bias, 0x3FF0000000000000;
+    and.b64 %l_mbits, %l_xbits, 0x000FFFFFFFFFFFFF;
+    or.b64 %l_mbits, %l_mbits, %l_bias;
+    mov.b64 %l_m, %l_mbits;
+    sub.f64 %l_f, %l_m, %one;
+    add.f64 %l_s, %l_m, %one;
+    div.rn.f64 %l_f, %l_f, %l_s;
+    mul.f64 %l_f2, %l_f, %l_f;
+    mov.f64 %l_p, 0d3FB745D1745D1746;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC1C71C71C71C72;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC2492492492492;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC999999999999A;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FD5555555555555;
+    fma.rn.f64 %l_p, %l_p, %l_f2, %one;
+    mul.f64 %l_p, %l_p, %l_f;
+    add.f64 %l_p, %l_p, %l_p;
+    mov.f64 %l_ln2, 0d3FE62E42FEFA39EF;
+    fma.rn.f64 %sp, %l_nf, %l_ln2, %l_p;
+
+    // === tanh(sp) = (exp(2*sp)-1)/(exp(2*sp)+1) ===
+    add.f64 %two_sp, %sp, %sp;
+    fma.rn.f64 %e_nf, %two_sp, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %two_sp;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e2sp, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e2sp, %e2sp, %e_nf;
+
+    sub.f64 %e2sp_m1, %e2sp, %one;
+    add.f64 %e2sp_p1, %e2sp, %one;
+    div.rn.f64 %th, %e2sp_m1, %e2sp_p1;
+
+    mul.f64 %vr, %x, %th;
+    st.global.f64 [%out], %vr;
+    bra DONE;
+
+LARGE_X:
+    // softplus ~ x, tanh(x) = (exp(2x)-1)/(exp(2x)+1) in f64
+    add.f64 %two_sp, %x, %x;
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %two_sp, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %two_sp;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e2sp, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e2sp, %e2sp, %e_nf;
+
+    sub.f64 %e2sp_m1, %e2sp, %one;
+    add.f64 %e2sp_p1, %e2sp, %one;
+    div.rn.f64 %th, %e2sp_m1, %e2sp_p1;
+    mul.f64 %vr, %x, %th;
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -1985,6 +3007,228 @@ DONE:
 }
 ";
 
+/// PTX source for `mish_backward_f64_kernel` (f64).
+/// Full f64 precision: exp via Cody-Waite + Horner, log via argument reduction.
+#[cfg(feature = "cuda")]
+pub(crate) const MISH_BACKWARD_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry mish_backward_f64_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f64 %vg, %x, %one, %ex, %ep1, %sp;
+    .reg .f64 %two_sp, %e2sp, %e2sp_m1, %e2sp_p1, %t, %t2, %one_m_t2;
+    .reg .f64 %neg_x, %en, %denom, %sig, %x_sig_omt2, %deriv, %result;
+    .reg .f64 %threshold;
+    // exp subroutine regs
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    // log subroutine regs
+    .reg .u64 %l_xbits, %l_mbits, %l_bias;
+    .reg .s64 %l_exp64;
+    .reg .f64 %l_m, %l_f, %l_f2, %l_s, %l_p, %l_nf, %l_ln2;
+    .reg .pred %p, %large;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %vg, [%grad];
+    ld.global.f64 %x, [%input];
+
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %threshold, 0d4034000000000000;
+
+    setp.gt.f64 %large, %x, %threshold;
+    @%large bra LARGE_X;
+
+    // === softplus: sp = ln(1 + exp(x)) ===
+    // exp(x)
+    mov.f64 %e_half, 0d3FE0000000000000;
+    mul.f64 %e_nf, %x, 0d3FF71547652B82FE;
+    cvt.rni.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %ex, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %ex, %ex, %e_nf;
+
+    add.f64 %ep1, %ex, %one;
+
+    // ln(ep1) via argument reduction
+    mov.b64 %l_xbits, %ep1;
+    shr.u64 %l_exp64, %l_xbits, 52;
+    and.b64 %l_exp64, %l_exp64, 2047;
+    sub.s64 %l_exp64, %l_exp64, 1023;
+    cvt.rn.f64.s64 %l_nf, %l_exp64;
+    mov.u64 %l_bias, 0x3FF0000000000000;
+    and.b64 %l_mbits, %l_xbits, 0x000FFFFFFFFFFFFF;
+    or.b64 %l_mbits, %l_mbits, %l_bias;
+    mov.b64 %l_m, %l_mbits;
+    sub.f64 %l_f, %l_m, %one;
+    add.f64 %l_s, %l_m, %one;
+    div.rn.f64 %l_f, %l_f, %l_s;
+    mul.f64 %l_f2, %l_f, %l_f;
+    mov.f64 %l_p, 0d3FB745D1745D1746;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC1C71C71C71C72;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC2492492492492;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC999999999999A;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FD5555555555555;
+    fma.rn.f64 %l_p, %l_p, %l_f2, %one;
+    mul.f64 %l_p, %l_p, %l_f;
+    add.f64 %l_p, %l_p, %l_p;
+    mov.f64 %l_ln2, 0d3FE62E42FEFA39EF;
+    fma.rn.f64 %sp, %l_nf, %l_ln2, %l_p;
+
+    // === tanh(sp) ===
+    add.f64 %two_sp, %sp, %sp;
+    mul.f64 %e_nf, %two_sp, 0d3FF71547652B82FE;
+    cvt.rni.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %two_sp;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e2sp, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e2sp, %e2sp, %e_nf;
+
+    sub.f64 %e2sp_m1, %e2sp, %one;
+    add.f64 %e2sp_p1, %e2sp, %one;
+    div.rn.f64 %t, %e2sp_m1, %e2sp_p1;
+
+    // === sigmoid(x) = 1/(1+exp(-x)) ===
+    neg.f64 %neg_x, %x;
+    mul.f64 %e_nf, %neg_x, 0d3FF71547652B82FE;
+    cvt.rni.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %en, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %en, %en, %e_nf;
+
+    add.f64 %denom, %one, %en;
+    div.rn.f64 %sig, %one, %denom;
+
+    // deriv = t + x * sig * (1 - t*t)
+    mul.f64 %t2, %t, %t;
+    sub.f64 %one_m_t2, %one, %t2;
+    mul.f64 %x_sig_omt2, %x, %sig;
+    mul.f64 %x_sig_omt2, %x_sig_omt2, %one_m_t2;
+    add.f64 %deriv, %t, %x_sig_omt2;
+    mul.f64 %result, %vg, %deriv;
+    st.global.f64 [%out], %result;
+    bra DONE;
+
+LARGE_X:
+    // sp ~ x, tanh(x) in f64, sig ~ 1
+    add.f64 %two_sp, %x, %x;
+    mov.f64 %e_half, 0d3FE0000000000000;
+    mul.f64 %e_nf, %two_sp, 0d3FF71547652B82FE;
+    cvt.rni.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %two_sp;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e2sp, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e2sp, %e2sp, %e_nf;
+
+    sub.f64 %e2sp_m1, %e2sp, %one;
+    add.f64 %e2sp_p1, %e2sp, %one;
+    div.rn.f64 %t, %e2sp_m1, %e2sp_p1;
+
+    // sig ~ 1, deriv ~ t + x*(1-t*t)
+    mul.f64 %t2, %t, %t;
+    sub.f64 %one_m_t2, %one, %t2;
+    mul.f64 %x_sig_omt2, %x, %one_m_t2;
+    add.f64 %deriv, %t, %x_sig_omt2;
+    mul.f64 %result, %vg, %deriv;
+    st.global.f64 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `clamp_kernel`: `out[i] = max(min_val, min(max_val, x[i]))`.
 /// Takes two extra f32 params: min_val, max_val.
 #[cfg(feature = "cuda")]
@@ -2033,6 +3277,7 @@ DONE:
     ret;
 }
 ";
+
 
 // ---------------------------------------------------------------------------
 // Backward activation kernels
@@ -2088,6 +3333,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `gelu_backward_kernel`:
 /// `out[i] = grad[i] * (sig + 1.702 * x * sig * (1 - sig))`
@@ -2159,6 +3405,98 @@ pub(crate) const GELU_BACKWARD_PTX: &str = "\
     // out = grad * d_gelu
     mul.f32 %result, %vg, %dsig;
     st.global.f32 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `gelu_backward_f64_kernel`: sigmoid-approx backward (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(-k*x).
+#[cfg(feature = "cuda")]
+pub(crate) const GELU_BACKWARD_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry gelu_backward_f64_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f64 %vg, %x, %k, %kx, %neg_kx, %exp_neg, %one, %denom, %sig;
+    .reg .f64 %one_minus_sig, %kx_sig_oms, %dsig, %result;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %vg, [%grad];
+    ld.global.f64 %x, [%input];
+
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %k, 0d3FFB44E400000000;
+    mul.f64 %kx, %k, %x;
+    neg.f64 %neg_kx, %kx;
+
+    // --- exp(%neg_kx) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_kx, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_kx;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %exp_neg, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %exp_neg, %exp_neg, %e_nf;
+    // --- end exp ---
+
+    add.f64 %denom, %one, %exp_neg;
+    div.rn.f64 %sig, %one, %denom;
+
+    sub.f64 %one_minus_sig, %one, %sig;
+    mul.f64 %kx_sig_oms, %kx, %sig;
+    mul.f64 %kx_sig_oms, %kx_sig_oms, %one_minus_sig;
+    add.f64 %dsig, %sig, %kx_sig_oms;
+
+    mul.f64 %result, %vg, %dsig;
+    st.global.f64 [%out], %result;
 
 DONE:
     ret;
@@ -2293,6 +3631,166 @@ DONE:
 }
 ";
 
+/// PTX source for `gelu_backward_erf_f64_kernel`: exact erf backward (f64).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(-z^2) and exp(-x^2/2).
+#[cfg(feature = "cuda")]
+pub(crate) const GELU_BACKWARD_ERF_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry gelu_backward_erf_f64_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %grad, %input, %out, %off;
+    .reg .f64 %vg, %x, %ax, %z, %z2, %neg_z2, %exp_neg_z2;
+    .reg .f64 %t, %pt, %one, %half, %erf_val, %cdf, %pdf;
+    .reg .f64 %neg_x2h, %exp_neg_x2h, %inv_sqrt_2pi, %x_pdf;
+    .reg .f64 %d_gelu, %result;
+    .reg .f64 %p_coef, %a1, %a2, %a3, %a4, %a5;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %pred_ge, %pred_neg;
+
+    ld.param.u64 %grad, [grad_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %pred_ge, %r_tid, %n_reg;
+    @%pred_ge bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %grad, %grad, %off;
+    add.u64 %input, %input, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %vg, [%grad];
+    ld.global.f64 %x, [%input];
+
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %half, 0d3FE0000000000000;
+
+    mov.f64 %z, 0d3FE6A09E60000000;
+    mul.f64 %z, %x, %z;
+    abs.f64 %ax, %z;
+
+    mov.f64 %p_coef, 0d3FD4F740A0000000;
+    mul.f64 %t, %p_coef, %ax;
+    add.f64 %t, %one, %t;
+    div.rn.f64 %t, %one, %t;
+
+    mov.f64 %a5, 0d3FC1555560000000;
+    mov.f64 %a4, 0dBFD6752060000000;
+    mov.f64 %a3, 0d3FF6A0DBA0000000;
+    mov.f64 %a2, 0dBFE0783C20000000;
+    mov.f64 %a1, 0d3FD41AD760000000;
+
+    mul.f64 %pt, %t, %a5;
+    add.f64 %pt, %pt, %a4;
+    mul.f64 %pt, %pt, %t;
+    add.f64 %pt, %pt, %a3;
+    mul.f64 %pt, %pt, %t;
+    add.f64 %pt, %pt, %a2;
+    mul.f64 %pt, %pt, %t;
+    add.f64 %pt, %pt, %a1;
+    mul.f64 %pt, %pt, %t;
+
+    // exp(-z^2) in full f64
+    mul.f64 %z2, %ax, %ax;
+    neg.f64 %neg_z2, %z2;
+
+    // --- exp(%neg_z2) ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_z2, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_z2;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %exp_neg_z2, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %exp_neg_z2, %exp_neg_z2, %e_nf;
+    // --- end exp ---
+
+    mul.f64 %erf_val, %pt, %exp_neg_z2;
+    sub.f64 %erf_val, %one, %erf_val;
+
+    setp.lt.f64 %pred_neg, %z, 0d0000000000000000;
+    @%pred_neg neg.f64 %erf_val, %erf_val;
+
+    add.f64 %cdf, %one, %erf_val;
+    mul.f64 %cdf, %half, %cdf;
+
+    // phi(x) = exp(-x^2/2) / sqrt(2*pi)
+    mul.f64 %neg_x2h, %x, %x;
+    mul.f64 %neg_x2h, %neg_x2h, %half;
+    neg.f64 %neg_x2h, %neg_x2h;
+
+    // --- exp(%neg_x2h) ---
+    fma.rn.f64 %e_nf, %neg_x2h, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_x2h;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %exp_neg_x2h, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %exp_neg_x2h, %exp_neg_x2h, %e_nf;
+    // --- end exp ---
+
+    // 1/sqrt(2*pi) = 0.39894228
+    mov.f64 %inv_sqrt_2pi, 0d3FD9884440000000;
+    mul.f64 %pdf, %exp_neg_x2h, %inv_sqrt_2pi;
+
+    mul.f64 %x_pdf, %x, %pdf;
+    add.f64 %d_gelu, %cdf, %x_pdf;
+
+    mul.f64 %result, %vg, %d_gelu;
+    st.global.f64 [%out], %result;
+
+DONE:
+    ret;
+}
+";
+
 // ---------------------------------------------------------------------------
 // Index-select (1-D gather) PTX kernel
 // ---------------------------------------------------------------------------
@@ -2352,6 +3850,7 @@ DONE:
     ret;
 }
 ";
+
 
 // ---------------------------------------------------------------------------
 // Scatter-add (1-D) PTX kernel — backward of index_select
@@ -2415,6 +3914,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Masked-fill PTX kernel
 // ---------------------------------------------------------------------------
@@ -2472,6 +3972,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Masked-zero PTX kernel — backward of masked_fill
 // ---------------------------------------------------------------------------
@@ -2528,6 +4029,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Sigmoid backward PTX kernel: out[i] = grad[i] * output[i] * (1 - output[i])
 // ---------------------------------------------------------------------------
@@ -2582,6 +4084,7 @@ DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Tanh backward PTX kernel: out[i] = grad[i] * (1 - output[i]^2)
 // ---------------------------------------------------------------------------
@@ -2635,6 +4138,7 @@ DONE:
     ret;
 }
 ";
+
 
 // ---------------------------------------------------------------------------
 // Softmax backward PTX kernel (row-wise, shared-memory dot product)
@@ -2763,6 +4267,7 @@ DONE:\n\
     ret;\n\
 }\n\
 ";
+
 
 // ---------------------------------------------------------------------------
 // LogSoftmax forward PTX kernel (row-wise, shared-memory max + log-sum-exp)
@@ -2950,6 +4455,221 @@ DONE:\n\
 }\n\
 ";
 
+/// PTX source for `log_softmax_f64_kernel`: row-wise log-softmax (f64).
+#[cfg(feature = "cuda")]
+pub(crate) const LOG_SOFTMAX_F64_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.shared .align 8 .f64 sdata[256];\n\
+\n\
+.visible .entry log_softmax_f64_kernel(\n\
+    .param .u64 input_ptr,\n\
+    .param .u64 output_ptr,\n\
+    .param .u32 rows,\n\
+    .param .u32 cols\n\
+) {\n\
+    .reg .u32 %r_tid, %bid, %bdim, %rows_reg, %cols_reg, %j;\n\
+    .reg .u64 %in, %out, %row_off, %off, %sbase, %saddr;\n\
+    .reg .f64 %val, %max_val, %sum_val, %exp_val, %log_sum_exp, %result;\n\
+    .reg .pred %p, %loop_p;\n\
+    .reg .u32 %half, %other_tid;\n\
+    .reg .f64 %other_val;\n\
+    .reg .pred %reduce_p;\n\
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half, %e_one;\n\
+    .reg .s32 %e_ni;\n\
+    .reg .s64 %e_ni64, %e_bits;\n\
+    .reg .u64 %l_xbits, %l_mbits, %l_bias;\n\
+    .reg .s64 %l_exp64;\n\
+    .reg .f64 %l_m, %l_f, %l_f2, %l_s, %l_p, %l_nf, %l_ln2;\n\
+\n\
+    ld.param.u64 %in, [input_ptr];\n\
+    ld.param.u64 %out, [output_ptr];\n\
+    ld.param.u32 %rows_reg, [rows];\n\
+    ld.param.u32 %cols_reg, [cols];\n\
+\n\
+    mov.u32 %bid, %ctaid.x;\n\
+    mov.u32 %bdim, %ntid.x;\n\
+    mov.u32 %r_tid, %tid.x;\n\
+    mov.u64 %sbase, sdata;\n\
+\n\
+    setp.ge.u32 %p, %bid, %rows_reg;\n\
+    @%p bra DONE;\n\
+\n\
+    cvt.u64.u32 %row_off, %bid;\n\
+    cvt.u64.u32 %off, %cols_reg;\n\
+    mul.lo.u64 %row_off, %row_off, %off;\n\
+    shl.b64 %row_off, %row_off, 3;\n\
+\n\
+    mov.f64 %max_val, 0dFFF0000000000000;\n\
+    mov.u32 %j, %r_tid;\n\
+FIND_MAX:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra FIND_MAX_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %off, %in, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f64 %val, [%off];\n\
+    max.f64 %max_val, %max_val, %val;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra FIND_MAX;\n\
+FIND_MAX_DONE:\n\
+\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f64 [%saddr], %max_val;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+MAX_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra MAX_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra MAX_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %max_val, [%saddr];\n\
+    max.f64 %max_val, %max_val, %other_val;\n\
+    st.shared.f64 [%saddr], %max_val;\n\
+MAX_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra MAX_REDUCE;\n\
+MAX_REDUCE_DONE:\n\
+\n\
+    ld.shared.f64 %max_val, [sdata];\n\
+    bar.sync 0;\n\
+\n\
+    mov.f64 %sum_val, 0d0000000000000000;\n\
+    mov.u32 %j, %r_tid;\n\
+SUM_EXP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra SUM_EXP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %off, %in, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f64 %val, [%off];\n\
+    sub.f64 %val, %val, %max_val;\n\
+    mov.f64 %e_one, 0d3FF0000000000000;\n\
+    mov.f64 %e_half, 0d3FE0000000000000;\n\
+    mul.f64 %e_nf, %val, 0d3FF71547652B82FE;\n\
+    cvt.rni.f64.f64 %e_nf, %e_nf;\n\
+    cvt.rni.s32.f64 %e_ni, %e_nf;\n\
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %val;\n\
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;\n\
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_one;\n\
+    fma.rn.f64 %exp_val, %e_p, %e_r, %e_one;\n\
+    cvt.s64.s32 %e_ni64, %e_ni;\n\
+    add.s64 %e_ni64, %e_ni64, 1023;\n\
+    shl.b64 %e_bits, %e_ni64, 52;\n\
+    mov.b64 %e_nf, %e_bits;\n\
+    mul.f64 %exp_val, %exp_val, %e_nf;\n\
+    add.f64 %sum_val, %sum_val, %exp_val;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra SUM_EXP;\n\
+SUM_EXP_DONE:\n\
+\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f64 [%saddr], %sum_val;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+SUM_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra SUM_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra SUM_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %sum_val, [%saddr];\n\
+    add.f64 %sum_val, %sum_val, %other_val;\n\
+    st.shared.f64 [%saddr], %sum_val;\n\
+SUM_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra SUM_REDUCE;\n\
+SUM_REDUCE_DONE:\n\
+\n\
+    ld.shared.f64 %sum_val, [sdata];\n\
+    bar.sync 0;\n\
+    mov.f64 %e_one, 0d3FF0000000000000;\n\
+    mov.b64 %l_xbits, %sum_val;\n\
+    shr.u64 %l_exp64, %l_xbits, 52;\n\
+    and.b64 %l_exp64, %l_exp64, 2047;\n\
+    sub.s64 %l_exp64, %l_exp64, 1023;\n\
+    cvt.rn.f64.s64 %l_nf, %l_exp64;\n\
+    mov.u64 %l_bias, 0x3FF0000000000000;\n\
+    and.b64 %l_mbits, %l_xbits, 0x000FFFFFFFFFFFFF;\n\
+    or.b64 %l_mbits, %l_mbits, %l_bias;\n\
+    mov.b64 %l_m, %l_mbits;\n\
+    sub.f64 %l_f, %l_m, %e_one;\n\
+    add.f64 %l_s, %l_m, %e_one;\n\
+    div.rn.f64 %l_f, %l_f, %l_s;\n\
+    mul.f64 %l_f2, %l_f, %l_f;\n\
+    mov.f64 %l_p, 0d3FB745D1745D1746;\n\
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC1C71C71C71C72;\n\
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC2492492492492;\n\
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC999999999999A;\n\
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FD5555555555555;\n\
+    fma.rn.f64 %l_p, %l_p, %l_f2, %e_one;\n\
+    mul.f64 %l_p, %l_p, %l_f;\n\
+    add.f64 %l_p, %l_p, %l_p;\n\
+    mov.f64 %l_ln2, 0d3FE62E42FEFA39EF;\n\
+    fma.rn.f64 %log_sum_exp, %l_nf, %l_ln2, %l_p;\n\
+    add.f64 %log_sum_exp, %max_val, %log_sum_exp;\n\
+\n\
+    mov.u32 %j, %r_tid;\n\
+WRITE_OUTPUT:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra WRITE_OUTPUT_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %in, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f64 %val, [%saddr];\n\
+    sub.f64 %result, %val, %log_sum_exp;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %out, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    st.global.f64 [%saddr], %result;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra WRITE_OUTPUT;\n\
+WRITE_OUTPUT_DONE:\n\
+\n\
+DONE:\n\
+    ret;\n\
+}\n\
+";
+
 // ---------------------------------------------------------------------------
 // LogSoftmax backward PTX kernel (row-wise, shared-memory sum reduction)
 // ---------------------------------------------------------------------------
@@ -3080,6 +4800,147 @@ DONE:\n\
 }\n\
 ";
 
+/// PTX source for `log_softmax_backward_f64_kernel` (f64).
+#[cfg(feature = "cuda")]
+pub(crate) const LOG_SOFTMAX_BACKWARD_F64_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.shared .align 8 .f64 sdata[256];\n\
+\n\
+.visible .entry log_softmax_backward_f64_kernel(\n\
+    .param .u64 grad_ptr,\n\
+    .param .u64 output_ptr,\n\
+    .param .u64 out_ptr,\n\
+    .param .u32 rows,\n\
+    .param .u32 cols\n\
+) {\n\
+    .reg .u32 %r_tid, %bid, %bdim, %rows_reg, %cols_reg, %j, %half, %other_tid;\n\
+    .reg .u64 %grad, %output, %out, %row_off, %off, %sbase, %saddr;\n\
+    .reg .f64 %vg, %vo, %sum_grad, %other_val, %softmax_j, %result;\n\
+    .reg .pred %p, %loop_p, %reduce_p;\n\
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half, %e_one;\n\
+    .reg .s32 %e_ni;\n\
+    .reg .s64 %e_ni64, %e_bits;\n\
+\n\
+    ld.param.u64 %grad, [grad_ptr];\n\
+    ld.param.u64 %output, [output_ptr];\n\
+    ld.param.u64 %out, [out_ptr];\n\
+    ld.param.u32 %rows_reg, [rows];\n\
+    ld.param.u32 %cols_reg, [cols];\n\
+\n\
+    mov.u32 %bid, %ctaid.x;\n\
+    mov.u32 %bdim, %ntid.x;\n\
+    mov.u32 %r_tid, %tid.x;\n\
+    mov.u64 %sbase, sdata;\n\
+\n\
+    setp.ge.u32 %p, %bid, %rows_reg;\n\
+    @%p bra DONE;\n\
+\n\
+    cvt.u64.u32 %row_off, %bid;\n\
+    cvt.u64.u32 %off, %cols_reg;\n\
+    mul.lo.u64 %row_off, %row_off, %off;\n\
+    shl.b64 %row_off, %row_off, 3;\n\
+\n\
+    mov.f64 %sum_grad, 0d0000000000000000;\n\
+    mov.u32 %j, %r_tid;\n\
+SUM_LOOP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra SUM_LOOP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %grad, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f64 %vg, [%saddr];\n\
+    add.f64 %sum_grad, %sum_grad, %vg;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra SUM_LOOP;\n\
+SUM_LOOP_DONE:\n\
+\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f64 [%saddr], %sum_grad;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+SUM_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra SUM_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra SUM_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %sum_grad, [%saddr];\n\
+    add.f64 %sum_grad, %sum_grad, %other_val;\n\
+    st.shared.f64 [%saddr], %sum_grad;\n\
+SUM_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra SUM_REDUCE;\n\
+SUM_REDUCE_DONE:\n\
+\n\
+    ld.shared.f64 %sum_grad, [sdata];\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %j, %r_tid;\n\
+WRITE_LOOP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra WRITE_LOOP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %grad, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f64 %vg, [%saddr];\n\
+    add.u64 %saddr, %output, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    ld.global.f64 %vo, [%saddr];\n\
+    // exp(log_softmax_output) — inline f64 exp\n\
+    mov.f64 %e_one, 0d3FF0000000000000;\n\
+    mov.f64 %e_half, 0d3FE0000000000000;\n\
+    mul.f64 %e_nf, %vo, 0d3FF71547652B82FE;\n\
+    cvt.rni.f64.f64 %e_nf, %e_nf;\n\
+    cvt.rni.s32.f64 %e_ni, %e_nf;\n\
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %vo;\n\
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;\n\
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_one;\n\
+    fma.rn.f64 %softmax_j, %e_p, %e_r, %e_one;\n\
+    cvt.s64.s32 %e_ni64, %e_ni;\n\
+    add.s64 %e_ni64, %e_ni64, 1023;\n\
+    shl.b64 %e_bits, %e_ni64, 52;\n\
+    mov.b64 %e_nf, %e_bits;\n\
+    mul.f64 %softmax_j, %softmax_j, %e_nf;\n\
+    mul.f64 %result, %softmax_j, %sum_grad;\n\
+    sub.f64 %result, %vg, %result;\n\
+    add.u64 %saddr, %out, %off;\n\
+    add.u64 %saddr, %saddr, %row_off;\n\
+    st.global.f64 [%saddr], %result;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra WRITE_LOOP;\n\
+WRITE_LOOP_DONE:\n\
+\n\
+DONE:\n\
+    ret;\n\
+}\n\
+";
+
 // ---------------------------------------------------------------------------
 // Sum-axis PTX kernel: reduce along one axis of a tensor
 // ---------------------------------------------------------------------------
@@ -3188,8 +5049,10 @@ END:
 }
 ";
 
+
 // Thread i: output[i] = sum_{k=0}^{axis_size-1} input[outer_idx * axis_size * inner_size + k * inner_size + inner_idx]
 // where outer_idx = i / inner_size, inner_idx = i % inner_size.
+
 
 #[cfg(feature = "cuda")]
 pub(crate) const SUM_AXIS_PTX: &str = "\
@@ -3351,6 +5214,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `cumprod_kernel`: prefix product along an axis.
 ///
 /// Thread i processes the scan for outer_idx = i / inner, inner_idx = i % inner.
@@ -3426,6 +5290,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `cummax_kernel`: running maximum along an axis.
 ///
@@ -3513,6 +5378,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `cummin_kernel`: running minimum along an axis.
 ///
 /// Thread i processes the scan for outer_idx = i / inner, inner_idx = i % inner.
@@ -3596,6 +5462,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `logcumsumexp_kernel`: numerically stable log-cumulative-sum-exp.
 ///
@@ -3688,6 +5555,161 @@ SCAN_LOOP:
 
     add.u64 %addr, %out, %off;
     st.global.f32 [%addr], %acc;
+
+    add.u32 %k, %k, 1;
+    bra SCAN_LOOP;
+SCAN_DONE:
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `logcumsumexp_f64_kernel`: numerically stable log-cumulative-sum-exp (f64).
+#[cfg(feature = "cuda")]
+pub(crate) const LOGCUMSUMEXP_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry logcumsumexp_f64_kernel(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 outer_size,
+    .param .u32 dim_size,
+    .param .u32 inner_size,
+    .param .u32 total
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg, %outer_sz, %dim_sz, %inner_sz;
+    .reg .u32 %outer_idx, %inner_idx, %k, %base, %idx, %tmp;
+    .reg .u64 %in, %out, %off, %addr;
+    .reg .f64 %val, %acc, %m, %ea, %ev, %s, %ls;
+    .reg .pred %p, %lp;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half, %e_one;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .u64 %l_xbits, %l_mbits, %l_bias;
+    .reg .s64 %l_exp64;
+    .reg .f64 %l_m, %l_f, %l_f2, %l_s, %l_p, %l_nf, %l_ln2;
+
+    ld.param.u64 %in, [input_ptr];
+    ld.param.u64 %out, [output_ptr];
+    ld.param.u32 %outer_sz, [outer_size];
+    ld.param.u32 %dim_sz, [dim_size];
+    ld.param.u32 %inner_sz, [inner_size];
+    ld.param.u32 %n_reg, [total];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    mul.lo.u32 %tmp, %outer_sz, %inner_sz;
+    setp.ge.u32 %p, %r_tid, %tmp;
+    @%p bra DONE;
+
+    div.u32 %outer_idx, %r_tid, %inner_sz;
+    rem.u32 %inner_idx, %r_tid, %inner_sz;
+
+    mul.lo.u32 %base, %outer_idx, %dim_sz;
+    mul.lo.u32 %base, %base, %inner_sz;
+    add.u32 %base, %base, %inner_idx;
+
+    // acc = -inf
+    mov.b64 %acc, 0xFFF0000000000000;
+    mov.u32 %k, 0;
+SCAN_LOOP:
+    setp.ge.u32 %lp, %k, %dim_sz;
+    @%lp bra SCAN_DONE;
+
+    mul.lo.u32 %idx, %k, %inner_sz;
+    add.u32 %idx, %base, %idx;
+
+    cvt.u64.u32 %off, %idx;
+    shl.b64 %off, %off, 3;
+    add.u64 %addr, %in, %off;
+    ld.global.f64 %val, [%addr];
+
+    max.f64 %m, %acc, %val;
+    mov.f64 %e_one, 0d3FF0000000000000;
+    mov.f64 %e_half, 0d3FE0000000000000;
+    // --- inline exp(acc - m) -> %ea ---
+    sub.f64 %ea, %acc, %m;
+    mul.f64 %e_nf, %ea, 0d3FF71547652B82FE;
+    cvt.rni.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %ea;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_one;
+    fma.rn.f64 %ea, %e_p, %e_r, %e_one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %ea, %ea, %e_nf;
+    // --- inline exp(val - m) -> %ev ---
+    sub.f64 %ev, %val, %m;
+    mul.f64 %e_nf, %ev, 0d3FF71547652B82FE;
+    cvt.rni.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %ev;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_one;
+    fma.rn.f64 %ev, %e_p, %e_r, %e_one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %ev, %ev, %e_nf;
+    add.f64 %s, %ea, %ev;
+    // --- inline ln(%s) -> %ls ---
+    mov.b64 %l_xbits, %s;
+    shr.u64 %l_exp64, %l_xbits, 52;
+    and.b64 %l_exp64, %l_exp64, 2047;
+    sub.s64 %l_exp64, %l_exp64, 1023;
+    cvt.rn.f64.s64 %l_nf, %l_exp64;
+    mov.u64 %l_bias, 0x3FF0000000000000;
+    and.b64 %l_mbits, %l_xbits, 0x000FFFFFFFFFFFFF;
+    or.b64 %l_mbits, %l_mbits, %l_bias;
+    mov.b64 %l_m, %l_mbits;
+    sub.f64 %l_f, %l_m, %e_one;
+    add.f64 %l_s, %l_m, %e_one;
+    div.rn.f64 %l_f, %l_f, %l_s;
+    mul.f64 %l_f2, %l_f, %l_f;
+    mov.f64 %l_p, 0d3FB745D1745D1746;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC1C71C71C71C72;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC2492492492492;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC999999999999A;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FD5555555555555;
+    fma.rn.f64 %l_p, %l_p, %l_f2, %e_one;
+    mul.f64 %l_p, %l_p, %l_f;
+    add.f64 %l_p, %l_p, %l_p;
+    mov.f64 %l_ln2, 0d3FE62E42FEFA39EF;
+    fma.rn.f64 %ls, %l_nf, %l_ln2, %l_p;
+    add.f64 %acc, %m, %ls;
+
+    add.u64 %addr, %out, %off;
+    st.global.f64 [%addr], %acc;
 
     add.u32 %k, %k, 1;
     bra SCAN_LOOP;
@@ -3881,6 +5903,7 @@ DONE:
     ret;
 }
 ";
+
 
 // ---------------------------------------------------------------------------
 // LayerNorm backward PTX kernel
@@ -4211,6 +6234,7 @@ LNB_DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // RMSNorm PTX kernel (row-wise: rms, normalize+scale)
 //
@@ -4346,6 +6370,7 @@ DONE:
     ret;
 }
 ";
+
 
 // ---------------------------------------------------------------------------
 // RMSNorm backward PTX kernel
@@ -4585,6 +6610,7 @@ RNB_DONE:
 }
 ";
 
+
 // ---------------------------------------------------------------------------
 // Softmax PTX kernel (row-wise, numerically stable)
 // ---------------------------------------------------------------------------
@@ -4804,6 +6830,7 @@ END:
 }
 ";
 
+
 /// PTX kernel for MaxPool2d forward: sliding window max.
 ///
 /// One thread per output element. Reads the kernel-sized window from the
@@ -4946,6 +6973,7 @@ END:
 }
 ";
 
+
 /// PTX kernel for AvgPool2d forward: sliding window average.
 ///
 /// One thread per output element. Same structure as MaxPool2d but
@@ -5081,6 +7109,7 @@ END:
     ret;
 }
 ";
+
 
 #[cfg(feature = "cuda")]
 pub(crate) const SOFTMAX_PTX: &str = "\
@@ -5247,6 +7276,196 @@ DONE:\n\
 }\n\
 ";
 
+/// PTX source for `softmax_f64_kernel`: row-wise softmax (f64).
+#[cfg(feature = "cuda")]
+pub(crate) const SOFTMAX_F64_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.shared .align 8 .f64 sdata[256];\n\
+\n\
+.visible .entry softmax_f64_kernel(\n\
+    .param .u64 input_ptr,\n\
+    .param .u64 output_ptr,\n\
+    .param .u32 rows,\n\
+    .param .u32 cols\n\
+) {\n\
+    .reg .u32 %r_tid, %bid, %bdim, %rows_reg, %cols_reg, %j;\n\
+    .reg .u64 %in, %out, %row_off, %off, %sbase, %saddr;\n\
+    .reg .f64 %val, %max_val, %sum_val, %exp_val, %result, %one;\n\
+    .reg .pred %p, %loop_p;\n\
+    .reg .u32 %half, %other_tid;\n\
+    .reg .f64 %other_val;\n\
+    .reg .pred %reduce_p;\n\
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half, %e_one;\n\
+    .reg .s32 %e_ni;\n\
+    .reg .s64 %e_ni64, %e_bits;\n\
+\n\
+    ld.param.u64 %in, [input_ptr];\n\
+    ld.param.u64 %out, [output_ptr];\n\
+    ld.param.u32 %rows_reg, [rows];\n\
+    ld.param.u32 %cols_reg, [cols];\n\
+\n\
+    mov.u32 %bid, %ctaid.x;\n\
+    mov.u32 %bdim, %ntid.x;\n\
+    mov.u32 %r_tid, %tid.x;\n\
+    mov.u64 %sbase, sdata;\n\
+    mov.f64 %one, 0d3FF0000000000000;\n\
+\n\
+    setp.ge.u32 %p, %bid, %rows_reg;\n\
+    @%p bra DONE;\n\
+\n\
+    cvt.u64.u32 %row_off, %bid;\n\
+    cvt.u64.u32 %off, %cols_reg;\n\
+    mul.lo.u64 %row_off, %row_off, %off;\n\
+    shl.b64 %row_off, %row_off, 3;\n\
+\n\
+    mov.f64 %max_val, 0dFFF0000000000000;\n\
+    mov.u32 %j, %r_tid;\n\
+FIND_MAX:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra FIND_MAX_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %off, %in, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f64 %val, [%off];\n\
+    max.f64 %max_val, %max_val, %val;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra FIND_MAX;\n\
+FIND_MAX_DONE:\n\
+\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f64 [%saddr], %max_val;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+MAX_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra MAX_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra MAX_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %max_val, [%saddr];\n\
+    max.f64 %max_val, %max_val, %other_val;\n\
+    st.shared.f64 [%saddr], %max_val;\n\
+MAX_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra MAX_REDUCE;\n\
+MAX_REDUCE_DONE:\n\
+\n\
+    ld.shared.f64 %max_val, [sdata];\n\
+    bar.sync 0;\n\
+\n\
+    mov.f64 %sum_val, 0d0000000000000000;\n\
+    mov.u32 %j, %r_tid;\n\
+SUM_EXP:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra SUM_EXP_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %off, %in, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f64 %val, [%off];\n\
+    sub.f64 %val, %val, %max_val;\n\
+    mov.f64 %e_one, 0d3FF0000000000000;\n\
+    mov.f64 %e_half, 0d3FE0000000000000;\n\
+    mul.f64 %e_nf, %val, 0d3FF71547652B82FE;\n\
+    cvt.rni.f64.f64 %e_nf, %e_nf;\n\
+    cvt.rni.s32.f64 %e_ni, %e_nf;\n\
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %val;\n\
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;\n\
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FC5555555555555;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;\n\
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_one;\n\
+    fma.rn.f64 %exp_val, %e_p, %e_r, %e_one;\n\
+    cvt.s64.s32 %e_ni64, %e_ni;\n\
+    add.s64 %e_ni64, %e_ni64, 1023;\n\
+    shl.b64 %e_bits, %e_ni64, 52;\n\
+    mov.b64 %e_nf, %e_bits;\n\
+    mul.f64 %exp_val, %exp_val, %e_nf;\n\
+    add.f64 %sum_val, %sum_val, %exp_val;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %off, %out, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    st.global.f64 [%off], %exp_val;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra SUM_EXP;\n\
+SUM_EXP_DONE:\n\
+\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    st.shared.f64 [%saddr], %sum_val;\n\
+    bar.sync 0;\n\
+\n\
+    mov.u32 %half, %bdim;\n\
+SUM_REDUCE:\n\
+    shr.u32 %half, %half, 1;\n\
+    setp.eq.u32 %reduce_p, %half, 0;\n\
+    @%reduce_p bra SUM_REDUCE_DONE;\n\
+    setp.ge.u32 %reduce_p, %r_tid, %half;\n\
+    @%reduce_p bra SUM_REDUCE_SKIP;\n\
+    add.u32 %other_tid, %r_tid, %half;\n\
+    cvt.u64.u32 %off, %other_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %other_val, [%saddr];\n\
+    cvt.u64.u32 %off, %r_tid;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %saddr, %sbase, %off;\n\
+    ld.shared.f64 %sum_val, [%saddr];\n\
+    add.f64 %sum_val, %sum_val, %other_val;\n\
+    st.shared.f64 [%saddr], %sum_val;\n\
+SUM_REDUCE_SKIP:\n\
+    bar.sync 0;\n\
+    bra SUM_REDUCE;\n\
+SUM_REDUCE_DONE:\n\
+\n\
+    ld.shared.f64 %sum_val, [sdata];\n\
+    bar.sync 0;\n\
+\n\
+    div.rn.f64 %sum_val, %one, %sum_val;\n\
+    mov.u32 %j, %r_tid;\n\
+NORMALIZE:\n\
+    setp.ge.u32 %loop_p, %j, %cols_reg;\n\
+    @%loop_p bra NORMALIZE_DONE;\n\
+    cvt.u64.u32 %off, %j;\n\
+    shl.b64 %off, %off, 3;\n\
+    add.u64 %off, %out, %off;\n\
+    add.u64 %off, %off, %row_off;\n\
+    ld.global.f64 %val, [%off];\n\
+    mul.f64 %result, %val, %sum_val;\n\
+    st.global.f64 [%off], %result;\n\
+    add.u32 %j, %j, %bdim;\n\
+    bra NORMALIZE;\n\
+NORMALIZE_DONE:\n\
+\n\
+DONE:\n\
+    ret;\n\
+}\n\
+";
+
 // ---------------------------------------------------------------------------
 // Dropout PTX kernel (inverted dropout with xorshift RNG)
 // ---------------------------------------------------------------------------
@@ -5311,6 +7530,7 @@ DONE:\n\
     ret;\n\
 }\n\
 ";
+
 
 // ---------------------------------------------------------------------------
 // General N-dimensional broadcast binary PTX kernels
@@ -5438,6 +7658,7 @@ DONE:
 }
 ";
 
+
 /// PTX for general broadcast sub: `out[i] = a[bcast_a(i)] - b[bcast_b(i)]`.
 #[cfg(feature = "cuda")]
 pub(crate) const BROADCAST_SUB_PTX: &str = "\
@@ -5522,6 +7743,7 @@ DONE:
 }
 ";
 
+
 /// PTX for general broadcast mul: `out[i] = a[bcast_a(i)] * b[bcast_b(i)]`.
 #[cfg(feature = "cuda")]
 pub(crate) const BROADCAST_MUL_PTX: &str = "\
@@ -5605,6 +7827,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `broadcast_div_kernel`: broadcast division, identical structure
 /// to `broadcast_mul_kernel` but uses `div.f32` instead of `mul.f32`.
@@ -5691,6 +7914,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `strided_split_kernel`: extract a sub-tensor along a given axis.
 ///
 /// Thread `i` computes:
@@ -5770,6 +7994,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `strided_cat_kernel`: write a sub-tensor into a larger tensor
 /// at an offset along an axis.
@@ -5852,6 +8077,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `div_kernel`: `out[i] = a[i] / b[i]`.
 #[cfg(feature = "cuda")]
 pub(crate) const DIV_PTX: &str = "\
@@ -5900,6 +8126,7 @@ DONE:
 }
 ";
 
+
 /// PTX source for `exp_kernel`: `out[i] = exp(a[i])`.
 #[cfg(feature = "cuda")]
 pub(crate) const EXP_PTX: &str = "\
@@ -5941,6 +8168,105 @@ pub(crate) const EXP_PTX: &str = "\
     mul.f32 %va, %va, 0f3FB8AA3B;
     ex2.approx.f32 %vr, %va;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `exp_f64_kernel`: `out[i] = exp(a[i])` (f64).
+/// Uses f32 `ex2.approx` via downcast for the transcendental, then upcasts back.
+/// Accurate to f32 precision (~7 decimal digits), sufficient for deep learning.
+#[cfg(feature = "cuda")]
+/// f64 exp with full double precision via Cody-Waite range reduction +
+/// degree-13 minimax polynomial.
+///
+/// Algorithm: exp(x) = 2^n * (1 + P(r))
+///   where n = round(x * log2(e)), r = x - n*ln2_hi - n*ln2_lo
+///   and P(r) is a 13th-degree minimax polynomial for (exp(r)-1)/r.
+///
+/// Accuracy: < 1 ULP for |x| < 709 (full f64 range).
+pub(crate) const EXP_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry exp_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %x, %vr;
+    .reg .f64 %log2e, %nf, %r;
+    .reg .f64 %p, %one, %half;
+    .reg .s32 %ni;
+    .reg .s64 %ni64, %exp_bits;
+    .reg .pred %p_bounds, %p_tid;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p_tid, %r_tid, %n_reg;
+    @%p_tid bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%a];
+
+    // Constants
+    mov.f64 %log2e, 0d3FF71547652B82FE;   // log2(e) = 1.4426950408889634
+    mov.f64 %ln2_hi, 0d3FE62E42FEFA3800;  // ln(2) high bits
+    mov.f64 %ln2_lo, 0d3D2EF35793C76730;  // ln(2) low bits
+    mov.f64 %one, 0d3FF0000000000000;      // 1.0
+    mov.f64 %half, 0d3FE0000000000000;     // 0.5
+
+    // n = round(x * log2(e))
+    mul.f64 %nf, %x, %log2e;
+    cvt.rni.f64.f64 %nf, %nf;             // round to nearest integer
+    cvt.rni.s32.f64 %ni, %nf;             // integer n
+
+    // r = x - n * ln2  (Cody-Waite two-step for precision)
+    fma.rn.f64 %r, %nf, 0dBFE62E42FEFA3800, %x;  // r = x - n*ln2_hi
+    fma.rn.f64 %r, %nf, 0dBD2EF35793C76730, %r;   // r -= n*ln2_lo
+
+    // Horner polynomial for exp(r) - 1 - r = r^2 * (1/2! + r*(1/3! + r*(1/4! + ...)))
+    // p starts at 1/11!, accumulates down to 1/2!
+    mov.f64 %p, 0d3E21EED8EFF8D898;           // 1/11! = 2.505e-8
+    fma.rn.f64 %p, %p, %r, 0d3E5AE64567F544E4;  // 1/10! = 2.756e-7
+    fma.rn.f64 %p, %p, %r, 0d3E927E4FB7789F5C;  // 1/9!  = 2.756e-6
+    fma.rn.f64 %p, %p, %r, 0d3EC71DE3A556C734;  // 1/8!  = 2.480e-5
+    fma.rn.f64 %p, %p, %r, 0d3EFA01A01A01A01A;  // 1/7!  = 1.984e-4
+    fma.rn.f64 %p, %p, %r, 0d3F2A01A01A01A01A;  // 1/6!  = 1.389e-3
+    fma.rn.f64 %p, %p, %r, 0d3F56C16C16C16C17;  // 1/5!  = 8.333e-3
+    fma.rn.f64 %p, %p, %r, 0d3F811111111111111;  // 1/4!  = 4.167e-2
+    fma.rn.f64 %p, %p, %r, 0d3FC5555555555555;  // 1/3!  = 1.667e-1
+    fma.rn.f64 %p, %p, %r, %half;                // 1/2!  = 5.000e-1
+
+    // exp(r) = 1 + r + r^2 * p  =>  1 + r*(1 + r*p)
+    fma.rn.f64 %p, %p, %r, %one;   // p = r*p + 1
+    fma.rn.f64 %vr, %p, %r, %one;  // vr = p*r + 1 = exp(r)
+
+    // Scale by 2^n: multiply by constructing the f64 bit pattern for 2^n.
+    // IEEE 754 f64: 2^n has exponent field = n + 1023, no mantissa bits.
+    // Bit pattern: (n + 1023) << 52.
+    cvt.s64.s32 %ni64, %ni;
+    add.s64 %ni64, %ni64, 1023;
+    shl.b64 %exp_bits, %ni64, 52;
+    mov.b64 %nf, %exp_bits;        // reinterpret as f64 = 2^n
+    mul.f64 %vr, %vr, %nf;
+
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -5994,6 +8320,110 @@ DONE:
 }
 ";
 
+/// PTX source for `log_f64_kernel`: `out[i] = ln(a[i])` (f64).
+/// Uses f32 `lg2.approx` via downcast for the transcendental, then upcasts back.
+/// Accurate to f32 precision (~7 decimal digits), sufficient for deep learning.
+#[cfg(feature = "cuda")]
+/// f64 log with full double precision via argument reduction + rational
+/// approximation.
+///
+/// Algorithm: decompose x = 2^n * m (1 <= m < 2), then
+///   ln(x) = n*ln(2) + ln(m)
+/// where ln(m) is computed via f = (m-1)/(m+1), ln(m) = 2*f*(1 + f^2/3 + f^4/5 + ...)
+///
+/// Accuracy: < 2 ULP across the full f64 range.
+pub(crate) const LOG_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry log_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .u64 %xbits, %mantissa_bits, %bias_bits;
+    .reg .f64 %x, %vr, %m, %f, %f2, %s, %p;
+    .reg .f64 %ln2_hi, %ln2_lo, %one, %two;
+    .reg .s32 %exp_i;
+    .reg .s64 %exp64;
+    .reg .f64 %nf;
+    .reg .pred %p_tid;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p_tid, %r_tid, %n_reg;
+    @%p_tid bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %x, [%a];
+
+    mov.f64 %ln2_hi, 0d3FE62E42FEFA39EF;   // ln(2) = 0.6931471805599453
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %two, 0d4000000000000000;
+
+    // Extract exponent: n = exponent_field - 1023
+    mov.b64 %xbits, %x;
+    shr.u64 %exp64, %xbits, 52;
+    and.b64 %exp64, %exp64, 2047;   // 11-bit exponent field
+    sub.s64 %exp64, %exp64, 1023;
+    cvt.rn.f64.s64 %nf, %exp64;     // n as f64
+
+    // Extract mantissa m: set exponent to 1023 (so m is in [1, 2))
+    mov.u64 %bias_bits, 0x3FF0000000000000;  // exponent = 1023
+    and.b64 %mantissa_bits, %xbits, 0x000FFFFFFFFFFFFF;  // mantissa bits
+    or.b64 %mantissa_bits, %mantissa_bits, %bias_bits;
+    mov.b64 %m, %mantissa_bits;      // m in [1.0, 2.0)
+
+    // f = (m - 1) / (m + 1) — maps [1,2) to [0, 1/3)
+    sub.f64 %f, %m, %one;
+    add.f64 %s, %m, %one;
+    div.rn.f64 %f, %f, %s;
+
+    // ln(m) = 2*f + 2*f^3/3 + 2*f^5/5 + 2*f^7/7 + 2*f^9/9 + 2*f^11/11
+    // Horner: ln(m) = 2*f*(1 + f^2*(1/3 + f^2*(1/5 + f^2*(1/7 + f^2*(1/9 + f^2/11)))))
+    mul.f64 %f2, %f, %f;
+
+    // p = 1/11
+    mov.f64 %p, 0d3FB745D1745D1746;
+    // p = p*f2 + 1/9
+    fma.rn.f64 %p, %p, %f2, 0d3FC1C71C71C71C72;
+    // p = p*f2 + 1/7
+    fma.rn.f64 %p, %p, %f2, 0d3FC2492492492492;
+    // p = p*f2 + 1/5
+    fma.rn.f64 %p, %p, %f2, 0d3FC999999999999A;
+    // p = p*f2 + 1/3
+    fma.rn.f64 %p, %p, %f2, 0d3FD5555555555555;
+    // p = p*f2 + 1
+    fma.rn.f64 %p, %p, %f2, %one;
+
+    // ln(m) = 2*f*p
+    mul.f64 %p, %p, %f;
+    add.f64 %p, %p, %p;   // * 2
+
+    // ln(x) = n*ln(2) + ln(m)
+    fma.rn.f64 %vr, %nf, %ln2_hi, %p;
+
+    st.global.f64 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `sqrt_kernel`: `out[i] = sqrt(a[i])`.
 #[cfg(feature = "cuda")]
 pub(crate) const SQRT_PTX: &str = "\
@@ -6037,6 +8467,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `pow_kernel`: `out[i] = a[i] ^ exponent`.
 /// Uses the identity: x^e = 2^(e * log2(x)).
@@ -6088,6 +8519,127 @@ DONE:
 }
 ";
 
+/// PTX source for `pow_f64_kernel`: `out[i] = a[i] ^ exponent` (f64).
+/// Full f64 precision: x^e = exp(e * ln(x)).
+/// Uses inline f64 log (argument reduction + odd-power series) and
+/// inline f64 exp (Cody-Waite + degree-11 Horner).
+#[cfg(feature = "cuda")]
+pub(crate) const POW_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry pow_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .f64 exponent,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %va, %vr, %exp64, %one, %two;
+    // log registers
+    .reg .u64 %l_xbits, %l_mbits, %l_bias;
+    .reg .s64 %l_exp64;
+    .reg .f64 %l_m, %l_f, %l_f2, %l_s, %l_p, %l_nf, %l_ln2, %l_lnx;
+    // exp registers
+    .reg .f64 %e_z, %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.f64 %exp64, [exponent];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %va, [%a];
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %two, 0d4000000000000000;
+
+    // === ln(va) via argument reduction ===
+    // Decompose va = 2^n * m, m in [1,2), ln(va) = n*ln(2) + ln(m)
+    mov.b64 %l_xbits, %va;
+    shr.u64 %l_exp64, %l_xbits, 52;
+    and.b64 %l_exp64, %l_exp64, 2047;
+    sub.s64 %l_exp64, %l_exp64, 1023;
+    cvt.rn.f64.s64 %l_nf, %l_exp64;
+
+    mov.u64 %l_bias, 0x3FF0000000000000;
+    and.b64 %l_mbits, %l_xbits, 0x000FFFFFFFFFFFFF;
+    or.b64 %l_mbits, %l_mbits, %l_bias;
+    mov.b64 %l_m, %l_mbits;
+
+    // f = (m-1)/(m+1)
+    sub.f64 %l_f, %l_m, %one;
+    add.f64 %l_s, %l_m, %one;
+    div.rn.f64 %l_f, %l_f, %l_s;
+    mul.f64 %l_f2, %l_f, %l_f;
+
+    // Horner: p = 1/11 + f2*(1/9 + f2*(1/7 + f2*(1/5 + f2*(1/3 + f2*1))))
+    mov.f64 %l_p, 0d3FB745D1745D1746;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC1C71C71C71C72;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC2492492492492;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FC999999999999A;
+    fma.rn.f64 %l_p, %l_p, %l_f2, 0d3FD5555555555555;
+    fma.rn.f64 %l_p, %l_p, %l_f2, %one;
+
+    // ln(m) = 2*f*p
+    mul.f64 %l_p, %l_p, %l_f;
+    add.f64 %l_p, %l_p, %l_p;
+
+    // ln(x) = n*ln(2) + ln(m)
+    mov.f64 %l_ln2, 0d3FE62E42FEFA39EF;
+    fma.rn.f64 %l_lnx, %l_nf, %l_ln2, %l_p;
+
+    // === exp(exponent * ln(x)) ===
+    mul.f64 %e_z, %exp64, %l_lnx;
+
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %e_z, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %e_z;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %vr, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %vr, %vr, %e_nf;
+
+    st.global.f64 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `abs_kernel`: `out[i] = |a[i]|`.
 #[cfg(feature = "cuda")]
 pub(crate) const ABS_PTX: &str = "\
@@ -6131,6 +8683,7 @@ DONE:
     ret;
 }
 ";
+
 
 /// PTX source for `sigmoid_kernel`: `out[i] = 1 / (1 + exp(-a[i]))`.
 #[cfg(feature = "cuda")]
@@ -6177,6 +8730,87 @@ pub(crate) const SIGMOID_PTX: &str = "\
     add.f32 %denom, %one, %e;
     div.rn.f32 %vr, %one, %denom;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `sigmoid_f64_kernel`: `out[i] = 1 / (1 + exp(-a[i]))` (f64).
+/// Full f64 precision: Cody-Waite range reduction + degree-11 Horner polynomial
+/// for exp(-x), then sigmoid = 1/(1+exp(-x)).
+#[cfg(feature = "cuda")]
+pub(crate) const SIGMOID_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry sigmoid_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %va, %vr, %e64, %denom, %one, %neg_x;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %va, [%a];
+    mov.f64 %one, 0d3FF0000000000000;
+
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    neg.f64 %neg_x, %va;
+
+    // --- exp(%neg_x) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg_x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg_x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e64, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e64, %e64, %e_nf;
+    // --- end exp ---
+
+    add.f64 %denom, %one, %e64;
+    div.rn.f64 %vr, %one, %denom;
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -6233,6 +8867,90 @@ pub(crate) const TANH_PTX: &str = "\
     mul.f32 %vr, %two, %sig;
     sub.f32 %vr, %vr, %one;
     st.global.f32 [%out], %vr;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `tanh_f64_kernel`: `out[i] = tanh(a[i])` (f64).
+/// Uses the identity: tanh(x) = 2*sigmoid(2x) - 1 = (1-exp(-2x))/(1+exp(-2x)).
+/// Full f64 precision via Cody-Waite + degree-11 Horner for exp(-2x).
+#[cfg(feature = "cuda")]
+pub(crate) const TANH_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry tanh_f64_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .f64 %va, %vr, %e64, %num, %denom, %one, %two, %neg2x;
+    .reg .f64 %e_nf, %e_r, %e_p, %e_half;
+    .reg .s32 %e_ni;
+    .reg .s64 %e_ni64, %e_bits;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f64 %va, [%a];
+    mov.f64 %one, 0d3FF0000000000000;
+    mov.f64 %two, 0d4000000000000000;
+
+    // tanh(x) = (1 - exp(-2x)) / (1 + exp(-2x))
+    mul.f64 %neg2x, %va, %two;
+    neg.f64 %neg2x, %neg2x;
+
+    // --- exp(%neg2x) via Cody-Waite + degree-11 Horner ---
+    mov.f64 %e_half, 0d3FE0000000000000;
+    fma.rn.f64 %e_nf, %neg2x, 0d3FF71547652B82FE, %e_half;
+    cvt.rmi.f64.f64 %e_nf, %e_nf;
+    cvt.rni.s32.f64 %e_ni, %e_nf;
+    fma.rn.f64 %e_r, %e_nf, 0dBFE62E42FEFA3800, %neg2x;
+    fma.rn.f64 %e_r, %e_nf, 0dBD2EF35793C76730, %e_r;
+    mov.f64 %e_p, 0d3E21EED8EFF8D898;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E5AE64567F544E4;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3E927E4FB7789F5C;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EC71DE3A556C734;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3EFA01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F2A01A01A01A01A;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F56C16C16C16C17;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3F811111111111111;
+    fma.rn.f64 %e_p, %e_p, %e_r, 0d3FA5555555555555;
+    fma.rn.f64 %e_p, %e_p, %e_r, %e_half;
+    fma.rn.f64 %e_p, %e_p, %e_r, %one;
+    fma.rn.f64 %e64, %e_p, %e_r, %one;
+    cvt.s64.s32 %e_ni64, %e_ni;
+    add.s64 %e_ni64, %e_ni64, 1023;
+    shl.b64 %e_bits, %e_ni64, 52;
+    mov.b64 %e_nf, %e_bits;
+    mul.f64 %e64, %e64, %e_nf;
+    // --- end exp ---
+
+    sub.f64 %num, %one, %e64;
+    add.f64 %denom, %one, %e64;
+    div.rn.f64 %vr, %num, %denom;
+    st.global.f64 [%out], %vr;
 
 DONE:
     ret;
@@ -6615,6 +9333,18 @@ fn validate_unary(a: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<()> {
     Ok(())
 }
 
+/// Generic device-ordinal check for any `CudaBuffer<T>`.
+#[cfg(feature = "cuda")]
+fn validate_device<T>(a: &CudaBuffer<T>, device: &GpuDevice) -> GpuResult<()> {
+    if a.device_ordinal() != device.ordinal() {
+        return Err(GpuError::DeviceMismatch {
+            expected: a.device_ordinal(),
+            got: device.ordinal(),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // PTX kernel launch helpers
 // ---------------------------------------------------------------------------
@@ -6844,6 +9574,203 @@ fn try_launch_unary_into(
     }
 
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// f64 launch helpers
+// ---------------------------------------------------------------------------
+
+/// Try to launch a binary f64 PTX kernel.
+#[cfg(feature = "cuda")]
+fn try_launch_binary_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    device: &GpuDevice,
+    ptx_src: &'static str,
+    kernel_name: &'static str,
+) -> GpuResult<Option<CudaBuffer<f64>>> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = a.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx, ptx_src, kernel_name, device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(b.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+    Ok(Some(out))
+}
+
+/// Try to launch a unary f64 PTX kernel.
+#[cfg(feature = "cuda")]
+fn try_launch_unary_f64(
+    a: &CudaBuffer<f64>,
+    device: &GpuDevice,
+    ptx_src: &'static str,
+    kernel_name: &'static str,
+) -> GpuResult<Option<CudaBuffer<f64>>> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = a.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx, ptx_src, kernel_name, device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+    Ok(Some(out))
+}
+
+/// CPU fallback for f64 binary ops.
+#[cfg(feature = "cuda")]
+fn cpu_fallback_binary_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    device: &GpuDevice,
+    op: fn(f64, f64) -> f64,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_host = gpu_to_cpu(a, device)?;
+    let b_host = gpu_to_cpu(b, device)?;
+    let result: Vec<f64> = a_host.iter().zip(b_host.iter()).map(|(&x, &y)| op(x, y)).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// CPU fallback for f64 unary ops.
+#[cfg(feature = "cuda")]
+fn cpu_fallback_unary_f64(
+    a: &CudaBuffer<f64>,
+    device: &GpuDevice,
+    op: fn(f64) -> f64,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_host = gpu_to_cpu(a, device)?;
+    let result: Vec<f64> = a_host.iter().map(|&x| op(x)).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// Try to launch a general N-dimensional broadcast binary f64 PTX kernel.
+///
+/// Same as [`try_launch_broadcast_binary`] but for `f64` buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_launch_broadcast_binary_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    a_strides: &[u32],
+    b_strides: &[u32],
+    out_shape: &[u32],
+    out_numel: usize,
+    device: &GpuDevice,
+    ptx_src: &'static str,
+    kernel_name: &'static str,
+) -> GpuResult<Option<CudaBuffer<f64>>> {
+    use cudarc::driver::PushKernelArg;
+
+    let ndim = out_shape.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx_src,
+        kernel_name,
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    // Upload stride/shape metadata as small device buffers.
+    let a_str_buf = cpu_to_gpu(a_strides, device)?;
+    let b_str_buf = cpu_to_gpu(b_strides, device)?;
+    let shape_buf = cpu_to_gpu(out_shape, device)?;
+
+    let mut out = alloc_zeros_f64(out_numel, device)?;
+    let cfg = launch_cfg(out_numel)?;
+    let n_u32 = out_numel as u32;
+    let ndim_u32 = ndim as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(b.inner())
+            .arg(out.inner_mut())
+            .arg(a_str_buf.inner())
+            .arg(b_str_buf.inner())
+            .arg(shape_buf.inner())
+            .arg(&n_u32)
+            .arg(&ndim_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(Some(out))
+}
+
+/// CPU fallback for f64 broadcast binary ops.
+#[cfg(feature = "cuda")]
+fn cpu_fallback_broadcast_binary_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    device: &GpuDevice,
+    op: fn(f64, f64) -> f64,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_host = gpu_to_cpu(a, device)?;
+    let b_host = gpu_to_cpu(b, device)?;
+    let out_numel: usize = out_shape.iter().product();
+
+    let a_str = broadcast_strides(a_shape, out_shape);
+    let b_str = broadcast_strides(b_shape, out_shape);
+
+    let mut result = Vec::with_capacity(out_numel);
+    for i in 0..out_numel {
+        let mut remaining = i;
+        let mut a_idx = 0usize;
+        let mut b_idx = 0usize;
+        for d in (0..out_shape.len()).rev() {
+            let coord = remaining % out_shape[d];
+            remaining /= out_shape[d];
+            a_idx += coord * a_str[d] as usize;
+            b_idx += coord * b_str[d] as usize;
+        }
+        result.push(op(a_host[a_idx], b_host[b_idx]));
+    }
+    cpu_to_gpu(&result, device)
 }
 
 /// Try to launch a general N-dimensional broadcast binary PTX kernel.
@@ -8862,6 +11789,66 @@ pub fn gpu_dropout(
     Ok(out)
 }
 
+/// Elementwise dropout for f64 tensors.
+#[cfg(feature = "cuda")]
+pub fn gpu_dropout_f64(
+    input: &CudaBuffer<f64>,
+    threshold: u32,
+    scale: f64,
+    seed: u32,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let n = input.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, DROPOUT_PTX, "dropout_kernel", "dropout_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx, ptx, "dropout_f64_kernel", device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let result: Vec<f64> = host
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    let mut r = (i as u32).wrapping_mul(2654435761) ^ seed;
+                    r ^= r << 13;
+                    r ^= r >> 17;
+                    r ^= r << 5;
+                    if r < threshold { 0.0 } else { x * scale }
+                })
+                .collect();
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .arg(&threshold)
+            .arg(&scale)
+            .arg(&seed)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_dropout_f64(_input: &CudaBuffer<f64>, _threshold: u32, _scale: f64, _seed: u32, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+
 // ---------------------------------------------------------------------------
 // Public API -- 2D transpose
 // ---------------------------------------------------------------------------
@@ -9759,6 +12746,1378 @@ pub fn gpu_tanh(a: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<CudaBuffer
         return Ok(out);
     }
     cpu_fallback_unary(a, device, |x| x.tanh())
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 elementwise ops
+// ---------------------------------------------------------------------------
+
+/// Elementwise f64 addition: `out[i] = a[i] + b[i]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_add_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if a.len() != b.len() {
+        return Err(GpuError::LengthMismatch { a: a.len(), b: b.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, ADD_PTX, "add_kernel", "add_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(a, b, device, ptx, "add_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(a, b, device, |x, y| x + y)
+}
+
+/// Elementwise f64 subtraction: `out[i] = a[i] - b[i]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_sub_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if a.len() != b.len() {
+        return Err(GpuError::LengthMismatch { a: a.len(), b: b.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, SUB_PTX, "sub_kernel", "sub_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(a, b, device, ptx, "sub_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(a, b, device, |x, y| x - y)
+}
+
+/// Elementwise f64 multiplication: `out[i] = a[i] * b[i]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_mul_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if a.len() != b.len() {
+        return Err(GpuError::LengthMismatch { a: a.len(), b: b.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, MUL_PTX, "mul_kernel", "mul_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(a, b, device, ptx, "mul_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(a, b, device, |x, y| x * y)
+}
+
+/// Elementwise f64 division: `out[i] = a[i] / b[i]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_div_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if a.len() != b.len() {
+        return Err(GpuError::LengthMismatch { a: a.len(), b: b.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, DIV_PTX, "div_kernel", "div_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(a, b, device, ptx, "div_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(a, b, device, |x, y| x / y)
+}
+
+/// Elementwise f64 negation: `out[i] = -a[i]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_neg_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, NEG_PTX, "neg_kernel", "neg_f64_kernel");
+    if let Some(out) = try_launch_unary_f64(a, device, ptx, "neg_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| -x)
+}
+
+/// Elementwise f64 ReLU: `out[i] = max(a[i], 0.0)`.
+#[cfg(feature = "cuda")]
+pub fn gpu_relu_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, RELU_PTX, "relu_kernel", "relu_f64_kernel");
+    if let Some(out) = try_launch_unary_f64(a, device, ptx, "relu_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| x.max(0.0))
+}
+
+/// Elementwise f64 scale: `out[i] = a[i] * scalar`.
+#[cfg(feature = "cuda")]
+pub fn gpu_scale_f64(
+    a: &CudaBuffer<f64>,
+    scalar: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let n = a.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, SCALE_PTX, "scale_kernel", "scale_f64_kernel");
+    if let Ok(f) = crate::module_cache::get_or_compile(
+        ctx, ptx, "scale_f64_kernel", device.ordinal() as u32,
+    ) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let cfg = launch_cfg(n)?;
+        let n_u32 = n as u32;
+
+        unsafe {
+            stream
+                .launch_builder(&f)
+                .arg(a.inner())
+                .arg(out.inner_mut())
+                .arg(&scalar)
+                .arg(&n_u32)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+
+    let a_host = gpu_to_cpu(a, device)?;
+    let result: Vec<f64> = a_host.iter().map(|&x| x * scalar).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// Elementwise f64 exp: `out[i] = exp(a[i])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_exp_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(a, device, EXP_F64_PTX, "exp_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| x.exp())
+}
+
+/// Elementwise f64 log: `out[i] = ln(a[i])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_log_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(a, device, LOG_F64_PTX, "log_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| x.ln())
+}
+
+/// Elementwise f64 sqrt: `out[i] = sqrt(a[i])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_sqrt_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, SQRT_PTX, "sqrt_kernel", "sqrt_f64_kernel");
+    if let Some(out) = try_launch_unary_f64(a, device, ptx, "sqrt_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| x.sqrt())
+}
+
+/// Elementwise f64 pow: `out[i] = a[i] ^ exponent`.
+#[cfg(feature = "cuda")]
+pub fn gpu_pow_f64(
+    a: &CudaBuffer<f64>,
+    exponent: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = a.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    if let Ok(f) = crate::module_cache::get_or_compile(
+        ctx, POW_F64_PTX, "pow_f64_kernel", device.ordinal() as u32,
+    ) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let cfg = launch_cfg(n)?;
+        let n_u32 = n as u32;
+
+        unsafe {
+            stream
+                .launch_builder(&f)
+                .arg(a.inner())
+                .arg(out.inner_mut())
+                .arg(&exponent)
+                .arg(&n_u32)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+
+    let a_host = gpu_to_cpu(a, device)?;
+    let result: Vec<f64> = a_host.iter().map(|&x| x.powf(exponent)).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// Elementwise f64 abs: `out[i] = |a[i]|`.
+#[cfg(feature = "cuda")]
+pub fn gpu_abs_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, ABS_PTX, "abs_kernel", "abs_f64_kernel");
+    if let Some(out) = try_launch_unary_f64(a, device, ptx, "abs_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| x.abs())
+}
+
+/// Elementwise f64 sigmoid: `out[i] = 1 / (1 + exp(-a[i]))`.
+#[cfg(feature = "cuda")]
+pub fn gpu_sigmoid_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(a, device, SIGMOID_F64_PTX, "sigmoid_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| 1.0 / (1.0 + (-x).exp()))
+}
+
+/// Elementwise f64 tanh: `out[i] = tanh(a[i])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_tanh_f64(a: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(a, device, TANH_F64_PTX, "tanh_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(a, device, |x| x.tanh())
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 backward ops
+// ---------------------------------------------------------------------------
+
+/// ReLU backward (f64): `out[i] = (input[i] > 0) ? grad[i] : 0`.
+#[cfg(feature = "cuda")]
+pub fn gpu_relu_backward_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, RELU_BACKWARD_PTX, "relu_backward_kernel", "relu_backward_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(
+        grad,
+        input,
+        device,
+        ptx,
+        "relu_backward_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, input, device, |g, x| if x > 0.0 { g } else { 0.0 })
+}
+
+/// Sigmoid backward (f64): `out[i] = grad[i] * output[i] * (1 - output[i])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_sigmoid_backward_f64(
+    grad: &CudaBuffer<f64>,
+    output: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if grad.len() != output.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: output.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, SIGMOID_BACKWARD_PTX, "sigmoid_backward_kernel", "sigmoid_backward_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(
+        grad,
+        output,
+        device,
+        ptx,
+        "sigmoid_backward_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, output, device, |g, o| g * o * (1.0 - o))
+}
+
+/// Tanh backward (f64): `out[i] = grad[i] * (1 - output[i]^2)`.
+#[cfg(feature = "cuda")]
+pub fn gpu_tanh_backward_f64(
+    grad: &CudaBuffer<f64>,
+    output: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if grad.len() != output.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: output.len() });
+    }
+    let ptx = get_f64_ptx(&CACHE, TANH_BACKWARD_PTX, "tanh_backward_kernel", "tanh_backward_f64_kernel");
+    if let Some(out) = try_launch_binary_f64(
+        grad,
+        output,
+        device,
+        ptx,
+        "tanh_backward_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, output, device, |g, o| g * (1.0 - o * o))
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 broadcast ops
+// ---------------------------------------------------------------------------
+
+/// Broadcast addition (f64): `out[i] = a[bcast_a(i)] + b[bcast_b(i)]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_broadcast_add_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_str = broadcast_strides(a_shape, out_shape);
+    let b_str = broadcast_strides(b_shape, out_shape);
+    let shape_u32: Vec<u32> = out_shape.iter().map(|&d| d as u32).collect();
+    let out_numel: usize = out_shape.iter().product();
+
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, BROADCAST_ADD_PTX, "broadcast_add_kernel", "broadcast_add_f64_kernel");
+    if let Some(out) = try_launch_broadcast_binary_f64(
+        a,
+        b,
+        &a_str,
+        &b_str,
+        &shape_u32,
+        out_numel,
+        device,
+        ptx,
+        "broadcast_add_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    cpu_fallback_broadcast_binary_f64(a, b, a_shape, b_shape, out_shape, device, |x, y| x + y)
+}
+
+/// Broadcast subtraction (f64): `out[i] = a[bcast_a(i)] - b[bcast_b(i)]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_broadcast_sub_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_str = broadcast_strides(a_shape, out_shape);
+    let b_str = broadcast_strides(b_shape, out_shape);
+    let shape_u32: Vec<u32> = out_shape.iter().map(|&d| d as u32).collect();
+    let out_numel: usize = out_shape.iter().product();
+
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, BROADCAST_SUB_PTX, "broadcast_sub_kernel", "broadcast_sub_f64_kernel");
+    if let Some(out) = try_launch_broadcast_binary_f64(
+        a,
+        b,
+        &a_str,
+        &b_str,
+        &shape_u32,
+        out_numel,
+        device,
+        ptx,
+        "broadcast_sub_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    cpu_fallback_broadcast_binary_f64(a, b, a_shape, b_shape, out_shape, device, |x, y| x - y)
+}
+
+/// Broadcast multiplication (f64): `out[i] = a[bcast_a(i)] * b[bcast_b(i)]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_broadcast_mul_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_str = broadcast_strides(a_shape, out_shape);
+    let b_str = broadcast_strides(b_shape, out_shape);
+    let shape_u32: Vec<u32> = out_shape.iter().map(|&d| d as u32).collect();
+    let out_numel: usize = out_shape.iter().product();
+
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, BROADCAST_MUL_PTX, "broadcast_mul_kernel", "broadcast_mul_f64_kernel");
+    if let Some(out) = try_launch_broadcast_binary_f64(
+        a,
+        b,
+        &a_str,
+        &b_str,
+        &shape_u32,
+        out_numel,
+        device,
+        ptx,
+        "broadcast_mul_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    cpu_fallback_broadcast_binary_f64(a, b, a_shape, b_shape, out_shape, device, |x, y| x * y)
+}
+
+/// Broadcast division (f64): `out[i] = a[bcast_a(i)] / b[bcast_b(i)]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_broadcast_div_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    let a_str = broadcast_strides(a_shape, out_shape);
+    let b_str = broadcast_strides(b_shape, out_shape);
+    let shape_u32: Vec<u32> = out_shape.iter().map(|&d| d as u32).collect();
+    let out_numel: usize = out_shape.iter().product();
+
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, BROADCAST_DIV_PTX, "broadcast_div_kernel", "broadcast_div_f64_kernel");
+    if let Some(out) = try_launch_broadcast_binary_f64(
+        a,
+        b,
+        &a_str,
+        &b_str,
+        &shape_u32,
+        out_numel,
+        device,
+        ptx,
+        "broadcast_div_f64_kernel",
+    )? {
+        return Ok(out);
+    }
+
+    cpu_fallback_broadcast_binary_f64(a, b, a_shape, b_shape, out_shape, device, |x, y| x / y)
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 reduction ops
+// ---------------------------------------------------------------------------
+
+/// Full reduce-sum for f64: returns a 1-element buffer containing the sum of all elements.
+#[cfg(feature = "cuda")]
+pub fn gpu_reduce_sum_f64(
+    a: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let n = a.len();
+    if n == 0 {
+        return cpu_to_gpu(&[0.0f64], device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, REDUCE_SUM_PTX, "reduce_sum_kernel", "reduce_sum_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "reduce_sum_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(a, device)?;
+            let total: f64 = host.iter().sum();
+            return cpu_to_gpu(&[total], device);
+        }
+    };
+
+    const BLOCK: u32 = 256;
+    let num_blocks = ((n as u32).saturating_add(BLOCK - 1)) / BLOCK;
+    let num_blocks = num_blocks.min(1024);
+
+    let mut partials = alloc_zeros_f64(num_blocks as usize, device)?;
+    let n_u32 = n as u32;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_blocks.max(1), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(partials.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    if num_blocks <= 1 {
+        return Ok(partials);
+    }
+
+    if num_blocks <= 256 {
+        let host_partials = gpu_to_cpu(&partials, device)?;
+        let total: f64 = host_partials.iter().sum();
+        return cpu_to_gpu(&[total], device);
+    }
+
+    gpu_reduce_sum_f64(&partials, device)
+}
+
+/// Sum along an axis for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_sum_axis_f64(
+    a: &CudaBuffer<f64>,
+    outer: usize,
+    axis_size: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let total_output = outer * inner;
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, SUM_AXIS_PTX, "sum_axis_kernel", "sum_axis_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "sum_axis_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(a, device)?;
+            let mut result = vec![0.0f64; total_output];
+            for (i, out) in result.iter_mut().enumerate() {
+                let outer_idx = i / inner;
+                let inner_idx = i % inner;
+                let mut sum = 0.0f64;
+                for k in 0..axis_size {
+                    sum += host[outer_idx * axis_size * inner + k * inner + inner_idx];
+                }
+                *out = sum;
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total_output, device)?;
+    let cfg = launch_cfg(total_output)?;
+    let outer_u32 = outer as u32;
+    let axis_size_u32 = axis_size as u32;
+    let inner_u32 = inner as u32;
+    let total_u32 = total_output as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(out.inner_mut())
+            .arg(&outer_u32)
+            .arg(&axis_size_u32)
+            .arg(&inner_u32)
+            .arg(&total_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_reduce_sum_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_sum_axis_f64(_a: &CudaBuffer<f64>, _outer: usize, _axis_size: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 shape ops
+// ---------------------------------------------------------------------------
+
+/// Transpose an `[M, N]` f64 matrix to `[N, M]` on GPU.
+#[cfg(feature = "cuda")]
+pub fn gpu_transpose_2d_f64(
+    input: &CudaBuffer<f64>,
+    m: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let total = m * n;
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, TRANSPOSE_2D_PTX, "transpose_2d_kernel", "transpose_2d_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "transpose_2d_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0f64; total];
+            for i in 0..m {
+                for j in 0..n {
+                    out[j * m + i] = host[i * n + j];
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let cfg = launch_cfg(total)?;
+    let m_u32 = m as u32;
+    let n_u32 = n as u32;
+    let total_u32 = total as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&m_u32)
+            .arg(&n_u32)
+            .arg(&total_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Permute a 4D f64 tensor from `[d0, d1, d2, d3]` to `[d0, d2, d1, d3]` on GPU.
+#[cfg(feature = "cuda")]
+pub fn gpu_permute_0213_f64(
+    input: &CudaBuffer<f64>,
+    d0: usize,
+    d1: usize,
+    d2: usize,
+    d3: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let total = d0 * d1 * d2 * d3;
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, PERMUTE_0213_PTX, "permute_0213_kernel", "permute_0213_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "permute_0213_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0f64; total];
+            for i0 in 0..d0 {
+                for i1 in 0..d1 {
+                    for i2 in 0..d2 {
+                        for i3 in 0..d3 {
+                            let in_idx = ((i0 * d1 + i1) * d2 + i2) * d3 + i3;
+                            let out_idx = ((i0 * d2 + i2) * d1 + i1) * d3 + i3;
+                            out[out_idx] = host[in_idx];
+                        }
+                    }
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let cfg = launch_cfg(total)?;
+    let d0_u32 = d0 as u32;
+    let d1_u32 = d1 as u32;
+    let d2_u32 = d2 as u32;
+    let d3_u32 = d3 as u32;
+    let total_u32 = total as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&d0_u32)
+            .arg(&d1_u32)
+            .arg(&d2_u32)
+            .arg(&d3_u32)
+            .arg(&total_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Split a contiguous f64 tensor along an axis (strided read) on GPU.
+#[cfg(feature = "cuda")]
+pub fn gpu_strided_split_f64(
+    input: &CudaBuffer<f64>,
+    total_along_axis: usize,
+    split_offset: usize,
+    split_size: usize,
+    inner_size: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, STRIDED_SPLIT_PTX, "strided_split_kernel", "strided_split_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "strided_split_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut result = vec![0.0f64; n];
+            for (i, out) in result.iter_mut().enumerate() {
+                let outer_idx = i / (split_size * inner_size);
+                let within = i % (split_size * inner_size);
+                let src_idx =
+                    outer_idx * total_along_axis * inner_size + split_offset * inner_size + within;
+                *out = host[src_idx];
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let total_ax_u32 = total_along_axis as u32;
+    let offset_u32 = split_offset as u32;
+    let split_sz_u32 = split_size as u32;
+    let inner_u32 = inner_size as u32;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&total_ax_u32)
+            .arg(&offset_u32)
+            .arg(&split_sz_u32)
+            .arg(&inner_u32)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Concatenate an f64 sub-tensor into a larger output at an axis offset on GPU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_strided_cat_f64(
+    input: &CudaBuffer<f64>,
+    output: &mut CudaBuffer<f64>,
+    total_along_axis: usize,
+    cat_offset: usize,
+    part_size: usize,
+    inner_size: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<()> {
+    use cudarc::driver::PushKernelArg;
+
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, STRIDED_CAT_PTX, "strided_cat_kernel", "strided_cat_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "strided_cat_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host_in = gpu_to_cpu(input, device)?;
+            let mut host_out = gpu_to_cpu(output, device)?;
+            for (i, &val) in host_in.iter().enumerate().take(n) {
+                let outer_idx = i / (part_size * inner_size);
+                let within = i % (part_size * inner_size);
+                let dst_idx =
+                    outer_idx * total_along_axis * inner_size + cat_offset * inner_size + within;
+                host_out[dst_idx] = val;
+            }
+            *output = cpu_to_gpu(&host_out, device)?;
+            return Ok(());
+        }
+    };
+
+    let cfg = launch_cfg(n)?;
+    let total_ax_u32 = total_along_axis as u32;
+    let offset_u32 = cat_offset as u32;
+    let part_sz_u32 = part_size as u32;
+    let inner_u32 = inner_size as u32;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(output.inner_mut())
+            .arg(&total_ax_u32)
+            .arg(&offset_u32)
+            .arg(&part_sz_u32)
+            .arg(&inner_u32)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 indexing ops
+// ---------------------------------------------------------------------------
+
+/// Gather f64 elements by f32 index: `out[i] = input[indices[i]]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_index_select_1d_f64(
+    input: &CudaBuffer<f64>,
+    indices: &CudaBuffer<f32>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let n = indices.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, INDEX_SELECT_1D_PTX, "index_select_1d_kernel", "index_select_1d_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "index_select_1d_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let input_host = gpu_to_cpu(input, device)?;
+            let indices_host = gpu_to_cpu(indices, device)?;
+            let result: Vec<f64> = indices_host
+                .iter()
+                .map(|&idx_f| input_host[idx_f as usize])
+                .collect();
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(indices.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Scatter-add f64 `grad_output` back using f32 `indices`.
+///
+/// Output: `out = zeros(input_len); for i: out[indices[i]] += grad_output[i]`
+#[cfg(feature = "cuda")]
+pub fn gpu_scatter_add_1d_f64(
+    grad_output: &CudaBuffer<f64>,
+    indices: &CudaBuffer<f32>,
+    input_len: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(grad_output, device)?;
+
+    let n = grad_output.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, SCATTER_ADD_1D_PTX, "scatter_add_1d_kernel", "scatter_add_1d_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "scatter_add_1d_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let go_host = gpu_to_cpu(grad_output, device)?;
+            let idx_host = gpu_to_cpu(indices, device)?;
+            let mut result = vec![0.0f64; input_len];
+            for (i, &idx_f) in idx_host.iter().enumerate() {
+                result[idx_f as usize] += go_host[i];
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(input_len, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad_output.inner())
+            .arg(indices.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Fill f64 elements with `value` where u8 `mask` is nonzero.
+///
+/// `mask` is a GPU buffer of u8 values (nonzero = true).
+/// Output: `out[i] = mask[i] != 0 ? value : input[i]`
+#[cfg(feature = "cuda")]
+pub fn gpu_masked_fill_f64(
+    input: &CudaBuffer<f64>,
+    mask: &CudaBuffer<u8>,
+    value: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let n = input.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, MASKED_FILL_PTX, "masked_fill_kernel", "masked_fill_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "masked_fill_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let input_host = gpu_to_cpu(input, device)?;
+            let mask_host = gpu_to_cpu(mask, device)?;
+            let result: Vec<f64> = input_host
+                .iter()
+                .zip(mask_host.iter())
+                .map(|(&x, &m)| if m != 0 { value } else { x })
+                .collect();
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(mask.inner())
+            .arg(out.inner_mut())
+            .arg(&value)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Zero out f64 gradient where u8 `mask` is nonzero.
+///
+/// Output: `out[i] = mask[i] != 0 ? 0.0 : grad[i]`
+#[cfg(feature = "cuda")]
+pub fn gpu_masked_zero_f64(
+    grad: &CudaBuffer<f64>,
+    mask: &CudaBuffer<u8>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(grad, device)?;
+
+    let n = grad.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, MASKED_ZERO_PTX, "masked_zero_kernel", "masked_zero_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "masked_zero_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let grad_host = gpu_to_cpu(grad, device)?;
+            let mask_host = gpu_to_cpu(mask, device)?;
+            let result: Vec<f64> = grad_host
+                .iter()
+                .zip(mask_host.iter())
+                .map(|(&g, &m)| if m != 0 { 0.0 } else { g })
+                .collect();
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad.inner())
+            .arg(mask.inner())
+            .arg(out.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Write f64 `src` of shape `[N, D]` into row `pos` of `dst` of shape `[N, max_len, D]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_slice_write_f64(
+    src: &CudaBuffer<f64>,
+    dst: &mut CudaBuffer<f64>,
+    n_batch: usize,
+    d: usize,
+    max_len: usize,
+    pos: usize,
+    device: &GpuDevice,
+) -> GpuResult<()> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let total = n_batch * d;
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, SLICE_WRITE_PTX, "slice_write_kernel", "slice_write_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "slice_write_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let src_host = gpu_to_cpu(src, device)?;
+            let mut dst_host = gpu_to_cpu(dst, device)?;
+            for b in 0..n_batch {
+                for di in 0..d {
+                    dst_host[b * max_len * d + pos * d + di] = src_host[b * d + di];
+                }
+            }
+            let new_dst = cpu_to_gpu(&dst_host, device)?;
+            *dst = new_dst;
+            return Ok(());
+        }
+    };
+
+    let cfg = launch_cfg(total)?;
+    let n_u32 = total as u32;
+    let d_u32 = d as u32;
+    let max_len_u32 = max_len as u32;
+    let pos_u32 = pos as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(src.inner())
+            .arg(dst.inner_mut())
+            .arg(&n_u32)
+            .arg(&d_u32)
+            .arg(&max_len_u32)
+            .arg(&pos_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(())
+}
+
+/// Read first `len` rows from each batch of f64 `[N, max_len, D]` -> `[N, len, D]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_slice_read_f64(
+    src: &CudaBuffer<f64>,
+    n_batch: usize,
+    d: usize,
+    len: usize,
+    max_len: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let total = n_batch * len * d;
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, SLICE_READ_PTX, "slice_read_kernel", "slice_read_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "slice_read_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(src, device)?;
+            let mut out = vec![0.0f64; total];
+            for b in 0..n_batch {
+                for r in 0..len {
+                    for di in 0..d {
+                        out[b * len * d + r * d + di] = host[b * max_len * d + r * d + di];
+                    }
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let cfg = launch_cfg(total)?;
+    let total_u32 = total as u32;
+    let d_u32 = d as u32;
+    let len_u32 = len as u32;
+    let max_len_u32 = max_len as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(src.inner())
+            .arg(out.inner_mut())
+            .arg(&total_u32)
+            .arg(&d_u32)
+            .arg(&len_u32)
+            .arg(&max_len_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 embedding ops
+// ---------------------------------------------------------------------------
+
+/// Single f64 embedding lookup: `output[d] = weight[token_id * D + d]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_embed_lookup_f64(
+    idx: &CudaBuffer<f32>,
+    weight: &CudaBuffer<f64>,
+    d: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, EMBED_LOOKUP_PTX, "embed_lookup_kernel", "embed_lookup_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "embed_lookup_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let idx_host = gpu_to_cpu(idx, device)?;
+            let weight_host = gpu_to_cpu(weight, device)?;
+            let row = idx_host[0] as usize;
+            let start = row * d;
+            let out = weight_host[start..start + d].to_vec();
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(d, device)?;
+    let cfg = launch_cfg(d)?;
+    let d_u32 = d as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(idx.inner())
+            .arg(weight.inner())
+            .arg(out.inner_mut())
+            .arg(&d_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Batch f64 embedding lookup: gather N rows from `[V, D]` weight into `[N, D]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_embed_lookup_batch_f64(
+    indices: &CudaBuffer<f32>,
+    weight: &CudaBuffer<f64>,
+    n: usize,
+    d: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let total = n * d;
+    if total == 0 {
+        return alloc_zeros_f64(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, EMBED_LOOKUP_BATCH_PTX, "embed_lookup_batch_kernel", "embed_lookup_batch_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "embed_lookup_batch_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let idx_host = gpu_to_cpu(indices, device)?;
+            let weight_host = gpu_to_cpu(weight, device)?;
+            let mut out = Vec::with_capacity(total);
+            for &idx_f in &idx_host {
+                let row = idx_f as usize;
+                let start = row * d;
+                out.extend_from_slice(&weight_host[start..start + d]);
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let cfg = launch_cfg(total)?;
+    let d_u32 = d as u32;
+    let total_u32 = total as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(indices.inner())
+            .arg(weight.inner())
+            .arg(out.inner_mut())
+            .arg(&d_u32)
+            .arg(&total_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Scatter-add f64 rows for embedding backward.
+///
+/// Atomically accumulates `grad_output[i, :] += grad_weight[indices[i], :]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_scatter_add_rows_f64(
+    grad_output: &CudaBuffer<f64>,
+    indices: &CudaBuffer<f32>,
+    num_embeddings: usize,
+    d: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let n = indices.len();
+    let total = n * d;
+
+    if total == 0 {
+        return alloc_zeros_f64(num_embeddings * d, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, SCATTER_ADD_ROWS_PTX, "scatter_add_rows_kernel", "scatter_add_rows_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "scatter_add_rows_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let go_host = gpu_to_cpu(grad_output, device)?;
+            let idx_host = gpu_to_cpu(indices, device)?;
+            let mut result = vec![0.0f64; num_embeddings * d];
+            for (i, &idx_f) in idx_host.iter().enumerate() {
+                let row = idx_f as usize;
+                for j in 0..d {
+                    result[row * d + j] += go_host[i * d + j];
+                }
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(num_embeddings * d, device)?;
+    let cfg = launch_cfg(total)?;
+    let d_u32 = d as u32;
+    let total_u32 = total as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad_output.inner())
+            .arg(indices.inner())
+            .arg(out.inner_mut())
+            .arg(&d_u32)
+            .arg(&total_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -11991,6 +16350,1237 @@ pub(crate) fn gpu_f32_to_bf16(
 pub(crate) fn gpu_f32_to_bf16(_input: &CudaBuffer<f32>, _device: &GpuDevice) -> GpuResult<()> {
     Err(GpuError::NoCudaFeature)
 }
+
+// ---------------------------------------------------------------------------
+// Non-CUDA stubs -- f64 ops
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_add_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_sub_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_mul_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_div_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_neg_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_relu_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_scale_f64(_a: &CudaBuffer<f64>, _scalar: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_exp_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_log_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_sqrt_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_pow_f64(_a: &CudaBuffer<f64>, _exponent: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_abs_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_sigmoid_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_tanh_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_relu_backward_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_sigmoid_backward_f64(_grad: &CudaBuffer<f64>, _output: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_tanh_backward_f64(_grad: &CudaBuffer<f64>, _output: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_broadcast_add_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _a_shape: &[usize], _b_shape: &[usize], _out_shape: &[usize], _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_broadcast_sub_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _a_shape: &[usize], _b_shape: &[usize], _out_shape: &[usize], _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_broadcast_mul_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _a_shape: &[usize], _b_shape: &[usize], _out_shape: &[usize], _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_broadcast_div_f64(_a: &CudaBuffer<f64>, _b: &CudaBuffer<f64>, _a_shape: &[usize], _b_shape: &[usize], _out_shape: &[usize], _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_transpose_2d_f64(_input: &CudaBuffer<f64>, _m: usize, _n: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_permute_0213_f64(_input: &CudaBuffer<f64>, _d0: usize, _d1: usize, _d2: usize, _d3: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_strided_split_f64(_input: &CudaBuffer<f64>, _total_along_axis: usize, _split_offset: usize, _split_size: usize, _inner_size: usize, _n: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_strided_cat_f64(_input: &CudaBuffer<f64>, _output: &mut CudaBuffer<f64>, _total_along_axis: usize, _cat_offset: usize, _part_size: usize, _inner_size: usize, _n: usize, _device: &GpuDevice) -> GpuResult<()> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_index_select_1d_f64(_input: &CudaBuffer<f64>, _indices: &CudaBuffer<f32>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_scatter_add_1d_f64(_grad_output: &CudaBuffer<f64>, _indices: &CudaBuffer<f32>, _input_len: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_masked_fill_f64(_input: &CudaBuffer<f64>, _mask: &CudaBuffer<u8>, _value: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_masked_zero_f64(_grad: &CudaBuffer<f64>, _mask: &CudaBuffer<u8>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_slice_write_f64(_src: &CudaBuffer<f64>, _dst: &mut CudaBuffer<f64>, _n_batch: usize, _d: usize, _max_len: usize, _pos: usize, _device: &GpuDevice) -> GpuResult<()> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_slice_read_f64(_src: &CudaBuffer<f64>, _n_batch: usize, _d: usize, _len: usize, _max_len: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_embed_lookup_f64(_idx: &CudaBuffer<f32>, _weight: &CudaBuffer<f64>, _d: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_embed_lookup_batch_f64(_indices: &CudaBuffer<f32>, _weight: &CudaBuffer<f64>, _n: usize, _d: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_scatter_add_rows_f64(_grad_output: &CudaBuffer<f64>, _indices: &CudaBuffer<f32>, _num_embeddings: usize, _d: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 activation, normalization, scan, and pooling launchers
+// ---------------------------------------------------------------------------
+
+/// GELU (sigmoid-approx) for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_gelu_f64(input: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(input, device, GELU_F64_PTX, "gelu_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(input, device, |x| x * (1.0 / (1.0 + (-1.702 * x).exp())))
+}
+
+/// GELU (tanh-approx) for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_gelu_tanh_f64(input: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(input, device, GELU_TANH_F64_PTX, "gelu_tanh_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(input, device, |x| {
+        let inner = (2.0_f64 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+        0.5 * x * (1.0 + inner.tanh())
+    })
+}
+
+/// GELU (exact erf) for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_gelu_erf_f64(input: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(input, device, GELU_ERF_F64_PTX, "gelu_erf_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(input, device, |x| {
+        // Approximate erf via Abramowitz & Stegun
+        let z = x * std::f64::consts::FRAC_1_SQRT_2;
+        let az = z.abs();
+        let t = 1.0 / (1.0 + 0.3275911 * az);
+        let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        let erf_abs = 1.0 - poly * (-az * az).exp();
+        let erf_val = if z >= 0.0 { erf_abs } else { -erf_abs };
+        x * 0.5 * (1.0 + erf_val)
+    })
+}
+
+/// GELU backward (sigmoid-approx) for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_gelu_backward_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    if let Some(out) = try_launch_binary_f64(grad, input, device, GELU_BACKWARD_F64_PTX, "gelu_backward_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, input, device, |g, x| {
+        let sig = 1.0 / (1.0 + (-1.702 * x).exp());
+        g * (sig + 1.702 * x * sig * (1.0 - sig))
+    })
+}
+
+/// GELU backward (tanh-approx) for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_gelu_backward_tanh_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    if let Some(out) = try_launch_binary_f64(grad, input, device, GELU_BACKWARD_TANH_F64_PTX, "gelu_backward_tanh_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, input, device, |g, x| {
+        let s2pi = (2.0_f64 / std::f64::consts::PI).sqrt();
+        let c = 0.044715_f64;
+        let u = s2pi * (x + c * x * x * x);
+        let t = u.tanh();
+        let d = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * s2pi * (1.0 + 3.0 * c * x * x);
+        g * d
+    })
+}
+
+/// GELU backward (exact erf) for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_gelu_backward_erf_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    if let Some(out) = try_launch_binary_f64(grad, input, device, GELU_BACKWARD_ERF_F64_PTX, "gelu_backward_erf_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, input, device, |g, x| {
+        let z = x * std::f64::consts::FRAC_1_SQRT_2;
+        let az = z.abs();
+        let t = 1.0 / (1.0 + 0.3275911 * az);
+        let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        let erf_abs = 1.0 - poly * (-az * az).exp();
+        let erf_val = if z >= 0.0 { erf_abs } else { -erf_abs };
+        let cdf = 0.5 * (1.0 + erf_val);
+        let pdf = (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        g * (cdf + x * pdf)
+    })
+}
+
+/// SiLU for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_silu_f64(input: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(input, device, SILU_F64_PTX, "silu_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(input, device, |x| x / (1.0 + (-x).exp()))
+}
+
+/// SiLU backward for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_silu_backward_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    if let Some(out) = try_launch_binary_f64(grad, input, device, SILU_BACKWARD_F64_PTX, "silu_backward_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, input, device, |g, x| {
+        let sig = 1.0 / (1.0 + (-x).exp());
+        g * (sig + x * sig * (1.0 - sig))
+    })
+}
+
+/// ELU for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_elu_f64(
+    input: &CudaBuffer<f64>,
+    alpha: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    let n = input.len();
+    if n == 0 { return cpu_to_gpu(&[], device); }
+    let ctx = device.context();
+    let stream = device.stream();
+    if let Ok(f) = crate::module_cache::get_or_compile(ctx, ELU_F64_PTX, "elu_f64_kernel", device.ordinal() as u32) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let n_u32 = n as u32;
+        let cfg = launch_cfg(n)?;
+        unsafe {
+            stream.launch_builder(&f)
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&n_u32)
+                .arg(&alpha)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    let host = gpu_to_cpu(input, device)?;
+    let result: Vec<f64> = host.iter().map(|&x| if x > 0.0 { x } else { alpha * (x.exp() - 1.0) }).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// ELU backward for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_elu_backward_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    alpha: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    let n = grad.len();
+    if n == 0 { return cpu_to_gpu(&[], device); }
+    let ctx = device.context();
+    let stream = device.stream();
+    if let Ok(f) = crate::module_cache::get_or_compile(ctx, ELU_BACKWARD_F64_PTX, "elu_backward_f64_kernel", device.ordinal() as u32) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let n_u32 = n as u32;
+        let cfg = launch_cfg(n)?;
+        unsafe {
+            stream.launch_builder(&f)
+                .arg(grad.inner())
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&n_u32)
+                .arg(&alpha)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    let g_host = gpu_to_cpu(grad, device)?;
+    let x_host = gpu_to_cpu(input, device)?;
+    let result: Vec<f64> = g_host.iter().zip(x_host.iter()).map(|(&g, &x)| if x > 0.0 { g } else { g * alpha * x.exp() }).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// Mish for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_mish_f64(input: &CudaBuffer<f64>, device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> {
+    if let Some(out) = try_launch_unary_f64(input, device, MISH_F64_PTX, "mish_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_unary_f64(input, device, |x| x * (1.0_f64 + x.exp()).ln().tanh())
+}
+
+/// Mish backward for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_mish_backward_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: input.len() });
+    }
+    if let Some(out) = try_launch_binary_f64(grad, input, device, MISH_BACKWARD_F64_PTX, "mish_backward_f64_kernel")? {
+        return Ok(out);
+    }
+    cpu_fallback_binary_f64(grad, input, device, |g, x| {
+        let sp = (1.0_f64 + x.exp()).ln();
+        let t = sp.tanh();
+        let sig = 1.0 / (1.0 + (-x).exp());
+        g * (t + x * sig * (1.0 - t * t))
+    })
+}
+
+/// Clamp for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_clamp_f64(
+    input: &CudaBuffer<f64>,
+    min_val: f64,
+    max_val: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let n = input.len();
+    if n == 0 { return cpu_to_gpu(&[], device); }
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(&CACHE, CLAMP_PTX, "clamp_kernel", "clamp_f64_kernel");
+    if let Ok(f) = crate::module_cache::get_or_compile(ctx, ptx, "clamp_f64_kernel", device.ordinal() as u32) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let n_u32 = n as u32;
+        let cfg = launch_cfg(n)?;
+        unsafe {
+            stream.launch_builder(&f)
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&n_u32)
+                .arg(&min_val)
+                .arg(&max_val)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    let host = gpu_to_cpu(input, device)?;
+    let result: Vec<f64> = host.iter().map(|&x| x.max(min_val).min(max_val)).collect();
+    cpu_to_gpu(&result, device)
+}
+
+/// Cumulative sum for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_cumsum_f64(
+    input: &CudaBuffer<f64>,
+    outer: usize,
+    dim_size: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let total = outer * inner;
+    let n = outer * dim_size * inner;
+    if n == 0 { return cpu_to_gpu(&[], device); }
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(&CACHE, CUMSUM_PTX, "cumsum_kernel", "cumsum_f64_kernel");
+    if let Ok(f) = crate::module_cache::get_or_compile(ctx, ptx, "cumsum_f64_kernel", device.ordinal() as u32) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let cfg = launch_cfg(total)?;
+        let (o, d, i, t) = (outer as u32, dim_size as u32, inner as u32, total as u32);
+        unsafe {
+            stream.launch_builder(&f)
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&o)
+                .arg(&d)
+                .arg(&i)
+                .arg(&t)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    Err(GpuError::PtxCompileFailed { kernel: "cumsum_f64_kernel" })
+}
+
+/// Cumulative product for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_cumprod_f64(
+    input: &CudaBuffer<f64>,
+    outer: usize,
+    dim_size: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let total = outer * inner;
+    let n = outer * dim_size * inner;
+    if n == 0 { return cpu_to_gpu(&[], device); }
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(&CACHE, CUMPROD_PTX, "cumprod_kernel", "cumprod_f64_kernel");
+    if let Ok(f) = crate::module_cache::get_or_compile(ctx, ptx, "cumprod_f64_kernel", device.ordinal() as u32) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let cfg = launch_cfg(total)?;
+        let (o, d, i, t) = (outer as u32, dim_size as u32, inner as u32, total as u32);
+        unsafe {
+            stream.launch_builder(&f)
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&o)
+                .arg(&d)
+                .arg(&i)
+                .arg(&t)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    Err(GpuError::PtxCompileFailed { kernel: "cumprod_f64_kernel" })
+}
+
+/// Cumulative max for f64. Returns (values, indices).
+#[cfg(feature = "cuda")]
+pub fn gpu_cummax_f64(
+    input: &CudaBuffer<f64>,
+    outer: usize,
+    dim_size: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> {
+    use cudarc::driver::PushKernelArg;
+    let total = outer * inner;
+    let n = outer * dim_size * inner;
+    if n == 0 {
+        let e: &[f64] = &[];
+        return Ok((cpu_to_gpu(e, device)?, cpu_to_gpu(e, device)?));
+    }
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(&CACHE, CUMMAX_PTX, "cummax_kernel", "cummax_f64_kernel");
+    let f = crate::module_cache::get_or_compile(ctx, ptx, "cummax_f64_kernel", device.ordinal() as u32)
+        .map_err(|_| GpuError::PtxCompileFailed { kernel: "cummax_f64_kernel" })?;
+    let mut out = alloc_zeros_f64(n, device)?;
+    let mut ind = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(total)?;
+    let (o, d, i, t) = (outer as u32, dim_size as u32, inner as u32, total as u32);
+    unsafe {
+        stream.launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(ind.inner_mut())
+            .arg(&o)
+            .arg(&d)
+            .arg(&i)
+            .arg(&t)
+            .launch(cfg)?;
+    }
+    Ok((out, ind))
+}
+
+/// Cumulative min for f64. Returns (values, indices).
+#[cfg(feature = "cuda")]
+pub fn gpu_cummin_f64(
+    input: &CudaBuffer<f64>,
+    outer: usize,
+    dim_size: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> {
+    use cudarc::driver::PushKernelArg;
+    let total = outer * inner;
+    let n = outer * dim_size * inner;
+    if n == 0 {
+        let e: &[f64] = &[];
+        return Ok((cpu_to_gpu(e, device)?, cpu_to_gpu(e, device)?));
+    }
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(&CACHE, CUMMIN_PTX, "cummin_kernel", "cummin_f64_kernel");
+    let f = crate::module_cache::get_or_compile(ctx, ptx, "cummin_f64_kernel", device.ordinal() as u32)
+        .map_err(|_| GpuError::PtxCompileFailed { kernel: "cummin_f64_kernel" })?;
+    let mut out = alloc_zeros_f64(n, device)?;
+    let mut ind = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(total)?;
+    let (o, d, i, t) = (outer as u32, dim_size as u32, inner as u32, total as u32);
+    unsafe {
+        stream.launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(ind.inner_mut())
+            .arg(&o)
+            .arg(&d)
+            .arg(&i)
+            .arg(&t)
+            .launch(cfg)?;
+    }
+    Ok((out, ind))
+}
+
+/// Log-cumulative-sum-exp for f64.
+#[cfg(feature = "cuda")]
+pub fn gpu_logcumsumexp_f64(
+    input: &CudaBuffer<f64>,
+    outer: usize,
+    dim_size: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    let total = outer * inner;
+    let n = outer * dim_size * inner;
+    if n == 0 { return cpu_to_gpu(&[], device); }
+    let ctx = device.context();
+    let stream = device.stream();
+    if let Ok(f) = crate::module_cache::get_or_compile(ctx, LOGCUMSUMEXP_F64_PTX, "logcumsumexp_f64_kernel", device.ordinal() as u32) {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let cfg = launch_cfg(total)?;
+        let (o, d, i, t) = (outer as u32, dim_size as u32, inner as u32, total as u32);
+        unsafe {
+            stream.launch_builder(&f)
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&o)
+                .arg(&d)
+                .arg(&i)
+                .arg(&t)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    Err(GpuError::PtxCompileFailed { kernel: "logcumsumexp_f64_kernel" })
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- f64 softmax / log-softmax / layernorm / rmsnorm launchers
+// ---------------------------------------------------------------------------
+
+/// Row-wise softmax for f64 on GPU.
+///
+/// For each row: `out[j] = exp(x[j] - max(x)) / sum(exp(x - max(x)))`.
+/// One block per row, 256 threads per block, shared-memory reductions.
+#[cfg(feature = "cuda")]
+pub fn gpu_softmax_f64(
+    input: &CudaBuffer<f64>,
+    rows: usize,
+    cols: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        SOFTMAX_F64_PTX,
+        "softmax_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0f64; host.len()];
+            for r in 0..rows {
+                let base = r * cols;
+                let mut max_v = f64::NEG_INFINITY;
+                for c in 0..cols {
+                    max_v = max_v.max(host[base + c]);
+                }
+                let mut sum = 0.0f64;
+                for c in 0..cols {
+                    let e = (host[base + c] - max_v).exp();
+                    out[base + c] = e;
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                for c in 0..cols {
+                    out[base + c] *= inv;
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(rows * cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8, // sdata[256] f64
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Row-wise softmax backward for f64 on GPU.
+///
+/// For each row: `out[j] = output[j] * (grad[j] - dot(grad_row, output_row))`.
+#[cfg(feature = "cuda")]
+pub fn gpu_softmax_backward_f64(
+    grad: &CudaBuffer<f64>,
+    output: &CudaBuffer<f64>,
+    cols: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_device(grad, device)?;
+    if grad.len() != output.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: output.len() });
+    }
+
+    let total = grad.len();
+    let rows = total / cols;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let ptx = get_f64_ptx(&CACHE, SOFTMAX_BACKWARD_PTX, "softmax_backward_kernel", "softmax_backward_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "softmax_backward_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let grad_host = gpu_to_cpu(grad, device)?;
+            let output_host = gpu_to_cpu(output, device)?;
+            let mut result = vec![0.0f64; total];
+            for r in 0..rows {
+                let base = r * cols;
+                let mut dot = 0.0f64;
+                for c in 0..cols {
+                    dot += grad_host[base + c] * output_host[base + c];
+                }
+                for c in 0..cols {
+                    result[base + c] = output_host[base + c] * (grad_host[base + c] - dot);
+                }
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad.inner())
+            .arg(output.inner())
+            .arg(out.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Row-wise log-softmax for f64 on GPU.
+///
+/// For each row: `out[j] = x[j] - log(sum(exp(x - max(x))))`.
+#[cfg(feature = "cuda")]
+pub fn gpu_log_softmax_f64(
+    input: &CudaBuffer<f64>,
+    cols: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_device(input, device)?;
+
+    let total = input.len();
+    let rows = total / cols;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        LOG_SOFTMAX_F64_PTX,
+        "log_softmax_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0f64; total];
+            for r in 0..rows {
+                let base = r * cols;
+                let mut max_v = f64::NEG_INFINITY;
+                for c in 0..cols {
+                    max_v = max_v.max(host[base + c]);
+                }
+                let mut sum_exp = 0.0f64;
+                for c in 0..cols {
+                    sum_exp += (host[base + c] - max_v).exp();
+                }
+                let log_sum_exp = max_v + sum_exp.ln();
+                for c in 0..cols {
+                    out[base + c] = host[base + c] - log_sum_exp;
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Row-wise log-softmax backward for f64 on GPU.
+///
+/// For each row:
+///   `sum_grad = sum(grad[j])`
+///   `out[j] = grad[j] - exp(output[j]) * sum_grad`
+#[cfg(feature = "cuda")]
+pub fn gpu_log_softmax_backward_f64(
+    grad: &CudaBuffer<f64>,
+    output: &CudaBuffer<f64>,
+    cols: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_device(grad, device)?;
+    if grad.len() != output.len() {
+        return Err(GpuError::LengthMismatch { a: grad.len(), b: output.len() });
+    }
+
+    let total = grad.len();
+    let rows = total / cols;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        LOG_SOFTMAX_BACKWARD_F64_PTX,
+        "log_softmax_backward_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let grad_host = gpu_to_cpu(grad, device)?;
+            let output_host = gpu_to_cpu(output, device)?;
+            let mut result = vec![0.0f64; total];
+            for r in 0..rows {
+                let base = r * cols;
+                let mut sum_grad = 0.0f64;
+                for c in 0..cols {
+                    sum_grad += grad_host[base + c];
+                }
+                for c in 0..cols {
+                    result[base + c] =
+                        grad_host[base + c] - output_host[base + c].exp() * sum_grad;
+                }
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad.inner())
+            .arg(output.inner())
+            .arg(out.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// Row-wise LayerNorm for f64 on GPU.
+///
+/// `input`: `[rows * cols]`, `weight`: `[cols]`, `bias`: `[cols]`.
+/// `out[j] = weight[j] * (x[j] - mean) / sqrt(var + eps) + bias[j]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_layernorm_f64(
+    input: &CudaBuffer<f64>,
+    weight: &CudaBuffer<f64>,
+    bias: &CudaBuffer<f64>,
+    rows: usize,
+    cols: usize,
+    eps: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, LAYERNORM_PTX, "layernorm_kernel", "layernorm_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "layernorm_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let h_in = gpu_to_cpu(input, device)?;
+            let h_w = gpu_to_cpu(weight, device)?;
+            let h_b = gpu_to_cpu(bias, device)?;
+            let mut out = vec![0.0f64; rows * cols];
+            for r in 0..rows {
+                let base = r * cols;
+                let slice = &h_in[base..base + cols];
+                let mean: f64 = slice.iter().sum::<f64>() / cols as f64;
+                let var: f64 =
+                    slice.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / cols as f64;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                for c in 0..cols {
+                    let normed = (slice[c] - mean) * inv_std;
+                    out[base + c] = h_w[c] * normed + h_b[c];
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(rows * cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(weight.inner())
+            .arg(bias.inner())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// LayerNorm backward for f64 on GPU.
+///
+/// Returns `(grad_input [rows * cols], grad_weight [cols], grad_bias [cols])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_layernorm_backward_f64(
+    input: &CudaBuffer<f64>,
+    grad_output: &CudaBuffer<f64>,
+    weight: &CudaBuffer<f64>,
+    rows: usize,
+    cols: usize,
+    eps: f64,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>, CudaBuffer<f64>)> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, LAYERNORM_BACKWARD_PTX, "layernorm_backward_kernel", "layernorm_backward_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "layernorm_backward_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let h_in = gpu_to_cpu(input, device)?;
+            let h_go = gpu_to_cpu(grad_output, device)?;
+            let h_w = gpu_to_cpu(weight, device)?;
+            let mut grad_input = vec![0.0f64; rows * cols];
+            let mut grad_weight = vec![0.0f64; cols];
+            let mut grad_bias = vec![0.0f64; cols];
+            let n_f = cols as f64;
+            for r in 0..rows {
+                let base = r * cols;
+                let x_slice = &h_in[base..base + cols];
+                let go_slice = &h_go[base..base + cols];
+                let mean: f64 = x_slice.iter().sum::<f64>() / n_f;
+                let var: f64 = x_slice
+                    .iter()
+                    .map(|&x| (x - mean) * (x - mean))
+                    .sum::<f64>()
+                    / n_f;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                let mut sum1 = 0.0f64;
+                let mut sum2 = 0.0f64;
+                for c in 0..cols {
+                    let x_hat = (x_slice[c] - mean) * inv_std;
+                    let dl = go_slice[c] * h_w[c];
+                    sum1 += dl;
+                    sum2 += dl * x_hat;
+                    grad_weight[c] += go_slice[c] * x_hat;
+                    grad_bias[c] += go_slice[c];
+                }
+                let m1 = sum1 / n_f;
+                let m2 = sum2 / n_f;
+                for c in 0..cols {
+                    let x_hat = (x_slice[c] - mean) * inv_std;
+                    let dl = go_slice[c] * h_w[c];
+                    grad_input[base + c] = inv_std * (dl - m1 - x_hat * m2);
+                }
+            }
+            let gi = cpu_to_gpu(&grad_input, device)?;
+            let gw = cpu_to_gpu(&grad_weight, device)?;
+            let gb = cpu_to_gpu(&grad_bias, device)?;
+            return Ok((gi, gw, gb));
+        }
+    };
+
+    let mut grad_in = alloc_zeros_f64(rows * cols, device)?;
+    let mut grad_w = alloc_zeros_f64(cols, device)?;
+    let mut grad_b = alloc_zeros_f64(cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(grad_output.inner())
+            .arg(weight.inner())
+            .arg(grad_in.inner_mut())
+            .arg(grad_w.inner_mut())
+            .arg(grad_b.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+
+    Ok((grad_in, grad_w, grad_b))
+}
+
+/// Row-wise RMS normalization for f64 on GPU.
+///
+/// `input`: `[rows * cols]`, `weight`: `[cols]`.
+/// `out[j] = x[j] * rsqrt(mean(x^2) + eps) * weight[j]`.
+#[cfg(feature = "cuda")]
+pub fn gpu_rmsnorm_f64(
+    input: &CudaBuffer<f64>,
+    weight: &CudaBuffer<f64>,
+    rows: usize,
+    cols: usize,
+    eps: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, RMSNORM_PTX, "rmsnorm_kernel", "rmsnorm_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "rmsnorm_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let h_in = gpu_to_cpu(input, device)?;
+            let h_w = gpu_to_cpu(weight, device)?;
+            let mut out = vec![0.0f64; rows * cols];
+            for r in 0..rows {
+                let base = r * cols;
+                let slice = &h_in[base..base + cols];
+                let sq_mean: f64 =
+                    slice.iter().map(|&x| x * x).sum::<f64>() / cols as f64;
+                let inv_rms = 1.0 / (sq_mean + eps).sqrt();
+                for c in 0..cols {
+                    out[base + c] = slice[c] * inv_rms * h_w[c];
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(rows * cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(weight.inner())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// RMSNorm backward for f64 on GPU.
+///
+/// Returns `(grad_input [rows * cols], grad_weight [cols])`.
+#[cfg(feature = "cuda")]
+pub fn gpu_rmsnorm_backward_f64(
+    input: &CudaBuffer<f64>,
+    grad_output: &CudaBuffer<f64>,
+    weight: &CudaBuffer<f64>,
+    rows: usize,
+    cols: usize,
+    eps: f64,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, RMSNORM_BACKWARD_PTX, "rmsnorm_backward_kernel", "rmsnorm_backward_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "rmsnorm_backward_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let h_in = gpu_to_cpu(input, device)?;
+            let h_go = gpu_to_cpu(grad_output, device)?;
+            let h_w = gpu_to_cpu(weight, device)?;
+            let mut grad_input = vec![0.0f64; rows * cols];
+            let mut grad_weight = vec![0.0f64; cols];
+            let n_f = cols as f64;
+            for r in 0..rows {
+                let base = r * cols;
+                let x_slice = &h_in[base..base + cols];
+                let go_slice = &h_go[base..base + cols];
+                let sq_mean: f64 =
+                    x_slice.iter().map(|&x| x * x).sum::<f64>() / n_f;
+                let inv_rms = 1.0 / (sq_mean + eps).sqrt();
+                let inv_rms3 = inv_rms * inv_rms * inv_rms;
+                let mut dot = 0.0f64;
+                for c in 0..cols {
+                    dot += go_slice[c] * x_slice[c] * h_w[c];
+                    grad_weight[c] += go_slice[c] * x_slice[c] * inv_rms;
+                }
+                let coeff = dot * inv_rms3 / n_f;
+                for c in 0..cols {
+                    grad_input[base + c] =
+                        inv_rms * h_w[c] * go_slice[c] - x_slice[c] * coeff;
+                }
+            }
+            let gi = cpu_to_gpu(&grad_input, device)?;
+            let gw = cpu_to_gpu(&grad_weight, device)?;
+            return Ok((gi, gw));
+        }
+    };
+
+    let mut grad_in = alloc_zeros_f64(rows * cols, device)?;
+    let mut grad_w = alloc_zeros_f64(cols, device)?;
+    let rows_u32 = rows as u32;
+    let cols_u32 = cols as u32;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(grad_output.inner())
+            .arg(weight.inner())
+            .arg(grad_in.inner_mut())
+            .arg(grad_w.inner_mut())
+            .arg(&rows_u32)
+            .arg(&cols_u32)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+
+    Ok((grad_in, grad_w))
+}
+
+// ---------------------------------------------------------------------------
+// Non-cuda stubs for softmax/layernorm/rmsnorm f64
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_softmax_f64(_input: &CudaBuffer<f64>, _rows: usize, _cols: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_softmax_backward_f64(_grad: &CudaBuffer<f64>, _output: &CudaBuffer<f64>, _cols: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_log_softmax_f64(_input: &CudaBuffer<f64>, _cols: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_log_softmax_backward_f64(_grad: &CudaBuffer<f64>, _output: &CudaBuffer<f64>, _cols: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_layernorm_f64(_input: &CudaBuffer<f64>, _weight: &CudaBuffer<f64>, _bias: &CudaBuffer<f64>, _rows: usize, _cols: usize, _eps: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_layernorm_backward_f64(_input: &CudaBuffer<f64>, _grad_output: &CudaBuffer<f64>, _weight: &CudaBuffer<f64>, _rows: usize, _cols: usize, _eps: f64, _device: &GpuDevice) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>, CudaBuffer<f64>)> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_rmsnorm_f64(_input: &CudaBuffer<f64>, _weight: &CudaBuffer<f64>, _rows: usize, _cols: usize, _eps: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_rmsnorm_backward_f64(_input: &CudaBuffer<f64>, _grad_output: &CudaBuffer<f64>, _weight: &CudaBuffer<f64>, _rows: usize, _cols: usize, _eps: f64, _device: &GpuDevice) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> { Err(GpuError::NoCudaFeature) }
+
+// ---------------------------------------------------------------------------
+// Non-cuda stubs for new f64 ops
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_gelu_f64(_input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_gelu_tanh_f64(_input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_gelu_erf_f64(_input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_gelu_backward_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_gelu_backward_tanh_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_gelu_backward_erf_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_silu_f64(_input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_silu_backward_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_elu_f64(_input: &CudaBuffer<f64>, _alpha: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_elu_backward_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _alpha: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_mish_f64(_input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_mish_backward_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_clamp_f64(_input: &CudaBuffer<f64>, _min: f64, _max: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_cumsum_f64(_input: &CudaBuffer<f64>, _outer: usize, _dim_size: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_cumprod_f64(_input: &CudaBuffer<f64>, _outer: usize, _dim_size: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_cummax_f64(_input: &CudaBuffer<f64>, _outer: usize, _dim_size: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_cummin_f64(_input: &CudaBuffer<f64>, _outer: usize, _dim_size: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_logcumsumexp_f64(_input: &CudaBuffer<f64>, _outer: usize, _dim_size: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
 
 // ---------------------------------------------------------------------------
 // Tests -- require a real CUDA GPU

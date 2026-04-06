@@ -1205,6 +1205,175 @@ impl<T: Float> ReplicationPad3d<T> {
 impl_padding_module!(ReplicationPad3d);
 
 // ===========================================================================
+// CircularPad — wraps data circularly (periodic boundary conditions)
+// ===========================================================================
+
+/// 1-D circular padding: wraps the input circularly.
+///
+/// Input: [N, C, W]. Pads the W dimension with circular (periodic) values.
+/// Matches PyTorch's `nn.CircularPad1d`.
+#[derive(Debug, Clone)]
+pub struct CircularPad1d<T: Float> {
+    pub padding: (usize, usize),
+    training: bool,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Float> CircularPad1d<T> {
+    pub fn new(padding: (usize, usize)) -> Self {
+        Self { padding, training: true, _phantom: std::marker::PhantomData }
+    }
+
+    fn pad(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() != 3 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("CircularPad1d: expected 3-D input [N,C,W], got {:?}", input.shape()),
+            });
+        }
+        if input.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "CircularPad1d" });
+        }
+        let shape = input.shape();
+        let (n, c, w) = (shape[0], shape[1], shape[2]);
+        let (pl, pr) = self.padding;
+        let new_w = w + pl + pr;
+        let data = input.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let mut out = vec![zero; n * c * new_w];
+
+        for batch in 0..n {
+            for ch in 0..c {
+                for ow in 0..new_w {
+                    let iw = ((ow as isize - pl as isize).rem_euclid(w as isize)) as usize;
+                    out[batch * c * new_w + ch * new_w + ow] =
+                        data[batch * c * w + ch * w + iw];
+                }
+            }
+        }
+
+        Tensor::from_storage(TensorStorage::cpu(out), vec![n, c, new_w], false)
+    }
+}
+
+impl<T: Float> Default for CircularPad1d<T> {
+    fn default() -> Self { Self::new((0, 0)) }
+}
+
+impl_padding_module!(CircularPad1d);
+
+/// 2-D circular padding. Input: [N, C, H, W].
+/// Matches PyTorch's `nn.CircularPad2d`.
+#[derive(Debug, Clone)]
+pub struct CircularPad2d<T: Float> {
+    pub padding: (usize, usize, usize, usize),
+    training: bool,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Float> CircularPad2d<T> {
+    pub fn new(padding: (usize, usize, usize, usize)) -> Self {
+        Self { padding, training: true, _phantom: std::marker::PhantomData }
+    }
+
+    fn pad(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() != 4 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("CircularPad2d: expected 4-D input [N,C,H,W], got {:?}", input.shape()),
+            });
+        }
+        if input.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "CircularPad2d" });
+        }
+        let shape = input.shape();
+        let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let (pl, pr, pt, pb) = self.padding;
+        let new_h = h + pt + pb;
+        let new_w = w + pl + pr;
+        let data = input.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let mut out = vec![zero; n * c * new_h * new_w];
+
+        for batch in 0..n {
+            for ch in 0..c {
+                for oh in 0..new_h {
+                    let ih = ((oh as isize - pt as isize).rem_euclid(h as isize)) as usize;
+                    for ow in 0..new_w {
+                        let iw = ((ow as isize - pl as isize).rem_euclid(w as isize)) as usize;
+                        out[batch * c * new_h * new_w + ch * new_h * new_w + oh * new_w + ow] =
+                            data[batch * c * h * w + ch * h * w + ih * w + iw];
+                    }
+                }
+            }
+        }
+
+        Tensor::from_storage(TensorStorage::cpu(out), vec![n, c, new_h, new_w], false)
+    }
+}
+
+impl<T: Float> Default for CircularPad2d<T> {
+    fn default() -> Self { Self::new((0, 0, 0, 0)) }
+}
+
+impl_padding_module!(CircularPad2d);
+
+/// 3-D circular padding. Input: [N, C, D, H, W].
+/// Matches PyTorch's `nn.CircularPad3d`.
+#[derive(Debug, Clone)]
+pub struct CircularPad3d<T: Float> {
+    pub padding: (usize, usize, usize, usize, usize, usize),
+    training: bool,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Float> CircularPad3d<T> {
+    pub fn new(padding: (usize, usize, usize, usize, usize, usize)) -> Self {
+        Self { padding, training: true, _phantom: std::marker::PhantomData }
+    }
+
+    fn pad(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() != 5 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("CircularPad3d: expected 5-D input [N,C,D,H,W], got {:?}", input.shape()),
+            });
+        }
+        if input.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "CircularPad3d" });
+        }
+        let shape = input.shape();
+        let (n, c, d, h, w) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
+        let (pl, pr, pt, pb, pf, pk) = self.padding;
+        let (new_d, new_h, new_w) = (d + pf + pk, h + pt + pb, w + pl + pr);
+        let data = input.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let mut out = vec![zero; n * c * new_d * new_h * new_w];
+
+        for batch in 0..n {
+            for ch in 0..c {
+                for od in 0..new_d {
+                    let id = ((od as isize - pf as isize).rem_euclid(d as isize)) as usize;
+                    for oh in 0..new_h {
+                        let ih = ((oh as isize - pt as isize).rem_euclid(h as isize)) as usize;
+                        for ow in 0..new_w {
+                            let iw = ((ow as isize - pl as isize).rem_euclid(w as isize)) as usize;
+                            out[batch*c*new_d*new_h*new_w + ch*new_d*new_h*new_w + od*new_h*new_w + oh*new_w + ow] =
+                                data[batch*c*d*h*w + ch*d*h*w + id*h*w + ih*w + iw];
+                        }
+                    }
+                }
+            }
+        }
+
+        Tensor::from_storage(TensorStorage::cpu(out), vec![n, c, new_d, new_h, new_w], false)
+    }
+}
+
+impl<T: Float> Default for CircularPad3d<T> {
+    fn default() -> Self { Self::new((0, 0, 0, 0, 0, 0)) }
+}
+
+impl_padding_module!(CircularPad3d);
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 

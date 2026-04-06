@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::autograd::no_grad::{is_grad_enabled, no_grad};
 use crate::dtype::Float;
 use crate::error::{FerrotorchError, FerrotorchResult};
-use crate::ops::elementwise::{binary_map, fast_add, fast_mul, scalar_map, unary_map};
+use crate::ops::elementwise::{fast_add, fast_mul, scalar_map, unary_map};
 use crate::shape::broadcast_shapes;
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
@@ -77,8 +77,8 @@ fn reduce_grad_to_shape<T: Float>(
         return crate::grad_fns::reduction::sum(grad);
     }
 
-    // GPU fast path for f32: reduce each broadcast axis on-device.
-    if grad.is_cuda() && is_f32::<T>() {
+    // GPU fast path for f32/f64: reduce each broadcast axis on-device.
+    if grad.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
         let mut handle = backend.clone_buffer(grad.gpu_handle()?)?;
@@ -88,14 +88,22 @@ fn reduce_grad_to_shape<T: Float>(
 
         // First reduce leading dimensions that don't exist in target.
         while current_shape.len() > target_ndim {
-            handle = backend.sum_axis_f32(&handle, &current_shape, 0)?;
+            handle = if is_f32::<T>() {
+                backend.sum_axis_f32(&handle, &current_shape, 0)?
+            } else {
+                backend.sum_axis_f64(&handle, &current_shape, 0)?
+            };
             current_shape.remove(0);
         }
 
         // Then reduce dimensions where target has size 1 but grad has size > 1.
         for axis in 0..current_shape.len() {
             if axis < target_shape.len() && target_shape[axis] == 1 && current_shape[axis] > 1 {
-                handle = backend.sum_axis_f32(&handle, &current_shape, axis)?;
+                handle = if is_f32::<T>() {
+                    backend.sum_axis_f32(&handle, &current_shape, axis)?
+                } else {
+                    backend.sum_axis_f64(&handle, &current_shape, axis)?
+                };
                 current_shape[axis] = 1;
             }
         }
@@ -103,15 +111,14 @@ fn reduce_grad_to_shape<T: Float>(
         return Tensor::from_storage(TensorStorage::gpu(handle), target_shape.to_vec(), false);
     }
 
-    // CPU path (also handles non-f32 GPU tensors via download/re-upload).
-    let device = grad.device();
-    let cpu_grad = if grad.is_cuda() {
-        grad.cpu()?
-    } else {
-        grad.clone()
-    };
+    // CPU path — non-f32/f64 GPU tensors have no GPU kernel, error out.
+    if grad.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda {
+            op: "broadcast_grad",
+        });
+    }
 
-    let grad_data = cpu_grad.data()?;
+    let grad_data = grad.data()?;
     let grad_ndim = grad_shape.len();
     let target_ndim = target_shape.len();
 
@@ -160,14 +167,7 @@ fn reduce_grad_to_shape<T: Float>(
         result[flat] += grad_val;
     }
 
-    let reduced = Tensor::from_storage(TensorStorage::cpu(result), target_shape.to_vec(), false)?;
-
-    // Move back to original device if needed.
-    if device.is_cuda() {
-        reduced.to(device)
-    } else {
-        Ok(reduced)
-    }
+    Tensor::from_storage(TensorStorage::cpu(result), target_shape.to_vec(), false)
 }
 
 // ===========================================================================
@@ -223,13 +223,11 @@ pub fn add<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
         let needs_broadcast = a.shape() != b.shape();
         let (handle, out_shape) = if needs_broadcast {
             let out_shape = broadcast_shapes(a.shape(), b.shape())?;
-            let h = backend.broadcast_add_f32(
-                a.gpu_handle()?,
-                b.gpu_handle()?,
-                a.shape(),
-                b.shape(),
-                &out_shape,
-            )?;
+            let h = if is_f64::<T>() {
+                backend.broadcast_add_f64(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            } else {
+                backend.broadcast_add_f32(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            };
             (h, out_shape)
         } else if is_f64::<T>() {
             (
@@ -329,13 +327,11 @@ pub fn sub<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
         let needs_broadcast = a.shape() != b.shape();
         let (handle, out_shape) = if needs_broadcast {
             let out_shape = broadcast_shapes(a.shape(), b.shape())?;
-            let h = backend.broadcast_sub_f32(
-                a.gpu_handle()?,
-                b.gpu_handle()?,
-                a.shape(),
-                b.shape(),
-                &out_shape,
-            )?;
+            let h = if is_f64::<T>() {
+                backend.broadcast_sub_f64(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            } else {
+                backend.broadcast_sub_f32(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            };
             (h, out_shape)
         } else if is_f64::<T>() {
             (
@@ -363,7 +359,7 @@ pub fn sub<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
             Tensor::from_storage(storage, out_shape, false)
         }
     } else {
-        let result = binary_map(a, b, |x, y| x - y)?;
+        let result = crate::ops::elementwise::fast_sub(a, b)?;
 
         if needs_grad(a, b) {
             let (storage, shape) = result.into_storage_and_shape()?;
@@ -463,13 +459,11 @@ pub fn mul<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
         let needs_broadcast = a.shape() != b.shape();
         let (handle, out_shape) = if needs_broadcast {
             let out_shape = broadcast_shapes(a.shape(), b.shape())?;
-            let h = backend.broadcast_mul_f32(
-                a.gpu_handle()?,
-                b.gpu_handle()?,
-                a.shape(),
-                b.shape(),
-                &out_shape,
-            )?;
+            let h = if is_f64::<T>() {
+                backend.broadcast_mul_f64(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            } else {
+                backend.broadcast_mul_f32(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            };
             (h, out_shape)
         } else if is_f64::<T>() {
             (
@@ -575,26 +569,26 @@ pub fn div<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
         });
     }
 
-    if a.is_cuda() && is_f32::<T>() {
+    if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
 
         let needs_broadcast = a.shape() != b.shape();
         let (handle, out_shape) = if needs_broadcast {
             let out_shape = broadcast_shapes(a.shape(), b.shape())?;
-            let h = backend.broadcast_div_f32(
-                a.gpu_handle()?,
-                b.gpu_handle()?,
-                a.shape(),
-                b.shape(),
-                &out_shape,
-            )?;
+            let h = if is_f64::<T>() {
+                backend.broadcast_div_f64(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            } else {
+                backend.broadcast_div_f32(a.gpu_handle()?, b.gpu_handle()?, a.shape(), b.shape(), &out_shape)?
+            };
             (h, out_shape)
         } else {
-            (
-                backend.div_f32(a.gpu_handle()?, b.gpu_handle()?)?,
-                a.shape().to_vec(),
-            )
+            let h = if is_f32::<T>() {
+                backend.div_f32(a.gpu_handle()?, b.gpu_handle()?)?
+            } else {
+                backend.div_f64(a.gpu_handle()?, b.gpu_handle()?)?
+            };
+            (h, a.shape().to_vec())
         };
         let storage = TensorStorage::gpu(handle);
 
@@ -611,7 +605,7 @@ pub fn div<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
             Tensor::from_storage(storage, out_shape, false)
         }
     } else {
-        let result = binary_map(a, b, |x, y| x / y)?;
+        let result = crate::ops::elementwise::fast_div(a, b)?;
 
         if needs_grad(a, b) {
             let (storage, shape) = result.into_storage_and_shape()?;
@@ -771,10 +765,14 @@ impl<T: Float> GradFn<T> for PowBackward<T> {
 
 /// Elementwise power: `c = a ^ exp` where `exp` is a scalar `f64`.
 pub fn pow<T: Float>(a: &Tensor<T>, exp: f64) -> FerrotorchResult<Tensor<T>> {
-    if a.is_cuda() && is_f32::<T>() {
+    if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
-        let handle = backend.pow_f32(a.gpu_handle()?, exp as f32)?;
+        let handle = if is_f32::<T>() {
+            backend.pow_f32(a.gpu_handle()?, exp as f32)?
+        } else {
+            backend.pow_f64(a.gpu_handle()?, exp)?
+        };
         let storage = TensorStorage::gpu(handle);
         let shape = a.shape().to_vec();
 
@@ -859,10 +857,14 @@ impl<T: Float> GradFn<T> for SqrtBackward<T> {
 
 /// Elementwise square root: `c = sqrt(a)`.
 pub fn sqrt<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    if a.is_cuda() && is_f32::<T>() {
+    if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
-        let handle = backend.sqrt_f32(a.gpu_handle()?)?;
+        let handle = if is_f32::<T>() {
+            backend.sqrt_f32(a.gpu_handle()?)?
+        } else {
+            backend.sqrt_f64(a.gpu_handle()?)?
+        };
         let storage = TensorStorage::gpu(handle);
         let shape = a.shape().to_vec();
 
@@ -898,32 +900,10 @@ struct AbsBackward<T: Float> {
 impl<T: Float> GradFn<T> for AbsBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         let da = if self.a.requires_grad() {
-            if grad_output.is_cuda() {
-                // GPU path: compute sign(a) on CPU, move to GPU, then mul.
-                // sign(a) is element-wise and only depends on `a`, not grad_output.
-                let a_cpu = self.a.cpu()?;
-                let a_data = a_cpu.data()?;
-                let zero = <T as num_traits::Zero>::zero();
-                let one = <T as num_traits::One>::one();
-                let sign_data: Vec<T> = a_data
-                    .iter()
-                    .map(|&a| {
-                        if a > zero {
-                            one
-                        } else if a < zero {
-                            -one
-                        } else {
-                            zero
-                        }
-                    })
-                    .collect();
-                let sign_cpu = Tensor::from_storage(
-                    TensorStorage::cpu(sign_data),
-                    self.a.shape().to_vec(),
-                    false,
-                )?;
-                let sign_gpu = sign_cpu.to(grad_output.device())?;
-                Some(no_grad(|| mul(grad_output, &sign_gpu))?)
+            if grad_output.is_cuda() || self.a.is_cuda() {
+                return Err(FerrotorchError::NotImplementedOnCuda {
+                    op: "AbsBackward",
+                });
             } else {
                 // CPU path: direct data access for performance.
                 let go_data = grad_output.data()?;
@@ -967,10 +947,14 @@ impl<T: Float> GradFn<T> for AbsBackward<T> {
 
 /// Elementwise absolute value: `c = |a|`.
 pub fn abs<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    if a.is_cuda() && is_f32::<T>() {
+    if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
-        let handle = backend.abs_f32(a.gpu_handle()?)?;
+        let handle = if is_f32::<T>() {
+            backend.abs_f32(a.gpu_handle()?)?
+        } else {
+            backend.abs_f64(a.gpu_handle()?)?
+        };
         let storage = TensorStorage::gpu(handle);
         let shape = a.shape().to_vec();
 

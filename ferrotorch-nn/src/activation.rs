@@ -85,6 +85,91 @@ impl Default for ReLU {
 impl_activation_module!(ReLU);
 
 // ===========================================================================
+// Softmax2d
+// ===========================================================================
+
+/// Applies softmax over the channel dimension of 4-D input [N, C, H, W].
+///
+/// `Softmax2d(x)[n, c, h, w] = exp(x[n,c,h,w]) / sum_c'(exp(x[n,c',h,w]))`
+///
+/// Matches PyTorch's `nn.Softmax2d`.
+#[derive(Debug, Clone)]
+pub struct Softmax2d {
+    training: bool,
+}
+
+impl Softmax2d {
+    pub fn new() -> Self {
+        Self { training: true }
+    }
+
+    pub fn forward<T: Float>(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        if input.ndim() != 4 {
+            return Err(ferrotorch_core::error::FerrotorchError::InvalidArgument {
+                message: format!("Softmax2d expects 4-D input [N,C,H,W], got {:?}", input.shape()),
+            });
+        }
+
+        if input.is_cuda() {
+            return Err(ferrotorch_core::error::FerrotorchError::NotImplementedOnCuda {
+                op: "Softmax2d",
+            });
+        }
+
+        let shape = input.shape();
+        let n = shape[0];
+        let c = shape[1];
+        let h = shape[2];
+        let w = shape[3];
+        let data = input.data()?;
+        let mut out = vec![<T as num_traits::Zero>::zero(); n * c * h * w];
+
+        // Softmax over channel dim (dim=1) for each (n, h, w) position.
+        for batch in 0..n {
+            for row in 0..h {
+                for col in 0..w {
+                    // Find max for stability.
+                    let mut max_val = T::neg_infinity();
+                    for ch in 0..c {
+                        let idx = batch * c * h * w + ch * h * w + row * w + col;
+                        if data[idx] > max_val {
+                            max_val = data[idx];
+                        }
+                    }
+                    // Compute exp and sum.
+                    let mut sum_exp = <T as num_traits::Zero>::zero();
+                    for ch in 0..c {
+                        let idx = batch * c * h * w + ch * h * w + row * w + col;
+                        let e = (data[idx] - max_val).exp();
+                        out[idx] = e;
+                        sum_exp = sum_exp + e;
+                    }
+                    // Normalize.
+                    for ch in 0..c {
+                        let idx = batch * c * h * w + ch * h * w + row * w + col;
+                        out[idx] = out[idx] / sum_exp;
+                    }
+                }
+            }
+        }
+
+        Tensor::from_storage(
+            ferrotorch_core::storage::TensorStorage::cpu(out),
+            shape.to_vec(),
+            false,
+        )
+    }
+}
+
+impl Default for Softmax2d {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl_activation_module!(Softmax2d);
+
+// ===========================================================================
 // GELU
 // ===========================================================================
 
@@ -524,13 +609,13 @@ impl<T: Float> PReLU<T> {
         // relu_x = relu(input)
         let relu_x = act::relu(input)?;
 
-        // Get alpha value (transfer to CPU if needed).
-        let cpu_alpha = if self.alpha.tensor().is_cuda() {
-            self.alpha.tensor().cpu()?
-        } else {
-            self.alpha.tensor().clone()
-        };
-        let alpha_data = cpu_alpha.data()?;
+        // Get alpha value — must be on CPU.
+        if self.alpha.tensor().is_cuda() {
+            return Err(ferrotorch_core::error::FerrotorchError::NotImplementedOnCuda {
+                op: "PReLU",
+            });
+        }
+        let alpha_data = self.alpha.tensor().data()?;
         let alpha_val = alpha_data[0];
 
         let one_minus_alpha = T::from(1.0).unwrap() - alpha_val;

@@ -5,7 +5,8 @@
 //! - `scatter_add(input, dim, index, src)` — scatter with addition
 //! - `where_cond(condition, x, y)` — ternary selection
 //!
-//! All operations are CPU-only; GPU tensors are transferred transparently.
+//! All operations are CPU-only; GPU tensors must be transferred with `.cpu()`
+//! before calling these functions.
 //! Backward (gradient) functions live in `grad_fns::indexing`.
 
 use std::sync::Arc;
@@ -123,6 +124,10 @@ pub fn gather<T: Float>(
     let dim = normalize_axis(dim, ndim)?;
     let input_shape = input.shape();
 
+    if input.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "gather" });
+    }
+
     validate_gather_shapes(input_shape, dim, index_shape, index, input_shape[dim])?;
 
     let input_data = input.data_vec()?;
@@ -190,6 +195,10 @@ pub fn scatter<T: Float>(
     }
     let dim = normalize_axis(dim, ndim)?;
     let input_shape = input.shape();
+
+    if input.is_cuda() || src.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "scatter" });
+    }
 
     validate_gather_shapes(input_shape, dim, index_shape, index, input_shape[dim])?;
 
@@ -263,6 +272,10 @@ pub fn scatter_add<T: Float>(
     let dim = normalize_axis(dim, ndim)?;
     let input_shape = input.shape();
 
+    if input.is_cuda() || src.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "scatter_add" });
+    }
+
     validate_gather_shapes(input_shape, dim, index_shape, index, input_shape[dim])?;
 
     let index_numel: usize = index_shape.iter().product();
@@ -332,6 +345,10 @@ pub fn where_cond<T: Float>(
             ),
         });
     }
+    if x.is_cuda() || y.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "where_cond" });
+    }
+
     let numel = x.numel();
     if condition.len() != numel {
         return Err(FerrotorchError::ShapeMismatch {

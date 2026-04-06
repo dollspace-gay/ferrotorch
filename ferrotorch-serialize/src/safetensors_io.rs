@@ -14,6 +14,38 @@ use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, Tensor, TensorStorage};
 use ferrotorch_nn::StateDict;
 
+/// Convert IEEE 754 half-precision (f16) bits to f32.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let frac = (bits & 0x3FF) as u32;
+
+    if exp == 0 {
+        if frac == 0 {
+            // Zero
+            f32::from_bits(sign << 31)
+        } else {
+            // Subnormal f16 → normal f32
+            let mut e = 1u32;
+            let mut f = frac;
+            while (f & 0x400) == 0 {
+                f <<= 1;
+                e += 1;
+            }
+            let f32_exp = (127 - 15 - e + 1) as u32;
+            let f32_frac = (f & 0x3FF) << 13;
+            f32::from_bits((sign << 31) | (f32_exp << 23) | f32_frac)
+        }
+    } else if exp == 31 {
+        // Inf or NaN
+        f32::from_bits((sign << 31) | (0xFF << 23) | (frac << 13))
+    } else {
+        // Normal
+        let f32_exp = (exp + 127 - 15) as u32;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
+    }
+}
+
 /// Return the `safetensors::Dtype` that corresponds to the concrete `Float`
 /// type `T`.
 fn st_dtype<T: Float>() -> FerrotorchResult<Dtype> {
@@ -136,14 +168,6 @@ pub fn load_safetensors<T: Float>(path: impl AsRef<Path>) -> FerrotorchResult<St
     let mut state: StateDict<T> = HashMap::with_capacity(tensor_list.len());
 
     for (name, view) in &tensor_list {
-        // Validate dtype.
-        if view.dtype() != expected {
-            return Err(FerrotorchError::DtypeMismatch {
-                expected: format!("{:?}", expected),
-                got: format!("{:?}", view.dtype()),
-            });
-        }
-
         let shape = view.shape().to_vec();
         let byte_data = view.data();
         let numel: usize = if shape.is_empty() {
@@ -151,6 +175,49 @@ pub fn load_safetensors<T: Float>(path: impl AsRef<Path>) -> FerrotorchResult<St
         } else {
             shape.iter().product()
         };
+
+        // Auto-cast f16/bf16 to the target type (f32 or f64).
+        if view.dtype() == Dtype::F16 || view.dtype() == Dtype::BF16 {
+            let is_bf16 = view.dtype() == Dtype::BF16;
+            if byte_data.len() != numel * 2 {
+                return Err(FerrotorchError::InvalidArgument {
+                    message: format!(
+                        "tensor '{name}': expected {} bytes for {:?} with {numel} elements, got {}",
+                        numel * 2,
+                        view.dtype(),
+                        byte_data.len()
+                    ),
+                });
+            }
+
+            let mut float_data: Vec<T> = Vec::with_capacity(numel);
+            for i in 0..numel {
+                let lo = byte_data[i * 2];
+                let hi = byte_data[i * 2 + 1];
+                let f32_val = if is_bf16 {
+                    // bf16: top 16 bits of f32
+                    f32::from_bits((hi as u32) << 24 | (lo as u32) << 16)
+                } else {
+                    // f16: IEEE 754 half-precision
+                    let bits = (hi as u16) << 8 | lo as u16;
+                    half_to_f32(bits)
+                };
+                float_data.push(T::from(f32_val).unwrap());
+            }
+
+            let tensor =
+                Tensor::from_storage(TensorStorage::cpu(float_data), shape, false)?;
+            state.insert(name.to_string(), tensor);
+            continue;
+        }
+
+        // Validate dtype for non-half types.
+        if view.dtype() != expected {
+            return Err(FerrotorchError::DtypeMismatch {
+                expected: format!("{:?}", expected),
+                got: format!("{:?}", view.dtype()),
+            });
+        }
 
         // Validate byte length.
         let expected_bytes = numel * elem_size;

@@ -47,6 +47,10 @@ pub enum GpuError {
     #[cfg(feature = "cuda")]
     Blas(cudarc::cublas::result::CublasError),
 
+    /// cuSOLVER error forwarded from cudarc.
+    #[cfg(feature = "cuda")]
+    Solver(cudarc::cusolver::result::CusolverError),
+
     /// PTX kernel compilation failed (e.g. unsupported GPU architecture).
     PtxCompileFailed { kernel: &'static str },
 
@@ -117,6 +121,9 @@ impl fmt::Display for GpuError {
             #[cfg(feature = "cuda")]
             GpuError::Blas(e) => write!(f, "cuBLAS error: {e}"),
 
+            #[cfg(feature = "cuda")]
+            GpuError::Solver(e) => write!(f, "cuSOLVER error: {e}"),
+
             GpuError::PtxCompileFailed { kernel } => {
                 write!(f, "PTX kernel compilation failed: {kernel}")
             }
@@ -135,6 +142,8 @@ impl std::error::Error for GpuError {
             GpuError::Driver(e) => Some(e),
             #[cfg(feature = "cuda")]
             GpuError::Blas(e) => Some(e),
+            #[cfg(feature = "cuda")]
+            GpuError::Solver(e) => Some(e),
             _ => None,
         }
     }
@@ -151,6 +160,13 @@ impl From<cudarc::driver::DriverError> for GpuError {
 impl From<cudarc::cublas::result::CublasError> for GpuError {
     fn from(e: cudarc::cublas::result::CublasError) -> Self {
         GpuError::Blas(e)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::cusolver::result::CusolverError> for GpuError {
+    fn from(e: cudarc::cusolver::result::CusolverError) -> Self {
+        GpuError::Solver(e)
     }
 }
 

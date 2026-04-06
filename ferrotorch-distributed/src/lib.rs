@@ -57,6 +57,15 @@ pub mod rpc;
 #[cfg(feature = "gpu")]
 pub mod gpu_collective;
 
+#[cfg(feature = "nccl")]
+pub mod nccl_sys;
+#[cfg(feature = "nccl")]
+pub mod nccl_backend;
+#[cfg(feature = "nccl")]
+pub mod nccl_collective;
+#[cfg(feature = "nccl")]
+pub mod hybrid_backend;
+
 // Re-export key types at crate root for convenience.
 pub use backend::{Backend, SimulatedBackend, TcpBackend};
 pub use checkpoint::{
@@ -75,3 +84,12 @@ pub use rpc::{RpcAgent, RpcError, TcpRpcBackend};
 
 #[cfg(feature = "gpu")]
 pub use gpu_collective::{gpu_allreduce, gpu_broadcast};
+
+#[cfg(feature = "nccl")]
+pub use nccl_backend::{NcclBackend, is_nccl_available};
+#[cfg(feature = "nccl")]
+pub use nccl_collective::{nccl_allreduce, nccl_all_gather, nccl_broadcast, nccl_reduce_scatter};
+#[cfg(feature = "nccl")]
+pub use nccl_sys::NcclUniqueId;
+#[cfg(feature = "nccl")]
+pub use hybrid_backend::HybridBackend;

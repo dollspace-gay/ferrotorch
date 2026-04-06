@@ -22,7 +22,10 @@ use crate::buffer::CudaBuffer;
 use crate::conv::gpu_conv2d_f32;
 use crate::device::GpuDevice;
 use crate::error::{GpuError, GpuResult};
-use crate::kernels::{gpu_add, gpu_mul, gpu_neg, gpu_relu, gpu_sub};
+use crate::kernels::{
+    gpu_add, gpu_add_f64, gpu_mul, gpu_mul_f64, gpu_neg, gpu_neg_f64, gpu_relu, gpu_relu_f64,
+    gpu_sub, gpu_sub_f64,
+};
 use crate::transfer::{cpu_to_gpu, gpu_to_cpu};
 
 // ---------------------------------------------------------------------------
@@ -130,6 +133,12 @@ fn is_f32<T: GpuFloat>() -> bool {
     std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
 }
 
+/// Returns `true` if `T` is `f64`.
+#[inline]
+fn is_f64<T: GpuFloat>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
+}
+
 /// Shape-validation helper for binary operations.
 fn validate_shapes<T: GpuFloat>(a: &GpuTensor<T>, b: &GpuTensor<T>) -> GpuResult<()> {
     if a.shape() != b.shape() {
@@ -160,16 +169,17 @@ impl<T: GpuFloat> GpuTensor<T> {
     pub fn add(&self, other: &GpuTensor<T>) -> GpuResult<GpuTensor<T>> {
         validate_shapes(self, other)?;
         if is_f32::<T>() {
-            // SAFETY: We have verified T is f32 via TypeId, so T is f32-layout-compatible.
             let a_buf = unsafe { transmute_buffer_ref::<T, f32>(&self.buffer) };
             let b_buf = unsafe { transmute_buffer_ref::<T, f32>(&other.buffer) };
             let out_buf = gpu_add(a_buf, b_buf, &self.device)?;
             let out_buf = unsafe { transmute_buffer::<f32, T>(out_buf) };
-            Ok(GpuTensor {
-                buffer: out_buf,
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-            })
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
+        } else if is_f64::<T>() {
+            let a_buf = unsafe { transmute_buffer_ref::<T, f64>(&self.buffer) };
+            let b_buf = unsafe { transmute_buffer_ref::<T, f64>(&other.buffer) };
+            let out_buf = gpu_add_f64(a_buf, b_buf, &self.device)?;
+            let out_buf = unsafe { transmute_buffer::<f64, T>(out_buf) };
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
         } else {
             binary_cpu_fallback(self, other, |a, b| a + b)
         }
@@ -185,11 +195,13 @@ impl<T: GpuFloat> GpuTensor<T> {
             let b_buf = unsafe { transmute_buffer_ref::<T, f32>(&other.buffer) };
             let out_buf = gpu_sub(a_buf, b_buf, &self.device)?;
             let out_buf = unsafe { transmute_buffer::<f32, T>(out_buf) };
-            Ok(GpuTensor {
-                buffer: out_buf,
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-            })
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
+        } else if is_f64::<T>() {
+            let a_buf = unsafe { transmute_buffer_ref::<T, f64>(&self.buffer) };
+            let b_buf = unsafe { transmute_buffer_ref::<T, f64>(&other.buffer) };
+            let out_buf = gpu_sub_f64(a_buf, b_buf, &self.device)?;
+            let out_buf = unsafe { transmute_buffer::<f64, T>(out_buf) };
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
         } else {
             binary_cpu_fallback(self, other, |a, b| a - b)
         }
@@ -205,11 +217,13 @@ impl<T: GpuFloat> GpuTensor<T> {
             let b_buf = unsafe { transmute_buffer_ref::<T, f32>(&other.buffer) };
             let out_buf = gpu_mul(a_buf, b_buf, &self.device)?;
             let out_buf = unsafe { transmute_buffer::<f32, T>(out_buf) };
-            Ok(GpuTensor {
-                buffer: out_buf,
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-            })
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
+        } else if is_f64::<T>() {
+            let a_buf = unsafe { transmute_buffer_ref::<T, f64>(&self.buffer) };
+            let b_buf = unsafe { transmute_buffer_ref::<T, f64>(&other.buffer) };
+            let out_buf = gpu_mul_f64(a_buf, b_buf, &self.device)?;
+            let out_buf = unsafe { transmute_buffer::<f64, T>(out_buf) };
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
         } else {
             binary_cpu_fallback(self, other, |a, b| a * b)
         }
@@ -223,11 +237,12 @@ impl<T: GpuFloat> GpuTensor<T> {
             let a_buf = unsafe { transmute_buffer_ref::<T, f32>(&self.buffer) };
             let out_buf = gpu_neg(a_buf, &self.device)?;
             let out_buf = unsafe { transmute_buffer::<f32, T>(out_buf) };
-            Ok(GpuTensor {
-                buffer: out_buf,
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-            })
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
+        } else if is_f64::<T>() {
+            let a_buf = unsafe { transmute_buffer_ref::<T, f64>(&self.buffer) };
+            let out_buf = gpu_neg_f64(a_buf, &self.device)?;
+            let out_buf = unsafe { transmute_buffer::<f64, T>(out_buf) };
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
         } else {
             unary_cpu_fallback(self, |x| -x)
         }
@@ -241,11 +256,12 @@ impl<T: GpuFloat> GpuTensor<T> {
             let a_buf = unsafe { transmute_buffer_ref::<T, f32>(&self.buffer) };
             let out_buf = gpu_relu(a_buf, &self.device)?;
             let out_buf = unsafe { transmute_buffer::<f32, T>(out_buf) };
-            Ok(GpuTensor {
-                buffer: out_buf,
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-            })
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
+        } else if is_f64::<T>() {
+            let a_buf = unsafe { transmute_buffer_ref::<T, f64>(&self.buffer) };
+            let out_buf = gpu_relu_f64(a_buf, &self.device)?;
+            let out_buf = unsafe { transmute_buffer::<f64, T>(out_buf) };
+            Ok(GpuTensor { buffer: out_buf, shape: self.shape.clone(), device: self.device.clone() })
         } else {
             unary_cpu_fallback(self, |x| {
                 let z = <T as num_traits::Zero>::zero();

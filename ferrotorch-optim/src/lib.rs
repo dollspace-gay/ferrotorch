@@ -1,9 +1,11 @@
 pub mod adadelta;
+pub mod adafactor;
 pub mod adagrad;
 pub mod adam;
 pub mod adamax;
 pub mod adamw;
 pub mod asgd;
+pub mod sparse_adam;
 pub mod ema;
 pub mod grad_accumulator;
 pub mod grad_scaler;
@@ -20,6 +22,8 @@ pub mod sgd;
 pub mod swa;
 
 pub use adadelta::{Adadelta, AdadeltaConfig};
+pub use adafactor::{Adafactor, AdafactorConfig};
+pub use sparse_adam::{SparseAdam, SparseAdamConfig};
 pub use adagrad::{Adagrad, AdagradConfig};
 pub use adam::{Adam, AdamConfig};
 pub use adamax::{Adamax, AdamaxConfig};
@@ -37,10 +41,10 @@ pub use radam::{RAdam, RAdamConfig};
 pub use rmsprop::{Rmsprop, RmspropConfig};
 pub use rprop::{Rprop, RpropConfig};
 pub use scheduler::{
-    AnnealStrategy, ConstantLR, CosineAnnealingLR, CosineAnnealingWarmRestarts, CyclicLR,
-    CyclicMode, ExponentialLR, LambdaLR, LinearLR, LinearWarmup, LrScheduler, MetricScheduler,
-    MultiStepLR, OneCycleLR, PlateauMode, PolynomialLR, ReduceLROnPlateau, SequentialLr, StepLR,
-    cosine_warmup_scheduler,
+    AnnealStrategy, ChainedScheduler, ConstantLR, CosineAnnealingLR,
+    CosineAnnealingWarmRestarts, CyclicLR, CyclicMode, ExponentialLR, LambdaLR, LinearLR,
+    LinearWarmup, LrScheduler, MetricScheduler, MultiStepLR, MultiplicativeLR, OneCycleLR,
+    PlateauMode, PolynomialLR, ReduceLROnPlateau, SequentialLr, StepLR, cosine_warmup_scheduler,
 };
 pub use sgd::{Sgd, SgdConfig};
 pub use swa::{AveragedModel, AveragingStrategy, Swalr};

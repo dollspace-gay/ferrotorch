@@ -374,6 +374,10 @@ impl<T: Float> GradFn<T> for GatherBackward<T> {
             return Ok(vec![None]);
         }
 
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "gather backward" });
+        }
+
         let input_shape = self.input.shape();
         let input_numel: usize = input_shape.iter().product();
         let go_data = grad_output.data_vec()?;
@@ -440,6 +444,10 @@ impl<T: Float> GradFn<T> for ScatterBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         if !is_grad_enabled() {
             return Ok(vec![None, None]);
+        }
+
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "scatter backward" });
         }
 
         let input_shape = self.input.shape();
@@ -533,6 +541,10 @@ impl<T: Float> GradFn<T> for ScatterAddBackward<T> {
             return Ok(vec![None, None]);
         }
 
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "scatter_add backward" });
+        }
+
         let input_shape = self.input.shape();
         let ndim = input_shape.len();
         let index_numel: usize = self.index_shape.iter().product();
@@ -607,6 +619,10 @@ impl<T: Float> GradFn<T> for WhereCondBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         if !is_grad_enabled() {
             return Ok(vec![None, None]);
+        }
+
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "where_cond backward" });
         }
 
         let go_data = grad_output.data_vec()?;

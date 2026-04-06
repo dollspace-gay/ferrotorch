@@ -321,16 +321,17 @@ mod tests {
 
     #[test]
     fn pool_take_miss_returns_none() {
-        // Take from an empty pool should return None.
-        let result = pool_take::<u64>(99, 256, 8);
+        // Use a unique device ID to avoid interference from parallel tests.
+        let result = pool_take::<u64>(9901, 256, 8);
         assert!(result.is_none());
     }
 
     #[test]
     fn pool_return_then_take() {
+        // Use a unique device ID to avoid interference from parallel tests.
         let value: u64 = 12345;
-        pool_return::<u64>(99, 256, 8, value);
-        let taken = pool_take::<u64>(99, 256, 8);
+        pool_return::<u64>(9902, 256, 8, value);
+        let taken = pool_take::<u64>(9902, 256, 8);
         assert_eq!(taken, Some(12345u64));
     }
 

@@ -310,24 +310,12 @@ impl<T: Float> GradFn<T> for CrossEntropyBackward<T> {
         let shape = self.logits.shape();
         let batch = shape[0];
         let classes = shape[1];
-        let cpu_sm = if self.softmax.is_cuda() {
-            self.softmax.cpu()?
-        } else {
-            self.softmax.clone()
-        };
-        let cpu_targets = if self.targets.is_cuda() {
-            self.targets.cpu()?
-        } else {
-            self.targets.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let sm_data = cpu_sm.data()?;
-        let targets_data = cpu_targets.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "CrossEntropy backward" });
+        }
+        let sm_data = self.softmax.data()?;
+        let targets_data = self.targets.data()?;
+        let grad_data = grad_output.data()?;
         let ls = T::from(self.label_smoothing).unwrap();
         let one = <T as One>::one();
         let inv_c = T::from(1.0).unwrap() / T::from(classes).unwrap();
@@ -358,7 +346,6 @@ impl<T: Float> GradFn<T> for CrossEntropyBackward<T> {
         }
 
         let grad_input = Tensor::from_storage(TensorStorage::cpu(result), shape.to_vec(), false)?;
-        let grad_input = grad_input.to(self.logits.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -872,13 +859,147 @@ impl CosineEmbeddingLoss {
         }
 
         let unreduced = Tensor::from_storage(TensorStorage::cpu(losses), vec![batch], false)?;
-        apply_reduction(&unreduced, self.reduction)
+        let reduced = apply_reduction(&unreduced, self.reduction)?;
+
+        if is_grad_enabled() && (x1.requires_grad() || x2.requires_grad()) {
+            let grad_fn = Arc::new(CosineEmbeddingBackward {
+                x1: x1.clone(),
+                x2: x2.clone(),
+                y: y.clone(),
+                margin: self.margin,
+                reduction: self.reduction,
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(reduced.data_vec()?),
+                reduced.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(reduced)
+        }
     }
 }
 
 impl Default for CosineEmbeddingLoss {
     fn default() -> Self {
         Self::new(Reduction::Mean, 0.0)
+    }
+}
+
+/// Backward for `CosineEmbeddingLoss`.
+///
+/// For positive pairs (y = 1):
+/// ```text
+/// d(loss)/d(x1_f) = -(x2_f / (||x1|| * ||x2||) - cos_sim * x1_f / ||x1||^2)
+/// d(loss)/d(x2_f) = -(x1_f / (||x1|| * ||x2||) - cos_sim * x2_f / ||x2||^2)
+/// ```
+///
+/// For negative pairs (y = -1) where `cos(x1, x2) - margin > 0`:
+/// ```text
+/// d(loss)/d(x1_f) = x2_f / (||x1|| * ||x2||) - cos_sim * x1_f / ||x1||^2
+/// d(loss)/d(x2_f) = x1_f / (||x1|| * ||x2||) - cos_sim * x2_f / ||x2||^2
+/// ```
+#[derive(Debug)]
+struct CosineEmbeddingBackward<T: Float> {
+    x1: Tensor<T>,
+    x2: Tensor<T>,
+    y: Tensor<T>,
+    margin: f64,
+    reduction: Reduction,
+}
+
+impl<T: Float> GradFn<T> for CosineEmbeddingBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let shape = self.x1.shape();
+        let (batch, feat) = if shape.len() == 1 {
+            (1, shape[0])
+        } else {
+            (shape[0], shape[1])
+        };
+
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "CosineEmbedding backward",
+            });
+        }
+        let x1_data = self.x1.data()?;
+        let x2_data = self.x2.data()?;
+        let y_data = self.y.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as Zero>::zero();
+        let margin_t = T::from(self.margin).unwrap();
+
+        let mut grad_x1 = vec![zero; batch * feat];
+        let mut grad_x2 = vec![zero; batch * feat];
+
+        for b in 0..batch {
+            let base = b * feat;
+
+            let scale = match self.reduction {
+                Reduction::Mean => grad_data[0] / T::from(batch).unwrap(),
+                Reduction::Sum => grad_data[0],
+                Reduction::None => grad_data[b],
+            };
+
+            // Compute cosine similarity for this sample.
+            let mut dot = zero;
+            let mut norm1_sq = zero;
+            let mut norm2_sq = zero;
+            for f in 0..feat {
+                let a = x1_data[base + f];
+                let bv = x2_data[base + f];
+                dot += a * bv;
+                norm1_sq += a * a;
+                norm2_sq += bv * bv;
+            }
+            let norm1 = norm1_sq.sqrt();
+            let norm2 = norm2_sq.sqrt();
+            let denom = norm1 * norm2;
+
+            if denom <= zero {
+                continue;
+            }
+
+            let cos_sim = dot / denom;
+
+            let is_positive = y_data[b] > zero;
+            let is_active = if is_positive {
+                true
+            } else {
+                cos_sim - margin_t > zero
+            };
+
+            if !is_active {
+                continue;
+            }
+
+            // sign: -1 for positive pairs, +1 for negative pairs
+            let sign = if is_positive { -<T as One>::one() } else { <T as One>::one() };
+
+            for f in 0..feat {
+                let a = x1_data[base + f];
+                let bv = x2_data[base + f];
+                // d(cos)/d(x1_f) = x2_f / (||x1|| * ||x2||) - cos * x1_f / ||x1||^2
+                let d_cos_x1 = bv / denom - cos_sim * a / norm1_sq;
+                let d_cos_x2 = a / denom - cos_sim * bv / norm2_sq;
+                grad_x1[base + f] = sign * d_cos_x1 * scale;
+                grad_x2[base + f] = sign * d_cos_x2 * scale;
+            }
+        }
+
+        let grad_x1_tensor =
+            Tensor::from_storage(TensorStorage::cpu(grad_x1), shape.to_vec(), false)?;
+        let grad_x2_tensor =
+            Tensor::from_storage(TensorStorage::cpu(grad_x2), shape.to_vec(), false)?;
+        Ok(vec![Some(grad_x1_tensor), Some(grad_x2_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.x1, &self.x2]
+    }
+
+    fn name(&self) -> &'static str {
+        "CosineEmbeddingBackward"
     }
 }
 
@@ -968,24 +1089,12 @@ struct L1Backward<T: Float> {
 
 impl<T: Float> GradFn<T> for L1Backward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_pred = if self.pred.is_cuda() {
-            self.pred.cpu()?
-        } else {
-            self.pred.clone()
-        };
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let pred_data = cpu_pred.data()?;
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "L1 backward" });
+        }
+        let pred_data = self.pred.data()?;
+        let target_data = self.target.data()?;
+        let grad_data = grad_output.data()?;
         let n = T::from(pred_data.len()).unwrap();
 
         let sign = |x: T| -> T {
@@ -1029,7 +1138,6 @@ impl<T: Float> GradFn<T> for L1Backward<T> {
             self.pred.shape().to_vec(),
             false,
         )?;
-        let grad_input = grad_input.to(self.pred.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -1224,18 +1332,11 @@ impl<T: Float> GradFn<T> for NLLBackward<T> {
         let batch = shape[0];
         let classes = shape[1];
 
-        let cpu_targets = if self.targets.is_cuda() {
-            self.targets.cpu()?
-        } else {
-            self.targets.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let targets_data = cpu_targets.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "NLL backward" });
+        }
+        let targets_data = self.targets.data()?;
+        let grad_data = grad_output.data()?;
 
         let mut result = vec![<T as Zero>::zero(); batch * classes];
 
@@ -1266,7 +1367,6 @@ impl<T: Float> GradFn<T> for NLLBackward<T> {
         }
 
         let grad_input = Tensor::from_storage(TensorStorage::cpu(result), shape.to_vec(), false)?;
-        let grad_input = grad_input.to(self.log_probs.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -1426,24 +1526,12 @@ struct BCEBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for BCEBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_input = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_data = cpu_input.data()?;
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "BCE backward" });
+        }
+        let input_data = self.input.data()?;
+        let target_data = self.target.data()?;
+        let grad_data = grad_output.data()?;
         let one = <T as One>::one();
         let eps = T::from(1e-12).unwrap();
         let one_m_eps = one - eps;
@@ -1506,7 +1594,6 @@ impl<T: Float> GradFn<T> for BCEBackward<T> {
             self.input.shape().to_vec(),
             false,
         )?;
-        let grad_input = grad_input.to(self.input.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -1662,30 +1749,13 @@ impl<T: Float> GradFn<T> for TripletMarginBackward<T> {
         let shape = self.anchor.shape();
         let batch = shape[0];
         let feat = shape[1];
-        let cpu_anchor = if self.anchor.is_cuda() {
-            self.anchor.cpu()?
-        } else {
-            self.anchor.clone()
-        };
-        let cpu_positive = if self.positive.is_cuda() {
-            self.positive.cpu()?
-        } else {
-            self.positive.clone()
-        };
-        let cpu_negative = if self.negative.is_cuda() {
-            self.negative.cpu()?
-        } else {
-            self.negative.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let anchor_data = cpu_anchor.data()?;
-        let positive_data = cpu_positive.data()?;
-        let negative_data = cpu_negative.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "TripletMargin backward" });
+        }
+        let anchor_data = self.anchor.data()?;
+        let positive_data = self.positive.data()?;
+        let negative_data = self.negative.data()?;
+        let grad_data = grad_output.data()?;
 
         let zero = <T as Zero>::zero();
         let p_val = T::from(self.p).unwrap();
@@ -1745,7 +1815,6 @@ impl<T: Float> GradFn<T> for TripletMarginBackward<T> {
         }
 
         let grad_input = Tensor::from_storage(TensorStorage::cpu(result), shape.to_vec(), false)?;
-        let grad_input = grad_input.to(self.anchor.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -1864,30 +1933,13 @@ struct MarginRankingBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for MarginRankingBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_x1 = if self.x1.is_cuda() {
-            self.x1.cpu()?
-        } else {
-            self.x1.clone()
-        };
-        let cpu_x2 = if self.x2.is_cuda() {
-            self.x2.cpu()?
-        } else {
-            self.x2.clone()
-        };
-        let cpu_y = if self.y.is_cuda() {
-            self.y.cpu()?
-        } else {
-            self.y.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let x1_data = cpu_x1.data()?;
-        let x2_data = cpu_x2.data()?;
-        let y_data = cpu_y.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "MarginRanking backward" });
+        }
+        let x1_data = self.x1.data()?;
+        let x2_data = self.x2.data()?;
+        let y_data = self.y.data()?;
+        let grad_data = grad_output.data()?;
         let zero = <T as Zero>::zero();
         let margin_t = T::from(self.margin).unwrap();
         let n = T::from(x1_data.len()).unwrap();
@@ -1931,7 +1983,6 @@ impl<T: Float> GradFn<T> for MarginRankingBackward<T> {
 
         let grad_input =
             Tensor::from_storage(TensorStorage::cpu(result), self.x1.shape().to_vec(), false)?;
-        let grad_input = grad_input.to(self.x1.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -2094,7 +2145,26 @@ impl CTCLoss {
         }
 
         let unreduced = Tensor::from_storage(TensorStorage::cpu(losses), vec![batch], false)?;
-        apply_reduction(&unreduced, self.reduction)
+        let reduced = apply_reduction(&unreduced, self.reduction)?;
+
+        if is_grad_enabled() && log_probs.requires_grad() {
+            let grad_fn = Arc::new(CTCBackward {
+                log_probs: log_probs.clone(),
+                targets: targets.clone(),
+                input_lengths: input_lengths.to_vec(),
+                target_lengths: target_lengths.to_vec(),
+                blank: self.blank,
+                zero_infinity: self.zero_infinity,
+                reduction: self.reduction,
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(reduced.data_vec()?),
+                reduced.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(reduced)
+        }
     }
 }
 
@@ -2114,6 +2184,192 @@ fn log_add_exp<T: Float>(a: T, b: T) -> T {
         max
     } else {
         max + (min - max).exp().ln_1p()
+    }
+}
+
+/// Backward for `CTCLoss`.
+///
+/// Uses the full forward-backward algorithm to compute gradients w.r.t.
+/// `log_probs`. For each `(t, b, c)`:
+///
+/// ```text
+/// grad[t, b, c] = exp(log_probs[t,b,c]) - (1/P) * sum_{s: ext[s]==c} exp(alpha[t][s] + beta[t][s] - log_probs[t,b,c])
+/// ```
+///
+/// where `P = exp(log_prob_total)` is the total path probability.
+#[derive(Debug)]
+struct CTCBackward<T: Float> {
+    log_probs: Tensor<T>,
+    targets: Tensor<T>,
+    input_lengths: Vec<usize>,
+    target_lengths: Vec<usize>,
+    blank: usize,
+    zero_infinity: bool,
+    reduction: Reduction,
+}
+
+impl<T: Float> GradFn<T> for CTCBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "CTC backward",
+            });
+        }
+
+        let shape = self.log_probs.shape();
+        let max_t = shape[0];
+        let batch = shape[1];
+        let num_classes = shape[2];
+        let total_size = max_t * batch * num_classes;
+
+        let lp_data = self.log_probs.data()?;
+        let targets_data = self.targets.data()?;
+        let grad_data = grad_output.data()?;
+        let neg_inf = T::from(-1e30).unwrap();
+        let zero = <T as Zero>::zero();
+
+        let mut result = vec![zero; total_size];
+        let mut target_offset = 0usize;
+
+        for b in 0..batch {
+            let t_len = self.input_lengths[b].min(max_t);
+            let s_len = self.target_lengths[b];
+
+            let tgt: Vec<usize> = (0..s_len)
+                .map(|i| targets_data[target_offset + i].to_usize().unwrap_or(0))
+                .collect();
+            target_offset += s_len;
+
+            let go_scale = match self.reduction {
+                Reduction::Mean => grad_data[0] / T::from(batch).unwrap(),
+                Reduction::Sum => grad_data[0],
+                Reduction::None => grad_data[b],
+            };
+
+            if s_len == 0 {
+                // Empty target: grad = -1 at blank for each timestep.
+                for t in 0..t_len {
+                    let idx = t * batch * num_classes + b * num_classes + self.blank;
+                    result[idx] = -go_scale;
+                }
+                continue;
+            }
+
+            let ext_len = 2 * s_len + 1;
+            let mut ext_labels = vec![self.blank; ext_len];
+            for i in 0..s_len {
+                ext_labels[2 * i + 1] = tgt[i];
+            }
+
+            // Forward pass (alpha).
+            let mut alpha = vec![vec![neg_inf; ext_len]; t_len];
+            alpha[0][0] = lp_data[b * num_classes + ext_labels[0]];
+            if ext_len > 1 {
+                alpha[0][1] = lp_data[b * num_classes + ext_labels[1]];
+            }
+            for t in 1..t_len {
+                for s in 0..ext_len {
+                    let lp_val =
+                        lp_data[t * batch * num_classes + b * num_classes + ext_labels[s]];
+                    let mut log_sum = alpha[t - 1][s];
+                    if s >= 1 {
+                        log_sum = log_add_exp(log_sum, alpha[t - 1][s - 1]);
+                    }
+                    if s >= 2
+                        && ext_labels[s] != self.blank
+                        && ext_labels[s] != ext_labels[s - 2]
+                    {
+                        log_sum = log_add_exp(log_sum, alpha[t - 1][s - 2]);
+                    }
+                    alpha[t][s] = log_sum + lp_val;
+                }
+            }
+
+            let log_prob =
+                log_add_exp(alpha[t_len - 1][ext_len - 1], alpha[t_len - 1][ext_len - 2]);
+
+            if self.zero_infinity && ((-log_prob) == T::infinity() || (-log_prob).is_nan()) {
+                continue;
+            }
+
+            // Backward pass (beta).
+            // beta[t][s] = log P(observing labels l'[s..] from time t onward),
+            // where alpha INCLUDES the emission at time t but beta does NOT.
+            // This avoids double-counting: alpha[t][s] + beta[t][s] =
+            // log P(path passes through state s at time t).
+            //
+            // Initialization: beta[T-1][s] = 0 for valid ending states.
+            // Recurrence: beta[t][s] = log_add_exp over successors s' of
+            //   (y_{t+1}^{l'[s']} + beta[t+1][s']).
+            let mut beta = vec![vec![neg_inf; ext_len]; t_len];
+            beta[t_len - 1][ext_len - 1] = zero;
+            if ext_len > 1 {
+                beta[t_len - 1][ext_len - 2] = zero;
+            }
+            for t in (0..t_len.saturating_sub(1)).rev() {
+                for s in (0..ext_len).rev() {
+                    // Successor s (same state): y_{t+1}^{l'[s]} + beta[t+1][s]
+                    let lp_s =
+                        lp_data[(t + 1) * batch * num_classes + b * num_classes + ext_labels[s]];
+                    let mut log_sum = lp_s + beta[t + 1][s];
+                    if s + 1 < ext_len {
+                        let lp_s1 = lp_data
+                            [(t + 1) * batch * num_classes + b * num_classes + ext_labels[s + 1]];
+                        log_sum = log_add_exp(log_sum, lp_s1 + beta[t + 1][s + 1]);
+                    }
+                    if s + 2 < ext_len
+                        && ext_labels[s] != self.blank
+                        && ext_labels[s] != ext_labels[s + 2]
+                    {
+                        let lp_s2 = lp_data
+                            [(t + 1) * batch * num_classes + b * num_classes + ext_labels[s + 2]];
+                        log_sum = log_add_exp(log_sum, lp_s2 + beta[t + 1][s + 2]);
+                    }
+                    beta[t][s] = log_sum;
+                }
+            }
+
+            // Accumulate gradients.
+            // alpha[t][s] includes emission, beta[t][s] does not, so
+            // alpha[t][s] + beta[t][s] = log P(all paths through state s at time t).
+            //
+            // d(-log P)/d(log_probs[t,b,c]) = -(1/P) * dP/d(log_probs[t,b,c])
+            // Since y_t^c = exp(log_probs[t,b,c]):
+            //   dP/d(log_probs[t,b,c]) = sum_{s:l'[s]=c} exp(alpha[t][s] + beta[t][s])
+            //
+            // So: grad[t,b,c] = -exp(log_ab_per_class[c] - log_prob)
+            for t in 0..t_len {
+                let mut log_ab_per_class = vec![neg_inf; num_classes];
+                for s in 0..ext_len {
+                    let c = ext_labels[s];
+                    let ab = alpha[t][s] + beta[t][s];
+                    log_ab_per_class[c] = log_add_exp(log_ab_per_class[c], ab);
+                }
+
+                for c in 0..num_classes {
+                    let idx = t * batch * num_classes + b * num_classes + c;
+                    let threshold = T::from(-1e29).unwrap();
+                    let occupation = if log_ab_per_class[c] > threshold {
+                        (log_ab_per_class[c] - log_prob).exp()
+                    } else {
+                        zero
+                    };
+                    result[idx] = -occupation * go_scale;
+                }
+            }
+        }
+
+        let grad_input =
+            Tensor::from_storage(TensorStorage::cpu(result), shape.to_vec(), false)?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.log_probs]
+    }
+
+    fn name(&self) -> &'static str {
+        "CTCBackward"
     }
 }
 
@@ -2403,24 +2659,12 @@ impl<T: Float> GradFn<T> for MultiMarginBackward<T> {
         let batch = shape[0];
         let classes = shape[1];
 
-        let cpu_input = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_data = cpu_input.data()?;
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "MultiMargin backward" });
+        }
+        let input_data = self.input.data()?;
+        let target_data = self.target.data()?;
+        let grad_data = grad_output.data()?;
 
         let zero = <T as Zero>::zero();
         let one = <T as One>::one();
@@ -2459,7 +2703,6 @@ impl<T: Float> GradFn<T> for MultiMarginBackward<T> {
         }
 
         let grad_input = Tensor::from_storage(TensorStorage::cpu(result), shape.to_vec(), false)?;
-        let grad_input = grad_input.to(self.input.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -2594,24 +2837,12 @@ impl<T: Float> GradFn<T> for MultiLabelSoftMarginBackward<T> {
         let batch = shape[0];
         let classes = shape[1];
 
-        let cpu_input = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let cpu_target = if self.target.is_cuda() {
-            self.target.cpu()?
-        } else {
-            self.target.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_data = cpu_input.data()?;
-        let target_data = cpu_target.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "MultiLabelSoftMargin backward" });
+        }
+        let input_data = self.input.data()?;
+        let target_data = self.target.data()?;
+        let grad_data = grad_output.data()?;
         let one = <T as One>::one();
         let inv_c = one / T::from(classes).unwrap();
 
@@ -2635,7 +2866,6 @@ impl<T: Float> GradFn<T> for MultiLabelSoftMarginBackward<T> {
         }
 
         let grad_input = Tensor::from_storage(TensorStorage::cpu(result), shape.to_vec(), false)?;
-        let grad_input = grad_input.to(self.input.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -2755,24 +2985,12 @@ struct HingeEmbeddingBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for HingeEmbeddingBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let cpu_input = if self.input.is_cuda() {
-            self.input.cpu()?
-        } else {
-            self.input.clone()
-        };
-        let cpu_y = if self.y.is_cuda() {
-            self.y.cpu()?
-        } else {
-            self.y.clone()
-        };
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let input_data = cpu_input.data()?;
-        let y_data = cpu_y.data()?;
-        let grad_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda { op: "HingeEmbedding backward" });
+        }
+        let input_data = self.input.data()?;
+        let y_data = self.y.data()?;
+        let grad_data = grad_output.data()?;
         let zero = <T as Zero>::zero();
         let one = <T as One>::one();
         let margin_t = T::from(self.margin).unwrap();
@@ -2829,7 +3047,6 @@ impl<T: Float> GradFn<T> for HingeEmbeddingBackward<T> {
             self.input.shape().to_vec(),
             false,
         )?;
-        let grad_input = grad_input.to(self.input.device())?;
         Ok(vec![Some(grad_input)])
     }
 
@@ -2839,6 +3056,200 @@ impl<T: Float> GradFn<T> for HingeEmbeddingBackward<T> {
 
     fn name(&self) -> &'static str {
         "HingeEmbeddingBackward"
+    }
+}
+
+// ===========================================================================
+// GaussianNLLLoss
+// ===========================================================================
+
+/// Gaussian negative log-likelihood loss.
+///
+/// Models the target as drawn from a Gaussian with predicted mean and variance:
+///
+/// ```text
+/// loss = 0.5 * (log(var) + (input - target)^2 / var + log(2*pi))
+/// ```
+///
+/// The `log(2*pi)` constant is included when `full` is `true` (default `false`),
+/// matching `torch.nn.GaussianNLLLoss`.
+///
+/// - `input`: predicted mean, any shape.
+/// - `target`: observed values, same shape as `input`.
+/// - `var`: predicted variance, same shape as `input` (must be positive).
+///
+/// The `eps` parameter clamps variance from below for numerical stability.
+#[derive(Debug, Clone)]
+pub struct GaussianNLLLoss {
+    pub reduction: Reduction,
+    pub full: bool,
+    pub eps: f64,
+}
+
+impl GaussianNLLLoss {
+    pub fn new(reduction: Reduction, full: bool, eps: f64) -> Self {
+        Self {
+            reduction,
+            full,
+            eps,
+        }
+    }
+
+    /// Compute Gaussian NLL loss.
+    ///
+    /// Participates in autocast: classified as `FullPrecision` (`"gaussian_nll_loss"`).
+    pub fn forward<T: Float>(
+        &self,
+        input: &Tensor<T>,
+        target: &Tensor<T>,
+        var: &Tensor<T>,
+    ) -> FerrotorchResult<Tensor<T>> {
+        autocast_guard("gaussian_nll_loss");
+
+        if input.shape() != target.shape() {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "GaussianNLLLoss: input shape {:?} != target shape {:?}",
+                    input.shape(),
+                    target.shape()
+                ),
+            });
+        }
+
+        if input.shape() != var.shape() {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "GaussianNLLLoss: input shape {:?} != var shape {:?}",
+                    input.shape(),
+                    var.shape()
+                ),
+            });
+        }
+
+        let input_data = input.data_vec()?;
+        let target_data = target.data_vec()?;
+        let var_data = var.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let eps_t = T::from(self.eps).unwrap();
+        let log_2pi = T::from((2.0 * std::f64::consts::PI).ln()).unwrap();
+
+        let loss_data: Vec<T> = input_data
+            .iter()
+            .zip(target_data.iter())
+            .zip(var_data.iter())
+            .map(|((&inp, &tgt), &v)| {
+                let v_clamped = if v < eps_t { eps_t } else { v };
+                let diff = inp - tgt;
+                let mut l = half * (v_clamped.ln() + diff * diff / v_clamped);
+                if self.full {
+                    l = l + half * log_2pi;
+                }
+                l
+            })
+            .collect();
+
+        let unreduced = Tensor::from_storage(
+            TensorStorage::cpu(loss_data),
+            input.shape().to_vec(),
+            false,
+        )?;
+        let reduced = apply_reduction(&unreduced, self.reduction)?;
+
+        if is_grad_enabled() && (input.requires_grad() || var.requires_grad()) {
+            let grad_fn = Arc::new(GaussianNLLBackward {
+                input: input.clone(),
+                target: target.clone(),
+                var: var.clone(),
+                eps: self.eps,
+                reduction: self.reduction,
+            });
+            Tensor::from_operation(
+                TensorStorage::cpu(reduced.data_vec()?),
+                reduced.shape().to_vec(),
+                grad_fn,
+            )
+        } else {
+            Ok(reduced)
+        }
+    }
+}
+
+impl Default for GaussianNLLLoss {
+    fn default() -> Self {
+        Self::new(Reduction::Mean, false, 1e-6)
+    }
+}
+
+/// Backward for `GaussianNLLLoss`.
+///
+/// ```text
+/// d(loss)/d(input) = (input - target) / var
+/// d(loss)/d(var)   = 0.5 * (1/var - (input - target)^2 / var^2)
+/// ```
+#[derive(Debug)]
+struct GaussianNLLBackward<T: Float> {
+    input: Tensor<T>,
+    target: Tensor<T>,
+    var: Tensor<T>,
+    eps: f64,
+    reduction: Reduction,
+}
+
+impl<T: Float> GradFn<T> for GaussianNLLBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "GaussianNLL backward",
+            });
+        }
+
+        let input_data = self.input.data()?;
+        let target_data = self.target.data()?;
+        let var_data = self.var.data()?;
+        let grad_data = grad_output.data()?;
+        let n = input_data.len();
+        let half = T::from(0.5).unwrap();
+        let eps_t = T::from(self.eps).unwrap();
+        let zero = <T as Zero>::zero();
+
+        let mut grad_input = vec![zero; n];
+        let mut grad_var = vec![zero; n];
+
+        for i in 0..n {
+            let scale = match self.reduction {
+                Reduction::Mean => grad_data[0] / T::from(n).unwrap(),
+                Reduction::Sum => grad_data[0],
+                Reduction::None => grad_data[i],
+            };
+
+            let v = if var_data[i] < eps_t {
+                eps_t
+            } else {
+                var_data[i]
+            };
+            let diff = input_data[i] - target_data[i];
+
+            // d(loss)/d(input) = (input - target) / var
+            grad_input[i] = diff / v * scale;
+
+            // d(loss)/d(var) = 0.5 * (1/var - diff^2 / var^2)
+            grad_var[i] = half * (<T as One>::one() / v - diff * diff / (v * v)) * scale;
+        }
+
+        let shape = self.input.shape().to_vec();
+        let grad_input_tensor =
+            Tensor::from_storage(TensorStorage::cpu(grad_input), shape.clone(), false)?;
+        let grad_var_tensor =
+            Tensor::from_storage(TensorStorage::cpu(grad_var), shape, false)?;
+        Ok(vec![Some(grad_input_tensor), Some(grad_var_tensor)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input, &self.var]
+    }
+
+    fn name(&self) -> &'static str {
+        "GaussianNLLBackward"
     }
 }
 
@@ -4806,5 +5217,496 @@ mod tests {
         let d = none_loss.data().unwrap();
         assert!((d[0] - 0.5).abs() < 1e-7);
         assert!((d[1] - 0.7).abs() < 1e-7);
+    }
+
+    // -----------------------------------------------------------------------
+    // GaussianNLLLoss
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gaussian_nll_forward_mean() {
+        // input = [1.0, 2.0], target = [1.5, 2.5], var = [1.0, 2.0]
+        // loss[0] = 0.5 * (ln(1.0) + (1.0-1.5)^2 / 1.0) = 0.5 * (0 + 0.25) = 0.125
+        // loss[1] = 0.5 * (ln(2.0) + (2.0-2.5)^2 / 2.0) = 0.5 * (ln(2) + 0.125)
+        // mean = (loss[0] + loss[1]) / 2
+        let input = leaf_vec(&[1.0, 2.0]);
+        let target = target_vec(&[1.5, 2.5]);
+        let var = target_vec(&[1.0, 2.0]);
+        let loss = GaussianNLLLoss::default();
+        let out = loss.forward(&input, &target, &var).unwrap();
+        let e0 = 0.5 * (0.0 + 0.25);
+        let e1 = 0.5 * (2.0_f64.ln() + 0.125);
+        let expected = (e0 + e1) / 2.0;
+        assert!(
+            (out.item().unwrap() - expected).abs() < 1e-7,
+            "GaussianNLL mean: expected {}, got {}",
+            expected,
+            out.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_forward_sum() {
+        let input = leaf_vec(&[1.0, 2.0]);
+        let target = target_vec(&[1.5, 2.5]);
+        let var = target_vec(&[1.0, 2.0]);
+        let loss = GaussianNLLLoss::new(Reduction::Sum, false, 1e-6);
+        let out = loss.forward(&input, &target, &var).unwrap();
+        let e0 = 0.5 * (0.0 + 0.25);
+        let e1 = 0.5 * (2.0_f64.ln() + 0.125);
+        let expected = e0 + e1;
+        assert!(
+            (out.item().unwrap() - expected).abs() < 1e-7,
+            "GaussianNLL sum: expected {}, got {}",
+            expected,
+            out.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_forward_none() {
+        let input = leaf_vec(&[1.0, 2.0]);
+        let target = target_vec(&[1.5, 2.5]);
+        let var = target_vec(&[1.0, 2.0]);
+        let loss = GaussianNLLLoss::new(Reduction::None, false, 1e-6);
+        let out = loss.forward(&input, &target, &var).unwrap();
+        assert_eq!(out.shape(), &[2]);
+        let d = out.data().unwrap();
+        let e0 = 0.5 * (0.0 + 0.25);
+        let e1 = 0.5 * (2.0_f64.ln() + 0.125);
+        assert!(
+            (d[0] - e0).abs() < 1e-7,
+            "GaussianNLL none[0]: expected {}, got {}",
+            e0,
+            d[0]
+        );
+        assert!(
+            (d[1] - e1).abs() < 1e-7,
+            "GaussianNLL none[1]: expected {}, got {}",
+            e1,
+            d[1]
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_full_mode() {
+        // With full=true, adds 0.5 * log(2*pi) per element.
+        let input = leaf_vec(&[0.0]);
+        let target = target_vec(&[0.0]);
+        let var = target_vec(&[1.0]);
+        let loss = GaussianNLLLoss::new(Reduction::Mean, true, 1e-6);
+        let out = loss.forward(&input, &target, &var).unwrap();
+        // loss = 0.5 * (ln(1) + 0 + ln(2*pi)) = 0.5 * ln(2*pi)
+        let expected = 0.5 * (2.0 * std::f64::consts::PI).ln();
+        assert!(
+            (out.item().unwrap() - expected).abs() < 1e-7,
+            "GaussianNLL full: expected {}, got {}",
+            expected,
+            out.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_backward_input() {
+        // d(loss)/d(input) = (input - target) / var
+        // input=2.0, target=1.0, var=4.0 => grad = 1.0/4.0 = 0.25 (mean, n=1)
+        let input = leaf_vec(&[2.0]);
+        let target = target_vec(&[1.0]);
+        let var = target_vec(&[4.0]);
+        let loss = GaussianNLLLoss::new(Reduction::Mean, false, 1e-6);
+        let out = loss.forward(&input, &target, &var).unwrap();
+        backward(&out).unwrap();
+
+        let grad = input.grad().unwrap().unwrap();
+        let g = grad.data().unwrap();
+        let expected = (2.0 - 1.0) / 4.0;
+        assert!(
+            (g[0] - expected).abs() < 1e-7,
+            "GaussianNLL backward input: expected {}, got {}",
+            expected,
+            g[0]
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_backward_var() {
+        // d(loss)/d(var) = 0.5 * (1/var - diff^2/var^2)
+        // input=2.0, target=1.0, var=4.0
+        // => 0.5 * (1/4 - 1/16) = 0.5 * (0.25 - 0.0625) = 0.09375
+        let input = leaf_vec(&[2.0]);
+        let target = target_vec(&[1.0]);
+        let var_tensor = Tensor::from_storage(
+            TensorStorage::cpu(vec![4.0]),
+            vec![1],
+            true,
+        )
+        .unwrap();
+        let loss = GaussianNLLLoss::new(Reduction::Mean, false, 1e-6);
+        let out = loss.forward(&input, &target, &var_tensor).unwrap();
+        backward(&out).unwrap();
+
+        let grad = var_tensor.grad().unwrap().unwrap();
+        let g = grad.data().unwrap();
+        let expected = 0.5 * (1.0 / 4.0 - 1.0 / 16.0);
+        assert!(
+            (g[0] - expected).abs() < 1e-7,
+            "GaussianNLL backward var: expected {}, got {}",
+            expected,
+            g[0]
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_eps_clamp() {
+        // Very small variance should be clamped to eps.
+        let input = leaf_vec(&[1.0]);
+        let target = target_vec(&[1.0]);
+        let var = target_vec(&[0.0]); // zero variance
+        let eps = 1e-6;
+        let loss = GaussianNLLLoss::new(Reduction::Mean, false, eps);
+        let out = loss.forward(&input, &target, &var).unwrap();
+        // diff = 0, so loss = 0.5 * ln(eps)
+        let expected = 0.5 * eps.ln();
+        assert!(
+            (out.item().unwrap() - expected).abs() < 1e-5,
+            "GaussianNLL eps clamp: expected {}, got {}",
+            expected,
+            out.item().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_gaussian_nll_shape_mismatch() {
+        let input = leaf_vec(&[1.0, 2.0]);
+        let target = target_vec(&[1.0]);
+        let var = target_vec(&[1.0, 1.0]);
+        let loss = GaussianNLLLoss::default();
+        assert!(loss.forward(&input, &target, &var).is_err());
+    }
+
+    #[test]
+    fn test_gaussian_nll_var_shape_mismatch() {
+        let input = leaf_vec(&[1.0, 2.0]);
+        let target = target_vec(&[1.0, 2.0]);
+        let var = target_vec(&[1.0]);
+        let loss = GaussianNLLLoss::default();
+        assert!(loss.forward(&input, &target, &var).is_err());
+    }
+
+    #[test]
+    fn test_gaussian_nll_zero_loss() {
+        // When input == target and var == 1, loss = 0.5 * (0 + 0) = 0
+        let input = leaf_vec(&[1.0, 2.0]);
+        let target = target_vec(&[1.0, 2.0]);
+        let var = target_vec(&[1.0, 1.0]);
+        let loss = GaussianNLLLoss::default();
+        let out = loss.forward(&input, &target, &var).unwrap();
+        assert!(
+            out.item().unwrap().abs() < 1e-10,
+            "GaussianNLL zero loss: expected ~0, got {}",
+            out.item().unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CosineEmbeddingLoss backward
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cosine_embedding_backward_positive() {
+        // x1 = [3, 4], x2 = [4, 3], y = 1 (positive)
+        // ||x1|| = 5, ||x2|| = 5, dot = 24, cos = 24/25 = 0.96
+        // loss = 1 - 0.96 = 0.04
+        let x1 = leaf_2d(&[3.0, 4.0], &[1, 2]);
+        let x2 = Tensor::from_storage(
+            TensorStorage::cpu(vec![4.0, 3.0]),
+            vec![1, 2],
+            true,
+        )
+        .unwrap();
+        let y = target_vec(&[1.0]);
+        let loss = CosineEmbeddingLoss::new(Reduction::Sum, 0.0);
+        let out = loss.forward_pair(&x1, &x2, &y).unwrap();
+
+        let cos_val = 24.0 / 25.0;
+        assert!(
+            (out.item().unwrap() - (1.0 - cos_val)).abs() < 1e-7,
+            "CosEmb positive: expected {}, got {}",
+            1.0 - cos_val,
+            out.item().unwrap()
+        );
+
+        backward(&out).unwrap();
+
+        let grad_x1 = x1.grad().unwrap().unwrap();
+        let g1 = grad_x1.data().unwrap();
+        // d(loss)/d(x1_f) = -(x2_f/(||x1||*||x2||) - cos*x1_f/||x1||^2)
+        // f=0: -(4/25 - 0.96*3/25) = -(0.16 - 0.1152) = -0.0448
+        // f=1: -(3/25 - 0.96*4/25) = -(0.12 - 0.1536) = 0.0336
+        let expected_g1_0 = -(4.0 / 25.0 - cos_val * 3.0 / 25.0);
+        let expected_g1_1 = -(3.0 / 25.0 - cos_val * 4.0 / 25.0);
+        assert!(
+            (g1[0] - expected_g1_0).abs() < 1e-7,
+            "CosEmb backward x1[0]: expected {}, got {}",
+            expected_g1_0,
+            g1[0]
+        );
+        assert!(
+            (g1[1] - expected_g1_1).abs() < 1e-7,
+            "CosEmb backward x1[1]: expected {}, got {}",
+            expected_g1_1,
+            g1[1]
+        );
+
+        let grad_x2 = x2.grad().unwrap().unwrap();
+        let g2 = grad_x2.data().unwrap();
+        let expected_g2_0 = -(3.0 / 25.0 - cos_val * 4.0 / 25.0);
+        let expected_g2_1 = -(4.0 / 25.0 - cos_val * 3.0 / 25.0);
+        assert!(
+            (g2[0] - expected_g2_0).abs() < 1e-7,
+            "CosEmb backward x2[0]: expected {}, got {}",
+            expected_g2_0,
+            g2[0]
+        );
+        assert!(
+            (g2[1] - expected_g2_1).abs() < 1e-7,
+            "CosEmb backward x2[1]: expected {}, got {}",
+            expected_g2_1,
+            g2[1]
+        );
+    }
+
+    #[test]
+    fn test_cosine_embedding_backward_negative_active() {
+        // x1 = [1, 0], x2 = [1, 0], y = -1, margin = 0.5
+        // cos = 1.0, loss = max(0, 1.0 - 0.5) = 0.5
+        // Gradients should be opposite sign of positive case.
+        let x1 = leaf_2d(&[1.0, 0.0], &[1, 2]);
+        let x2 = Tensor::from_storage(
+            TensorStorage::cpu(vec![1.0, 0.0]),
+            vec![1, 2],
+            true,
+        )
+        .unwrap();
+        let y = target_vec(&[-1.0]);
+        let loss = CosineEmbeddingLoss::new(Reduction::Sum, 0.5);
+        let out = loss.forward_pair(&x1, &x2, &y).unwrap();
+        assert!(
+            (out.item().unwrap() - 0.5).abs() < 1e-7,
+            "CosEmb negative active: expected 0.5, got {}",
+            out.item().unwrap()
+        );
+        backward(&out).unwrap();
+
+        let grad_x1 = x1.grad().unwrap().unwrap();
+        let g1 = grad_x1.data().unwrap();
+        // d(cos)/d(x1_0) = x2_0/(||x1||*||x2||) - cos*x1_0/||x1||^2 = 1/1 - 1*1/1 = 0
+        // d(cos)/d(x1_1) = x2_1/(||x1||*||x2||) - cos*x1_1/||x1||^2 = 0/1 - 1*0/1 = 0
+        // For negative: grad = +d(cos)/d(x1)
+        assert!(
+            g1[0].abs() < 1e-7,
+            "CosEmb neg backward x1[0]: expected 0, got {}",
+            g1[0]
+        );
+        assert!(
+            g1[1].abs() < 1e-7,
+            "CosEmb neg backward x1[1]: expected 0, got {}",
+            g1[1]
+        );
+    }
+
+    #[test]
+    fn test_cosine_embedding_backward_negative_inactive() {
+        // x1 = [1, 0], x2 = [0, 1], y = -1, margin = 0.0
+        // cos = 0, loss = max(0, 0 - 0) = 0, hinge inactive => grad = 0
+        let x1 = leaf_2d(&[1.0, 0.0], &[1, 2]);
+        let x2 = Tensor::from_storage(
+            TensorStorage::cpu(vec![0.0, 1.0]),
+            vec![1, 2],
+            true,
+        )
+        .unwrap();
+        let y = target_vec(&[-1.0]);
+        let loss = CosineEmbeddingLoss::new(Reduction::Sum, 0.0);
+        let out = loss.forward_pair(&x1, &x2, &y).unwrap();
+        backward(&out).unwrap();
+
+        let grad_x1 = x1.grad().unwrap().unwrap();
+        let g1 = grad_x1.data().unwrap();
+        assert!(
+            g1[0].abs() < 1e-7 && g1[1].abs() < 1e-7,
+            "CosEmb inactive neg: expected zero grad, got {:?}",
+            &g1[..]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CTCLoss backward
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ctc_backward_gradients_sum_to_zero() {
+        // For a valid probability distribution, gradients w.r.t. log_probs
+        // should approximately sum to zero over classes for each timestep
+        // (since probabilities sum to 1).
+        let mut lp = vec![-10.0_f64; 3 * 1 * 3];
+        // t=0: blank likely
+        lp[0] = -0.1;
+        lp[1] = -5.0;
+        lp[2] = -5.0;
+        // t=1: class 1 likely
+        lp[3] = -5.0;
+        lp[4] = -0.1;
+        lp[5] = -5.0;
+        // t=2: class 2 likely
+        lp[6] = -5.0;
+        lp[7] = -5.0;
+        lp[8] = -0.1;
+
+        let log_probs = Tensor::from_storage(
+            TensorStorage::cpu(lp),
+            vec![3, 1, 3],
+            true,
+        )
+        .unwrap();
+        let targets = target_vec(&[1.0, 2.0]);
+        let loss = CTCLoss::new(Reduction::Sum, 0, false);
+        let out = loss.forward(&log_probs, &targets, &[3], &[2]).unwrap();
+        backward(&out).unwrap();
+
+        let grad = log_probs.grad().unwrap().unwrap();
+        let g = grad.data().unwrap();
+        // Verify gradients are finite.
+        for i in 0..9 {
+            assert!(
+                g[i].is_finite(),
+                "CTC grad[{}] is not finite: {}",
+                i,
+                g[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_ctc_backward_empty_target() {
+        // Empty target: grad should be -1 at blank for each timestep.
+        let lp = vec![-0.5_f64, -10.0, -10.0, -0.3, -10.0, -10.0];
+        let log_probs = Tensor::from_storage(
+            TensorStorage::cpu(lp),
+            vec![2, 1, 3],
+            true,
+        )
+        .unwrap();
+        let targets = target_vec(&[]);
+        let loss = CTCLoss::new(Reduction::Sum, 0, false);
+        let out = loss.forward(&log_probs, &targets, &[2], &[0]).unwrap();
+        backward(&out).unwrap();
+
+        let grad = log_probs.grad().unwrap().unwrap();
+        let g = grad.data().unwrap();
+        // blank is class 0; grad at blank positions should be -1.
+        assert!(
+            (g[0] - (-1.0)).abs() < 1e-7,
+            "CTC empty target grad[t=0,blank]: expected -1, got {}",
+            g[0]
+        );
+        assert!(
+            (g[3] - (-1.0)).abs() < 1e-7,
+            "CTC empty target grad[t=1,blank]: expected -1, got {}",
+            g[3]
+        );
+        // Non-blank positions should be 0.
+        assert!(
+            g[1].abs() < 1e-7,
+            "CTC empty target grad[t=0,c=1]: expected 0, got {}",
+            g[1]
+        );
+    }
+
+    #[test]
+    fn test_ctc_backward_no_grad() {
+        // Inside no_grad, CTC should not attach grad_fn.
+        ferrotorch_core::no_grad(|| {
+            let lp = vec![-0.5_f64; 3 * 1 * 2];
+            let log_probs = Tensor::from_storage(
+                TensorStorage::cpu(lp),
+                vec![3, 1, 2],
+                true,
+            )
+            .unwrap();
+            let targets = target_vec(&[1.0]);
+            let loss = CTCLoss::default();
+            let out = loss
+                .forward(&log_probs, &targets, &[3], &[1])
+                .unwrap();
+            assert!(
+                out.grad_fn().is_none(),
+                "CTCLoss inside no_grad should not attach grad_fn"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ctc_backward_numerical_gradient() {
+        // Numerical gradient check with central differences.
+        let base_lp = vec![
+            -0.5_f64, -1.0, -2.0, // t=0
+            -1.0, -0.5, -2.0, // t=1
+            -2.0, -1.0, -0.5, // t=2
+        ];
+        let eps = 1e-5;
+
+        // Compute analytical gradient.
+        let log_probs = Tensor::from_storage(
+            TensorStorage::cpu(base_lp.clone()),
+            vec![3, 1, 3],
+            true,
+        )
+        .unwrap();
+        let targets = target_vec(&[1.0, 2.0]);
+        let loss = CTCLoss::new(Reduction::Sum, 0, false);
+        let out = loss.forward(&log_probs, &targets, &[3], &[2]).unwrap();
+        backward(&out).unwrap();
+
+        let grad = log_probs.grad().unwrap().unwrap();
+        let analytical = grad.data_vec().unwrap();
+
+        // Numerical gradient via central differences.
+        for idx in 0..9 {
+            let mut lp_plus = base_lp.clone();
+            lp_plus[idx] += eps;
+            let lp_p = Tensor::from_storage(
+                TensorStorage::cpu(lp_plus),
+                vec![3, 1, 3],
+                false,
+            )
+            .unwrap();
+            let t_p = target_vec(&[1.0, 2.0]);
+            let out_p = CTCLoss::new(Reduction::Sum, 0, false)
+                .forward(&lp_p, &t_p, &[3], &[2])
+                .unwrap();
+
+            let mut lp_minus = base_lp.clone();
+            lp_minus[idx] -= eps;
+            let lp_m = Tensor::from_storage(
+                TensorStorage::cpu(lp_minus),
+                vec![3, 1, 3],
+                false,
+            )
+            .unwrap();
+            let t_m = target_vec(&[1.0, 2.0]);
+            let out_m = CTCLoss::new(Reduction::Sum, 0, false)
+                .forward(&lp_m, &t_m, &[3], &[2])
+                .unwrap();
+
+            let numerical = (out_p.item().unwrap() - out_m.item().unwrap()) / (2.0 * eps);
+            assert!(
+                (analytical[idx] - numerical).abs() < 1e-4,
+                "CTC grad[{}]: analytical={}, numerical={}",
+                idx,
+                analytical[idx],
+                numerical,
+            );
+        }
     }
 }

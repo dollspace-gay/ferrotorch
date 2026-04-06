@@ -331,6 +331,87 @@ pub fn gpu_bmm_f32(
     Ok(c)
 }
 
+/// Batched matrix multiplication for f64 (cuBLAS DGEMM).
+#[cfg(feature = "cuda")]
+pub fn gpu_bmm_f64(
+    a: &CudaBuffer<f64>,
+    b: &CudaBuffer<f64>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    if batch == 0 || m == 0 || k == 0 || n == 0 {
+        return alloc_zeros_f64(batch * m * n, device);
+    }
+    if a.len() != batch * m * k {
+        return Err(GpuError::ShapeMismatch {
+            op: "bmm_f64",
+            expected: vec![batch, m, k],
+            got: vec![a.len()],
+        });
+    }
+    if b.len() != batch * k * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "bmm_f64",
+            expected: vec![batch, k, n],
+            got: vec![b.len()],
+        });
+    }
+
+    let m_i32 = i32::try_from(m).map_err(|_| GpuError::ShapeMismatch {
+        op: "bmm_f64", expected: vec![i32::MAX as usize], got: vec![m],
+    })?;
+    let k_i32 = i32::try_from(k).map_err(|_| GpuError::ShapeMismatch {
+        op: "bmm_f64", expected: vec![i32::MAX as usize], got: vec![k],
+    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::ShapeMismatch {
+        op: "bmm_f64", expected: vec![i32::MAX as usize], got: vec![n],
+    })?;
+
+    let blas = device.blas();
+    let mut c = alloc_zeros_f64(batch * m * n, device)?;
+
+    let cfg = StridedBatchedConfig {
+        gemm: GemmConfig {
+            transa: sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n_i32,
+            n: m_i32,
+            k: k_i32,
+            alpha: 1.0f64,
+            lda: n_i32,
+            ldb: k_i32,
+            beta: 0.0f64,
+            ldc: n_i32,
+        },
+        batch_size: batch as i32,
+        stride_a: (k * n) as i64,
+        stride_b: (m * k) as i64,
+        stride_c: (m * n) as i64,
+    };
+
+    unsafe {
+        blas.gemm_strided_batched(cfg, b.inner(), a.inner(), c.inner_mut())?;
+    }
+
+    Ok(c)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_bmm_f64(
+    _a: &CudaBuffer<f64>,
+    _b: &CudaBuffer<f64>,
+    _batch: usize,
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
+
 /// Stub -- always returns [`GpuError::NoCudaFeature`].
 #[cfg(not(feature = "cuda"))]
 pub fn gpu_bmm_f32(

@@ -143,26 +143,71 @@ pub fn rand<T: Float>(shape: &[usize]) -> FerrotorchResult<Tensor<T>> {
 /// Uses Box-Muller transform over a xorshift PRNG. See [`rand`] for notes
 /// on thread-local RNG limitations and gradient checkpointing.
 pub fn randn<T: Float>(shape: &[usize]) -> FerrotorchResult<Tensor<T>> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-
     let numel: usize = shape.iter().product();
-    let mut data = Vec::with_capacity(numel);
 
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    let mut state = hasher.finish();
-    if state == 0 {
-        state = 0xdeadbeefcafe;
+    // For f32: generate directly in f32 to avoid f64→f32 conversion overhead,
+    // and parallelize with rayon for large tensors.
+    if std::mem::size_of::<T>() == 4 && numel >= 32_768 {
+        use rayon::prelude::*;
+
+        // Each rayon chunk gets its own seed derived from chunk index.
+        let seed = xorshift_seed();
+        let chunk_size = (numel / rayon::current_num_threads()).max(4096);
+        // Round up to even for Box-Muller pairs.
+        let chunk_size = (chunk_size + 1) & !1;
+
+        let mut data = vec![0.0f32; numel];
+        data.par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                // Derive per-chunk seed.
+                let mut state = seed ^ (ci as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                if state == 0 { state = 0xdeadbeef; }
+
+                let mut next_u = || -> f32 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state as f32) / (u64::MAX as f32)
+                };
+
+                let len = chunk.len();
+                let mut i = 0;
+                while i + 1 < len {
+                    let u1 = next_u().max(1e-30);
+                    let u2 = next_u();
+                    let r = (-2.0f32 * u1.ln()).sqrt();
+                    let theta = 2.0f32 * std::f32::consts::PI * u2;
+                    chunk[i] = r * theta.cos();
+                    chunk[i + 1] = r * theta.sin();
+                    i += 2;
+                }
+                if i < len {
+                    let u1 = next_u().max(1e-30);
+                    let u2 = next_u();
+                    let r = (-2.0f32 * u1.ln()).sqrt();
+                    let theta = 2.0f32 * std::f32::consts::PI * u2;
+                    chunk[i] = r * theta.cos();
+                }
+            });
+
+        data.truncate(numel);
+        // SAFETY: f32 and T have the same size (checked above).
+        let typed: Vec<T> = unsafe {
+            let mut d = std::mem::ManuallyDrop::new(data);
+            Vec::from_raw_parts(d.as_mut_ptr() as *mut T, numel, d.capacity())
+        };
+        return Tensor::from_storage(TensorStorage::cpu(typed), shape.to_vec(), false);
     }
+
+    // Scalar path for small tensors or f64.
+    let mut data = Vec::with_capacity(numel);
+    let mut state = xorshift_seed();
 
     let mut next_uniform = || -> f64 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        // Ensure non-zero for log.
         ((state as f64) / (u64::MAX as f64)).max(1e-300)
     };
 
@@ -181,6 +226,20 @@ pub fn randn<T: Float>(shape: &[usize]) -> FerrotorchResult<Tensor<T>> {
 
     data.truncate(numel);
     Tensor::from_storage(TensorStorage::cpu(data), shape.to_vec(), false)
+}
+
+/// Seed a xorshift64 state from system time and thread id.
+fn xorshift_seed() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+
+    let mut hasher = DefaultHasher::new();
+    SystemTime::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    let mut state = hasher.finish();
+    if state == 0 { state = 0xdeadbeefcafe; }
+    state
 }
 
 /// Create a tensor of zeros with the same shape as `other`.

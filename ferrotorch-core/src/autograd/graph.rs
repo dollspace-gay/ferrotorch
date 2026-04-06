@@ -582,8 +582,12 @@ fn accumulate_non_leaf_grad<T: Float>(
         // SAFETY: inner_refcount == 1 && storage_refcount == 1 guarantees
         // exclusive ownership. No other references exist.
         let existing_slice = unsafe { existing.data_mut()? };
-        let grad_cpu = if grad.is_cuda() { grad.cpu()? } else { grad };
-        let grad_data = grad_cpu.data()?;
+        if grad.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "accumulate_grad",
+            });
+        }
+        let grad_data = grad.data()?;
         if existing_slice.len() != grad_data.len() {
             return Err(FerrotorchError::ShapeMismatch {
                 message: format!(
@@ -601,15 +605,13 @@ fn accumulate_non_leaf_grad<T: Float>(
     }
 
     // Fallback: allocate a new tensor for the sum (CPU path).
-    let device = existing.device();
-    let existing_cpu = if existing.is_cuda() {
-        existing.cpu()?
-    } else {
-        existing
-    };
-    let grad_cpu = if grad.is_cuda() { grad.cpu()? } else { grad };
-    let mut existing_data = existing_cpu.data()?.to_vec();
-    let grad_data = grad_cpu.data()?;
+    if existing.is_cuda() || grad.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda {
+            op: "accumulate_grad",
+        });
+    }
+    let mut existing_data = existing.data()?.to_vec();
+    let grad_data = grad.data()?;
     if existing_data.len() != grad_data.len() {
         return Err(FerrotorchError::ShapeMismatch {
             message: format!(
@@ -623,8 +625,8 @@ fn accumulate_non_leaf_grad<T: Float>(
         *e += g;
     }
     let storage = crate::storage::TensorStorage::cpu(existing_data);
-    let combined = Tensor::from_storage(storage, existing_cpu.shape().to_vec(), false)?;
-    grads.insert(input.id(), combined.to(device)?);
+    let combined = Tensor::from_storage(storage, existing.shape().to_vec(), false)?;
+    grads.insert(input.id(), combined);
     Ok(())
 }
 

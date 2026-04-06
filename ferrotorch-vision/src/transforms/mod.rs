@@ -1,6 +1,9 @@
 pub mod center_crop;
 pub mod color_jitter;
+pub mod compose;
 pub mod random_apply;
+pub mod random_crop;
+pub mod random_horizontal_flip;
 pub mod random_gaussian_blur;
 pub mod random_resized_crop;
 pub mod random_rotation;
@@ -12,6 +15,9 @@ pub mod vision_normalize;
 
 pub use center_crop::CenterCrop;
 pub use color_jitter::ColorJitter;
+pub use compose::Compose;
+pub use random_crop::RandomCrop;
+pub use random_horizontal_flip::RandomHorizontalFlip;
 pub use random_apply::{RandomApply, RandomChoice};
 pub use random_gaussian_blur::RandomGaussianBlur;
 pub use random_resized_crop::RandomResizedCrop;

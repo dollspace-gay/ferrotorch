@@ -24,6 +24,12 @@ fn is_f32<T: Float>() -> bool {
     TypeId::of::<T>() == TypeId::of::<f32>()
 }
 
+/// Returns `true` if `T` is `f64`.
+#[inline]
+fn is_f64<T: Float>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<f64>()
+}
+
 /// GPU-native matmul backward for f32 tensors.
 /// dA = grad_C @ B^T, dB = A^T @ grad_C — all on GPU, no CPU roundtrip.
 fn mm_backward_gpu<T: Float>(grad_output: &Tensor<T>, a: &Tensor<T>, b: &Tensor<T>) -> GradPair<T> {
@@ -31,35 +37,40 @@ fn mm_backward_gpu<T: Float>(grad_output: &Tensor<T>, a: &Tensor<T>, b: &Tensor<
     let go_h = grad_output.gpu_handle()?;
     let m = grad_output.shape()[0];
     let n = grad_output.shape()[1];
+    let f64_path = is_f64::<T>();
 
     let grad_a = if a.requires_grad() {
-        // dA = grad_C @ B^T: grad_C is (M,N), B is (K_b,N) => B^T is (N,K_b)
-        // result is (M, K_b)
         let k = b.shape()[0];
         let b_h = b.gpu_handle()?;
-        let bt_h = backend.transpose_2d_f32(b_h, k, n)?;
-        let result_h = backend.matmul_f32(go_h, &bt_h, m, n, k)?;
-        Some(Tensor::from_storage(
-            TensorStorage::gpu(result_h),
-            vec![m, k],
-            false,
-        )?)
+        let (bt_h, result_h) = if f64_path {
+            let bt = backend.transpose_2d_f64(b_h, k, n)?;
+            let r = backend.matmul_f64(go_h, &bt, m, n, k)?;
+            (bt, r)
+        } else {
+            let bt = backend.transpose_2d_f32(b_h, k, n)?;
+            let r = backend.matmul_f32(go_h, &bt, m, n, k)?;
+            (bt, r)
+        };
+        let _ = bt_h;
+        Some(Tensor::from_storage(TensorStorage::gpu(result_h), vec![m, k], false)?)
     } else {
         None
     };
 
     let grad_b = if b.requires_grad() {
-        // dB = A^T @ grad_C: A is (M,K_a), A^T is (K_a,M), grad_C is (M,N)
-        // result is (K_a, N)
         let k = a.shape()[1];
         let a_h = a.gpu_handle()?;
-        let at_h = backend.transpose_2d_f32(a_h, m, k)?;
-        let result_h = backend.matmul_f32(&at_h, go_h, k, m, n)?;
-        Some(Tensor::from_storage(
-            TensorStorage::gpu(result_h),
-            vec![k, n],
-            false,
-        )?)
+        let (at_h, result_h) = if f64_path {
+            let at = backend.transpose_2d_f64(a_h, m, k)?;
+            let r = backend.matmul_f64(&at, go_h, k, m, n)?;
+            (at, r)
+        } else {
+            let at = backend.transpose_2d_f32(a_h, m, k)?;
+            let r = backend.matmul_f32(&at, go_h, k, m, n)?;
+            (at, r)
+        };
+        let _ = at_h;
+        Some(Tensor::from_storage(TensorStorage::gpu(result_h), vec![k, n], false)?)
     } else {
         None
     };
@@ -90,52 +101,39 @@ impl<T: Float> MmBackward<T> {
 
 impl<T: Float> GradFn<T> for MmBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        // GPU-native path: stay on GPU for f32 tensors.
-        if grad_output.is_cuda() && is_f32::<T>() {
+        // GPU-native path for f32/f64.
+        if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             let (ga, gb) = mm_backward_gpu(grad_output, &self.a, &self.b)?;
             return Ok(vec![ga, gb]);
         }
 
-        // CPU fallback (also handles f64 GPU tensors).
-        let device = grad_output.device();
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let cpu_a = if self.a.is_cuda() {
-            self.a.cpu()?
-        } else {
-            self.a.clone()
-        };
-        let cpu_b = if self.b.is_cuda() {
-            self.b.cpu()?
-        } else {
-            self.b.clone()
-        };
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "MmBackward",
+            });
+        }
 
+        // CPU path.
         let grad_a = if self.a.requires_grad() {
-            let gc_data = cpu_go.data()?;
-            let b_data = cpu_b.data()?;
+            let gc_data = grad_output.data()?;
+            let b_data = self.b.data()?;
             let m = grad_output.shape()[0];
             let n = grad_output.shape()[1];
             let k = self.b.shape()[0];
             let result = crate::ops::linalg::mm_raw_bt(gc_data, b_data, m, n, k);
-            let t = Tensor::from_storage(TensorStorage::cpu(result), vec![m, k], false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(TensorStorage::cpu(result), vec![m, k], false)?)
         } else {
             None
         };
 
         let grad_b = if self.b.requires_grad() {
-            let a_data = cpu_a.data()?;
-            let gc_data = cpu_go.data()?;
+            let a_data = self.a.data()?;
+            let gc_data = grad_output.data()?;
             let m = self.a.shape()[0];
             let k = self.a.shape()[1];
             let n = grad_output.shape()[1];
             let result = crate::ops::linalg::mm_raw_at(a_data, gc_data, k, m, n);
-            let t = Tensor::from_storage(TensorStorage::cpu(result), vec![k, n], false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(TensorStorage::cpu(result), vec![k, n], false)?)
         } else {
             None
         };
@@ -175,29 +173,17 @@ impl<T: Float> MvBackward<T> {
 
 impl<T: Float> GradFn<T> for MvBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        // GPU-aware: pull to CPU, compute, restore device.
-        let device = grad_output.device();
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let cpu_a = if self.a.is_cuda() {
-            self.a.cpu()?
-        } else {
-            self.a.clone()
-        };
-        let cpu_x = if self.x.is_cuda() {
-            self.x.cpu()?
-        } else {
-            self.x.clone()
-        };
+        if grad_output.is_cuda() || self.a.is_cuda() || self.x.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "MvBackward",
+            });
+        }
 
         // grad_output is shape (M,) — the upstream gradient on y.
         let grad_a = if self.a.requires_grad() {
             // dA = outer(grad_y, x): shape (M, K)
-            let grad_data = cpu_go.data()?;
-            let x_data = cpu_x.data()?;
+            let grad_data = grad_output.data()?;
+            let x_data = self.x.data()?;
             let m = grad_data.len();
             let k = x_data.len();
             let mut outer = vec![<T as num_traits::Zero>::zero(); m * k];
@@ -206,17 +192,15 @@ impl<T: Float> GradFn<T> for MvBackward<T> {
                     outer[i * k + j] = grad_data[i] * x_data[j];
                 }
             }
-            let t = Tensor::from_storage(TensorStorage::cpu(outer), vec![m, k], false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(TensorStorage::cpu(outer), vec![m, k], false)?)
         } else {
             None
         };
 
         let grad_x = if self.x.requires_grad() {
             // dx = A^T @ grad_y
-            let at = transpose(&cpu_a)?;
-            let t = linalg::mv(&at, &cpu_go)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            let at = transpose(&self.a)?;
+            Some(linalg::mv(&at, grad_output)?)
         } else {
             None
         };
@@ -256,40 +240,33 @@ impl<T: Float> DotBackward<T> {
 
 impl<T: Float> GradFn<T> for DotBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let device = grad_output.device();
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let s = cpu_go.item()?;
+        if grad_output.is_cuda() || self.a.is_cuda() || self.b.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "DotBackward",
+            });
+        }
+        let s = grad_output.item()?;
 
         let grad_a = if self.a.requires_grad() {
-            let cpu_b = if self.b.is_cuda() {
-                self.b.cpu()?
-            } else {
-                self.b.clone()
-            };
-            let b_data = cpu_b.data()?;
+            let b_data = self.b.data()?;
             let result: Vec<T> = b_data.iter().map(|&v| s * v).collect();
-            let t =
-                Tensor::from_storage(TensorStorage::cpu(result), self.a.shape().to_vec(), false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(result),
+                self.a.shape().to_vec(),
+                false,
+            )?)
         } else {
             None
         };
 
         let grad_b = if self.b.requires_grad() {
-            let cpu_a = if self.a.is_cuda() {
-                self.a.cpu()?
-            } else {
-                self.a.clone()
-            };
-            let a_data = cpu_a.data()?;
+            let a_data = self.a.data()?;
             let result: Vec<T> = a_data.iter().map(|&v| s * v).collect();
-            let t =
-                Tensor::from_storage(TensorStorage::cpu(result), self.b.shape().to_vec(), false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(
+                TensorStorage::cpu(result),
+                self.b.shape().to_vec(),
+                false,
+            )?)
         } else {
             None
         };
@@ -408,33 +385,21 @@ impl<T: Float> GradFn<T> for MatmulBackward<T> {
             }
             (1, 2) => {
                 // vm: y = a @ B where a is (K,), B is (K,N), y is (N,)
-                let device = grad_output.device();
-                let cpu_go = if grad_output.is_cuda() {
-                    grad_output.cpu()?
-                } else {
-                    grad_output.clone()
-                };
-                let cpu_a = if self.a.is_cuda() {
-                    self.a.cpu()?
-                } else {
-                    self.a.clone()
-                };
-                let cpu_b = if self.b.is_cuda() {
-                    self.b.cpu()?
-                } else {
-                    self.b.clone()
-                };
+                if grad_output.is_cuda() || self.a.is_cuda() || self.b.is_cuda() {
+                    return Err(FerrotorchError::NotImplementedOnCuda {
+                        op: "MatmulBackward(vm)",
+                    });
+                }
 
                 let grad_a = if self.a.requires_grad() {
-                    let t = linalg::mv(&cpu_b, &cpu_go)?;
-                    Some(if device.is_cuda() { t.to(device)? } else { t })
+                    Some(linalg::mv(&self.b, grad_output)?)
                 } else {
                     None
                 };
 
                 let grad_b = if self.b.requires_grad() {
-                    let a_data = cpu_a.data()?;
-                    let grad_data = cpu_go.data()?;
+                    let a_data = self.a.data()?;
+                    let grad_data = grad_output.data()?;
                     let k = a_data.len();
                     let n = grad_data.len();
                     let mut outer = vec![<T as num_traits::Zero>::zero(); k * n];
@@ -443,8 +408,7 @@ impl<T: Float> GradFn<T> for MatmulBackward<T> {
                             outer[ki * n + ni] = a_data[ki] * grad_data[ni];
                         }
                     }
-                    let t = Tensor::from_storage(TensorStorage::cpu(outer), vec![k, n], false)?;
-                    Some(if device.is_cuda() { t.to(device)? } else { t })
+                    Some(Tensor::from_storage(TensorStorage::cpu(outer), vec![k, n], false)?)
                 } else {
                     None
                 };
@@ -494,9 +458,12 @@ fn broadcast_matmul_backward<T: Float>(
                 message: "Cannot transpose last two dims of tensor with ndim < 2".into(),
             });
         }
-        let t_device = t.device();
-        let cpu_t = if t.is_cuda() { t.cpu()? } else { t.clone() };
-        let data = cpu_t.data()?;
+        if t.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "MatmulBackward(broadcast)",
+            });
+        }
+        let data = t.data()?;
         let rows = shape[nd - 2];
         let cols = shape[nd - 1];
         let mat_size = rows * cols;
@@ -513,30 +480,27 @@ fn broadcast_matmul_backward<T: Float>(
         let mut out_shape = shape.to_vec();
         out_shape[nd - 2] = cols;
         out_shape[nd - 1] = rows;
-        let result = Tensor::from_storage(TensorStorage::cpu(out), out_shape, false)?;
-        if t_device.is_cuda() {
-            result.to(t_device)
-        } else {
-            Ok(result)
-        }
+        Tensor::from_storage(TensorStorage::cpu(out), out_shape, false)
     };
 
     // Sum-reduce grad to match the original shape. This handles the case
     // where a dimension was size-1 (broadcast) in the original but expanded
     // in the gradient. We need to sum over those expanded dimensions.
     let reduce_to_shape = |grad: Tensor<T>, target: &[usize]| -> FerrotorchResult<Tensor<T>> {
-        let grad_device = grad.device();
         let grad_shape = grad.shape().to_vec();
         if grad_shape == target {
             return Ok(grad);
+        }
+        if grad.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "MatmulBackward(broadcast)",
+            });
         }
 
         let grad_nd = grad_shape.len();
         let target_nd = target.len();
         let offset = grad_nd - target_nd;
-        // Use zero-copy borrow for CPU, owned copy only for GPU.
-        let cpu_grad = if grad.is_cuda() { grad.cpu()? } else { grad };
-        let grad_data = cpu_grad.data()?;
+        let grad_data = grad.data()?;
 
         // Compute target total size.
         let target_size: usize = target.iter().product::<usize>().max(1);
@@ -578,12 +542,7 @@ fn broadcast_matmul_backward<T: Float>(
             result[target_flat] += grad_val;
         }
 
-        let t = Tensor::from_storage(TensorStorage::cpu(result), target.to_vec(), false)?;
-        Ok(if grad_device.is_cuda() {
-            t.to(grad_device)?
-        } else {
-            t
-        })
+        Tensor::from_storage(TensorStorage::cpu(result), target.to_vec(), false)
     };
 
     let grad_a = if a.requires_grad() {
@@ -707,45 +666,52 @@ impl<T: Float> MmBtBackward<T> {
 
 impl<T: Float> GradFn<T> for MmBtBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let device = grad_output.device();
-
-        // GPU-native path for f32.
-        if grad_output.is_cuda() && is_f32::<T>() {
+        // GPU-native path for f32/f64.
+        if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
             let go_h = grad_output.gpu_handle()?;
             let m = grad_output.shape()[0];
             let n = grad_output.shape()[1];
+            let f64_path = is_f64::<T>();
 
             let grad_a = if self.a.requires_grad() {
-                // dA = grad_C @ B: (M,N) @ (N,K) -> (M,K)
                 let k = self.b.shape()[1];
                 let b_h = self.b.gpu_handle()?;
-                let result_h = backend.matmul_f32(go_h, b_h, m, n, k)?;
-                Some(Tensor::from_storage(
-                    TensorStorage::gpu(result_h),
-                    vec![m, k],
-                    false,
-                )?)
+                let result_h = if f64_path {
+                    backend.matmul_f64(go_h, b_h, m, n, k)?
+                } else {
+                    backend.matmul_f32(go_h, b_h, m, n, k)?
+                };
+                Some(Tensor::from_storage(TensorStorage::gpu(result_h), vec![m, k], false)?)
             } else {
                 None
             };
 
             let grad_b = if self.b.requires_grad() {
-                // dB = grad_C^T @ A: (N,M) @ (M,K) -> (N,K)
                 let k = self.a.shape()[1];
-                let got_h = backend.transpose_2d_f32(go_h, m, n)?;
                 let a_h = self.a.gpu_handle()?;
-                let result_h = backend.matmul_f32(&got_h, a_h, n, m, k)?;
-                Some(Tensor::from_storage(
-                    TensorStorage::gpu(result_h),
-                    vec![n, k],
-                    false,
-                )?)
+                let (got_h, result_h) = if f64_path {
+                    let got = backend.transpose_2d_f64(go_h, m, n)?;
+                    let r = backend.matmul_f64(&got, a_h, n, m, k)?;
+                    (got, r)
+                } else {
+                    let got = backend.transpose_2d_f32(go_h, m, n)?;
+                    let r = backend.matmul_f32(&got, a_h, n, m, k)?;
+                    (got, r)
+                };
+                let _ = got_h;
+                Some(Tensor::from_storage(TensorStorage::gpu(result_h), vec![n, k], false)?)
             } else {
                 None
             };
 
             return Ok(vec![grad_a, grad_b]);
+        }
+
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "MmBtBackward",
+            });
         }
 
         let grad_a = if self.a.requires_grad() {
@@ -755,24 +721,13 @@ impl<T: Float> GradFn<T> for MmBtBackward<T> {
         };
 
         let grad_b = if self.b.requires_grad() {
-            let cpu_go = if grad_output.is_cuda() {
-                grad_output.cpu()?
-            } else {
-                grad_output.clone()
-            };
-            let cpu_a = if self.a.is_cuda() {
-                self.a.cpu()?
-            } else {
-                self.a.clone()
-            };
-            let gc_data = cpu_go.data()?;
-            let a_data = cpu_a.data()?;
+            let gc_data = grad_output.data()?;
+            let a_data = self.a.data()?;
             let m = grad_output.shape()[0];
             let n = grad_output.shape()[1];
             let k = self.a.shape()[1];
             let result = crate::ops::linalg::mm_raw_at(gc_data, a_data, n, m, k);
-            let t = Tensor::from_storage(TensorStorage::cpu(result), vec![n, k], false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(TensorStorage::cpu(result), vec![n, k], false)?)
         } else {
             None
         };
@@ -858,67 +813,57 @@ struct LinearFusedBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for LinearFusedBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        let device = grad_output.device();
         let m = grad_output.shape()[0];
         let n = grad_output.shape()[1];
 
-        // GPU-native path for f32 tensors.
-        if grad_output.is_cuda() && is_f32::<T>() {
+        // GPU-native path for f32/f64 tensors.
+        if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
             let go_h = grad_output.gpu_handle()?;
+            let f64_path = is_f64::<T>();
 
-            // grad_input = grad_C @ W: grad_C(M,N) @ W(N,K) -> (M,K)
             let grad_input = if self.input.requires_grad() {
                 let k = self.weight.shape()[1];
                 let w_h = self.weight.gpu_handle()?;
-                let result_h = backend.matmul_f32(go_h, w_h, m, n, k)?;
-                Some(Tensor::from_storage(
-                    TensorStorage::gpu(result_h),
-                    vec![m, k],
-                    false,
-                )?)
+                let result_h = if f64_path {
+                    backend.matmul_f64(go_h, w_h, m, n, k)?
+                } else {
+                    backend.matmul_f32(go_h, w_h, m, n, k)?
+                };
+                Some(Tensor::from_storage(TensorStorage::gpu(result_h), vec![m, k], false)?)
             } else {
                 None
             };
 
-            // grad_weight = grad_C^T @ input: (N,M) @ (M,K) -> (N,K)
             let grad_weight = if self.weight.requires_grad() {
                 let k = self.input.shape()[1];
-                let got_h = backend.transpose_2d_f32(go_h, m, n)?;
                 let inp_h = self.input.gpu_handle()?;
-                let result_h = backend.matmul_f32(&got_h, inp_h, n, m, k)?;
-                Some(Tensor::from_storage(
-                    TensorStorage::gpu(result_h),
-                    vec![n, k],
-                    false,
-                )?)
+                let result_h = if f64_path {
+                    let got_h = backend.transpose_2d_f64(go_h, m, n)?;
+                    backend.matmul_f64(&got_h, inp_h, n, m, k)?
+                } else {
+                    let got_h = backend.transpose_2d_f32(go_h, m, n)?;
+                    backend.matmul_f32(&got_h, inp_h, n, m, k)?
+                };
+                Some(Tensor::from_storage(TensorStorage::gpu(result_h), vec![n, k], false)?)
             } else {
                 None
             };
 
-            // grad_bias = sum(grad_C, dim=0) -> (N,)
-            // Use GPU sum_axis_f32 to reduce along axis 0, staying on-device.
             let grad_bias = if self.has_bias {
                 if let Some(ref b) = self.bias {
                     if b.requires_grad() {
                         let go_shape = &[m, n];
-                        let summed = backend.sum_axis_f32(go_h, go_shape, 0)?;
-                        Some(Tensor::from_storage(
-                            TensorStorage::gpu(summed),
-                            vec![n],
-                            false,
-                        )?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+                        let summed = if f64_path {
+                            backend.sum_axis_f64(go_h, go_shape, 0)?
+                        } else {
+                            backend.sum_axis_f32(go_h, go_shape, 0)?
+                        };
+                        Some(Tensor::from_storage(TensorStorage::gpu(summed), vec![n], false)?)
+                    } else { None }
+                } else { None }
+            } else { None };
 
-            // Return exactly as many gradients as inputs() returns.
             let mut grads = vec![grad_input, grad_weight];
             if self.bias.is_some() {
                 grads.push(grad_bias);
@@ -926,40 +871,29 @@ impl<T: Float> GradFn<T> for LinearFusedBackward<T> {
             return Ok(grads);
         }
 
-        // CPU fallback.
-        let cpu_go = if grad_output.is_cuda() {
-            grad_output.cpu()?
-        } else {
-            grad_output.clone()
-        };
-        let gc_data = cpu_go.data()?;
+        if grad_output.is_cuda() {
+            return Err(FerrotorchError::NotImplementedOnCuda {
+                op: "LinearFusedBackward",
+            });
+        }
+
+        // CPU path.
+        let gc_data = grad_output.data()?;
 
         let grad_input = if self.input.requires_grad() {
-            let cpu_w = if self.weight.is_cuda() {
-                self.weight.cpu()?
-            } else {
-                self.weight.clone()
-            };
-            let w_data = cpu_w.data()?;
+            let w_data = self.weight.data()?;
             let k = self.weight.shape()[1];
             let result = crate::ops::linalg::mm_raw(gc_data, w_data, m, n, k);
-            let t = Tensor::from_storage(TensorStorage::cpu(result), vec![m, k], false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(TensorStorage::cpu(result), vec![m, k], false)?)
         } else {
             None
         };
 
         let grad_weight = if self.weight.requires_grad() {
-            let cpu_inp = if self.input.is_cuda() {
-                self.input.cpu()?
-            } else {
-                self.input.clone()
-            };
-            let a_data = cpu_inp.data()?;
+            let a_data = self.input.data()?;
             let k = self.input.shape()[1];
             let result = crate::ops::linalg::mm_raw_at(gc_data, a_data, n, m, k);
-            let t = Tensor::from_storage(TensorStorage::cpu(result), vec![n, k], false)?;
-            Some(if device.is_cuda() { t.to(device)? } else { t })
+            Some(Tensor::from_storage(TensorStorage::cpu(result), vec![n, k], false)?)
         } else {
             None
         };
@@ -975,8 +909,7 @@ impl<T: Float> GradFn<T> for LinearFusedBackward<T> {
                             gb[j] += gc_data[row + j];
                         }
                     }
-                    let t = Tensor::from_storage(TensorStorage::cpu(gb), vec![n], false)?;
-                    Some(if device.is_cuda() { t.to(device)? } else { t })
+                    Some(Tensor::from_storage(TensorStorage::cpu(gb), vec![n], false)?)
                 } else {
                     None
                 }

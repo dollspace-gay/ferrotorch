@@ -6,6 +6,7 @@ pub mod cond_scan;
 pub mod fixed_point;
 pub mod forward_ad;
 pub mod grad_penalty;
+pub mod gradcheck;
 pub mod graph;
 pub mod higher_order;
 pub mod hooks;
@@ -27,6 +28,7 @@ pub use forward_ad::{
     dual_relu, dual_sigmoid, dual_sin, dual_sub, dual_tanh, jacfwd, jvp_exact,
 };
 pub use grad_penalty::{grad_norm, gradient_penalty, jvp, vjp};
+pub use gradcheck::gradcheck;
 pub use graph::{backward, backward_with_grad};
 pub use higher_order::{grad, hessian, jacobian};
-pub use no_grad::{enable_grad, is_grad_enabled, no_grad, set_grad_enabled};
+pub use no_grad::{enable_grad, inference_mode, is_grad_enabled, is_inference_mode, no_grad, set_grad_enabled};

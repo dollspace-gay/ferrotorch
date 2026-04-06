@@ -21,24 +21,30 @@ fn is_f32<T: Float>() -> bool {
     TypeId::of::<T>() == TypeId::of::<f32>()
 }
 
+/// Returns `true` if `T` is `f64`.
+#[inline]
+fn is_f64<T: Float>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<f64>()
+}
+
 // ---------------------------------------------------------------------------
 // GPU-aware helper
 // ---------------------------------------------------------------------------
 
-/// Transfer a tensor to CPU if it's on GPU, returning the original device.
+/// Verify a tensor is on CPU, returning it with its device tag.
 ///
-/// Shape ops don't have native GPU kernels yet, so they round-trip through
-/// CPU: transfer to CPU -> do the work -> transfer back. This helper
-/// encapsulates the first half of that pattern.
+/// Shape ops don't have native GPU kernels yet. Instead of silently
+/// downloading from GPU (which hides a costly roundtrip), we error
+/// immediately so the caller can move data explicitly.
 #[inline]
 fn ensure_cpu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Device)> {
     let device = input.device();
-    let cpu_input = if input.is_cuda() {
-        input.cpu()?
-    } else {
-        input.clone()
-    };
-    Ok((cpu_input, device))
+    if input.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+            op: "shape backward",
+        });
+    }
+    Ok((input.clone(), device))
 }
 
 /// Move a tensor to the given device if it isn't already there.
@@ -524,7 +530,7 @@ impl<T: Float> CatBackward<T> {
 impl<T: Float> GradFn<T> for CatBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         // GPU fast path: use strided_split to extract each chunk directly on GPU.
-        if grad_output.is_cuda() && is_f32::<T>() {
+        if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
                 let go_shape = grad_output.shape();
                 let ndim = go_shape.len();
@@ -536,6 +542,7 @@ impl<T: Float> GradFn<T> for CatBackward<T> {
                     1
                 };
                 let go_handle = grad_output.gpu_handle()?;
+                let f64_path = is_f64::<T>();
 
                 let mut result = Vec::with_capacity(self.inputs.len());
                 let mut offset = 0usize;
@@ -548,14 +555,11 @@ impl<T: Float> GradFn<T> for CatBackward<T> {
                     }
 
                     let chunk_numel = self.inputs[i].numel();
-                    let chunk_handle = backend.strided_split_f32(
-                        go_handle,
-                        total_along_axis,
-                        offset,
-                        split_size,
-                        inner,
-                        chunk_numel,
-                    )?;
+                    let chunk_handle = if f64_path {
+                        backend.strided_split_f64(go_handle, total_along_axis, offset, split_size, inner, chunk_numel)?
+                    } else {
+                        backend.strided_split_f32(go_handle, total_along_axis, offset, split_size, inner, chunk_numel)?
+                    };
 
                     let grad_tensor = Tensor::from_storage(
                         TensorStorage::gpu(chunk_handle),
@@ -667,7 +671,7 @@ impl<T: Float> GradFn<T> for SplitBackward<T> {
         }
 
         // GPU fast path: allocate zeros on GPU, strided_cat the gradient into it.
-        if grad_output.is_cuda() && is_f32::<T>() {
+        if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
             if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
                 let orig_shape = self.input.shape();
                 let ndim = orig_shape.len();
@@ -679,22 +683,18 @@ impl<T: Float> GradFn<T> for SplitBackward<T> {
                 let total_along_dim = orig_shape[self.dim];
                 let orig_numel: usize = orig_shape.iter().product();
                 let device_ord = grad_output.gpu_handle()?.device_ordinal();
+                let f64_path = is_f64::<T>();
+                let elem_size = if f64_path { 8 } else { 4 };
 
-                // Allocate a zero buffer on GPU with the original tensor's shape.
-                let mut zeros_handle = backend.alloc_zeros(orig_numel, 4, device_ord)?;
+                let mut zeros_handle = backend.alloc_zeros(orig_numel, elem_size, device_ord)?;
 
-                // Write the gradient chunk into the correct slice of the zeros buffer.
                 let go_handle = grad_output.gpu_handle()?;
                 let chunk_numel = grad_output.numel();
-                backend.strided_cat_f32(
-                    go_handle,
-                    &mut zeros_handle,
-                    total_along_dim,
-                    self.offset,
-                    self.chunk_size,
-                    inner,
-                    chunk_numel,
-                )?;
+                if f64_path {
+                    backend.strided_cat_f64(go_handle, &mut zeros_handle, total_along_dim, self.offset, self.chunk_size, inner, chunk_numel)?;
+                } else {
+                    backend.strided_cat_f32(go_handle, &mut zeros_handle, total_along_dim, self.offset, self.chunk_size, inner, chunk_numel)?;
+                }
 
                 let grad_tensor = Tensor::from_storage(
                     TensorStorage::gpu(zeros_handle),
@@ -797,7 +797,7 @@ pub fn cat<T: Float>(tensors: &[Tensor<T>], axis: isize) -> FerrotorchResult<Ten
 
     // GPU fast path: allocate output on GPU, then strided_cat each input — no CPU
     // download needed.
-    if device.is_cuda() && is_f32::<T>() {
+    if device.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
             let inner: usize = if norm_axis + 1 < ndim {
                 out_shape[norm_axis + 1..].iter().product()
@@ -806,25 +806,21 @@ pub fn cat<T: Float>(tensors: &[Tensor<T>], axis: isize) -> FerrotorchResult<Ten
             };
             let out_numel: usize = out_shape.iter().product();
             let device_ord = tensors[0].gpu_handle()?.device_ordinal();
+            let f64_path = is_f64::<T>();
+            let elem_size = if f64_path { 8 } else { 4 };
 
-            // Allocate zeroed output buffer on GPU.
-            let mut out_handle = backend.alloc_zeros(out_numel, 4, device_ord)?;
+            let mut out_handle = backend.alloc_zeros(out_numel, elem_size, device_ord)?;
 
-            // Write each input tensor's data into the correct slice of the output.
             let mut offset = 0usize;
             for t in tensors {
                 let t_axis_size = t.shape()[norm_axis];
                 let t_numel = t.numel();
                 let t_handle = t.gpu_handle()?;
-                backend.strided_cat_f32(
-                    t_handle,
-                    &mut out_handle,
-                    total_along_axis,
-                    offset,
-                    t_axis_size,
-                    inner,
-                    t_numel,
-                )?;
+                if f64_path {
+                    backend.strided_cat_f64(t_handle, &mut out_handle, total_along_axis, offset, t_axis_size, inner, t_numel)?;
+                } else {
+                    backend.strided_cat_f32(t_handle, &mut out_handle, total_along_axis, offset, t_axis_size, inner, t_numel)?;
+                }
                 offset += t_axis_size;
             }
 
@@ -840,15 +836,13 @@ pub fn cat<T: Float>(tensors: &[Tensor<T>], axis: isize) -> FerrotorchResult<Ten
         }
     }
 
-    // CPU path (also serves as fallback for non-f32 or missing backend).
-    let cpu_tensors: Vec<Tensor<T>> = if device.is_cuda() {
-        tensors
-            .iter()
-            .map(|t| t.cpu())
-            .collect::<FerrotorchResult<_>>()?
-    } else {
-        tensors.to_vec()
-    };
+    // CPU path — non-f32 GPU tensors have no GPU kernel, error out.
+    if device.is_cuda() {
+        return Err(crate::error::FerrotorchError::NotImplementedOnCuda {
+            op: "cat",
+        });
+    }
+    let cpu_tensors: Vec<Tensor<T>> = tensors.to_vec();
 
     // Compute strides for the interleaved copy.
     let outer: usize = out_shape[..norm_axis].iter().product();

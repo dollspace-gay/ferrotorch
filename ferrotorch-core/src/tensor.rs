@@ -287,6 +287,13 @@ impl<T: Float> Tensor<T> {
         shape: Vec<usize>,
         grad_fn: Arc<dyn GradFn<T>>,
     ) -> FerrotorchResult<Self> {
+        // In inference mode, skip all autograd bookkeeping — create a plain
+        // tensor without grad_fn. This avoids allocating autograd metadata
+        // and makes operations faster for pure inference.
+        if crate::autograd::no_grad::is_inference_mode() {
+            return Self::from_storage(storage, shape, false);
+        }
+
         let numel: usize = shape.iter().product();
 
         if numel > storage.len() {
