@@ -1,0 +1,10 @@
+{
+  "uuid": "94ef036b-d7a6-4485-a0d7-335f2281cbcf",
+  "issue_uuid": "21d3f803-fbf5-484d-a3be-98d623730db7",
+  "author": "y4rr",
+  "content": "[result] Implemented Kumaraswamy distribution (two-parameter on [0,1], inverse CDF sampling, closed-form log_prob and entropy, 3 tests). LKJCholesky/LogisticNormal/Wishart are complex matrix distributions requiring Cholesky sampling — deferring. 269 distribution tests pass, 0 warnings.",
+  "created_at": "2026-04-06T13:46:42.225988026Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqmjiPkWH0/UeAonoLrtFVXL+lbaol9rKJrLIkUwLcIbrgxuSNHhO2jsWWiDvM2gIDViy+d5ajfyvG+t/58zOAA=="
+}
