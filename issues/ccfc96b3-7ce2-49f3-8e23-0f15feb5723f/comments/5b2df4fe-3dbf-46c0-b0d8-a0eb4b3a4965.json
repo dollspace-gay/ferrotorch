@@ -1,0 +1,10 @@
+{
+  "uuid": "5b2df4fe-3dbf-46c0-b0d8-a0eb4b3a4965",
+  "issue_uuid": "ccfc96b3-7ce2-49f3-8e23-0f15feb5723f",
+  "author": "y4rr",
+  "content": "[result] Implemented Weibull (inverse CDF sampling, log_prob, entropy, 3 tests), Pareto Type I (power-law, 3 tests), VonMises (circular normal with Best's rejection sampling, log Bessel I_0 approximation, 3 tests). Gumbel already existed. 266 distribution tests pass, 0 warnings.",
+  "created_at": "2026-04-06T13:44:41.632098815Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxXUfpaqPEwtyQyfxLa+gO5F1yD/rNO6tBLweh0JQPwyiXGTmnkPzUhpPGLh0GYs6sBnQ3LBNXocItm6dq7ZTAQ=="
+}
