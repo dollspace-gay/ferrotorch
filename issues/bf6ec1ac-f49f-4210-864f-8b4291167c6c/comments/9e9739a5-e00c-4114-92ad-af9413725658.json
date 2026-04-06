@@ -1,0 +1,10 @@
+{
+  "uuid": "9e9739a5-e00c-4114-92ad-af9413725658",
+  "issue_uuid": "bf6ec1ac-f49f-4210-864f-8b4291167c6c",
+  "author": "y4rr",
+  "content": "[result] Added f16/bf16 auto-casting in safetensors loader. When loading a file with F16 or BF16 dtypes, values are automatically converted to the target Float type (f32 or f64). f16 uses IEEE 754 half-precision conversion, bf16 uses top-16-bits-of-f32 reinterpretation. 118 serialize tests pass, 0 warnings.",
+  "created_at": "2026-04-06T13:54:13.752658089Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArLI7T5WhIcGXIQEiWYC+2PJyuipOPBp93sZ0zUpmD7rl+CcVWWycvm5/4eg00ejuSkC/WoimYwNls4oWHTdGDQ=="
+}
