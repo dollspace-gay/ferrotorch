@@ -1,0 +1,10 @@
+{
+  "uuid": "d148c93d-55c3-4733-b564-c7982a6526bd",
+  "issue_uuid": "1b869192-19b9-46ae-9b73-f598795cd849",
+  "author": "y4rr",
+  "content": "[result] Implemented inference_mode() and is_inference_mode(). Inference mode disables gradient tracking AND skips all autograd bookkeeping — from_operation() returns a plain tensor without grad_fn when inference mode is active. This avoids allocating Arc<dyn GradFn>, Mutex<grad>, and the full TensorInner overhead for inference-only tensors. RAII guard with panic safety. 4 tests. Exported from ferrotorch_core::autograd. 3649 total tests pass, 0 warnings.",
+  "created_at": "2026-04-06T03:45:10.103138182Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAvPbZHHdaoeECKpLzAchSJFAPvyfw+xsEcbj1Ck65shaRI7sqClKXhvEufiGWQ7M+9hjADsh4r8toXKpg1VWsDg=="
+}
