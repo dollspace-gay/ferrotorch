@@ -1,0 +1,10 @@
+{
+  "uuid": "47faaad6-9b23-40cd-a392-f036d0e8f22b",
+  "issue_uuid": "0c4aedf2-16ce-48ce-bb08-d460598ee773",
+  "author": "y4rr",
+  "content": "[result] Implemented Unflatten (inverse of Flatten — expands a dim into multiple dims via view_reshape) and ChannelShuffle (ShuffleNet-style group interleaving for [N,C,H,W]). Both parameterless modules. Exported from ferrotorch-nn.",
+  "created_at": "2026-04-06T04:15:33.624298203Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgKxQZ1YNo1l/PwSffBNATnVwLvZIMLW99TN0WmVgCKlGH0HemBeb0k6Bn3UnjmXma9VL6TWxO8QFMbvGstemCA=="
+}
