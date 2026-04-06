@@ -1,0 +1,10 @@
+{
+  "uuid": "c004ebb2-103b-4fc0-952b-7839800e67f2",
+  "issue_uuid": "9d31e719-aa5b-494d-8b13-033c7866cd2e",
+  "author": "y4rr",
+  "content": "[result] LoRALinear already fully implemented (638 lines, 19 tests). Supports rank, alpha scaling, dropout, merge/unmerge, freeze base weights.",
+  "created_at": "2026-04-06T03:38:35.438352559Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1u9B3sR7x0oJc64JWY1yrDo/uBYYQLdrW/flZ5ztYs7fIcGHKfYSF62Jj+PQXfnBUJa7LiqybLfvOe0TULz8Bg=="
+}
