@@ -273,6 +273,309 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// vmap3 — vectorize a three-argument function (CL-312, CL-362)
+// ---------------------------------------------------------------------------
+
+/// Vectorize a three-argument function over batch dimensions.
+///
+/// All three inputs must have the same size along their respective batch
+/// dimensions. The function `f` is called once per batch element with the
+/// corresponding slices, and the results are stacked along `out_dim`.
+///
+/// Useful for ops that take three tensors (e.g. `where(cond, a, b)`,
+/// custom triple-input losses).
+pub fn vmap3<T, F>(
+    f: F,
+    in_dim_a: usize,
+    in_dim_b: usize,
+    in_dim_c: usize,
+    out_dim: usize,
+) -> impl Fn(&Tensor<T>, &Tensor<T>, &Tensor<T>) -> FerrotorchResult<Tensor<T>>
+where
+    T: Float,
+    F: Fn(&Tensor<T>, &Tensor<T>, &Tensor<T>) -> FerrotorchResult<Tensor<T>>,
+{
+    move |a: &Tensor<T>, b: &Tensor<T>, c: &Tensor<T>| {
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        let c_shape = c.shape();
+
+        if in_dim_a >= a_shape.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "vmap3: in_dim_a {} is out of bounds for tensor a with {} dimensions",
+                    in_dim_a,
+                    a_shape.len()
+                ),
+            });
+        }
+        if in_dim_b >= b_shape.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "vmap3: in_dim_b {} is out of bounds for tensor b with {} dimensions",
+                    in_dim_b,
+                    b_shape.len()
+                ),
+            });
+        }
+        if in_dim_c >= c_shape.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "vmap3: in_dim_c {} is out of bounds for tensor c with {} dimensions",
+                    in_dim_c,
+                    c_shape.len()
+                ),
+            });
+        }
+
+        let batch_a = a_shape[in_dim_a];
+        let batch_b = b_shape[in_dim_b];
+        let batch_c = c_shape[in_dim_c];
+        if batch_a != batch_b || batch_a != batch_c {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "vmap3: batch size mismatch: a={} dim {}, b={} dim {}, c={} dim {}",
+                    batch_a, in_dim_a, batch_b, in_dim_b, batch_c, in_dim_c
+                ),
+            });
+        }
+
+        let mut results = Vec::with_capacity(batch_a);
+        for i in 0..batch_a {
+            let sa = select(a, in_dim_a, i)?;
+            let sb = select(b, in_dim_b, i)?;
+            let sc = select(c, in_dim_c, i)?;
+            results.push(f(&sa, &sb, &sc)?);
+        }
+        stack(&results, out_dim)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vmap_many — vectorize an N-argument function (CL-312, CL-362)
+// ---------------------------------------------------------------------------
+
+/// Vectorize an N-argument function over a shared batch dimension.
+///
+/// Each input is sliced along its corresponding `in_dims[i]`, the
+/// resulting per-batch slices are passed as a slice to `f`, and the
+/// outputs are stacked along `out_dim`. Use this when you have more
+/// than three inputs (or when the input count is dynamic).
+///
+/// All inputs must have the same size along their respective batch dim.
+pub fn vmap_many<T, F>(
+    f: F,
+    in_dims: Vec<usize>,
+    out_dim: usize,
+) -> impl Fn(&[&Tensor<T>]) -> FerrotorchResult<Tensor<T>>
+where
+    T: Float,
+    F: Fn(&[Tensor<T>]) -> FerrotorchResult<Tensor<T>>,
+{
+    move |inputs: &[&Tensor<T>]| {
+        if inputs.len() != in_dims.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "vmap_many: got {} inputs but {} in_dims",
+                    inputs.len(),
+                    in_dims.len()
+                ),
+            });
+        }
+        if inputs.is_empty() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "vmap_many: at least one input required".into(),
+            });
+        }
+
+        // Validate dims and check batch size consistency.
+        let mut batch_size: Option<usize> = None;
+        for (i, (input, &dim)) in inputs.iter().zip(in_dims.iter()).enumerate() {
+            if dim >= input.ndim() {
+                return Err(FerrotorchError::InvalidArgument {
+                    message: format!(
+                        "vmap_many: in_dims[{}] = {} is out of bounds for input with {} dims",
+                        i,
+                        dim,
+                        input.ndim()
+                    ),
+                });
+            }
+            let bs = input.shape()[dim];
+            match batch_size {
+                None => batch_size = Some(bs),
+                Some(b) if b != bs => {
+                    return Err(FerrotorchError::ShapeMismatch {
+                        message: format!(
+                            "vmap_many: batch size mismatch: input[{}] has {} along dim {}, others have {}",
+                            i, bs, dim, b
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        let batch_size = batch_size.unwrap();
+
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mut slices: Vec<Tensor<T>> = Vec::with_capacity(inputs.len());
+            for (input, &dim) in inputs.iter().zip(in_dims.iter()) {
+                slices.push(select(input, dim, i)?);
+            }
+            results.push(f(&slices)?);
+        }
+        stack(&results, out_dim)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vmap_multi_output — vectorize a function returning multiple tensors
+// ---------------------------------------------------------------------------
+
+/// Vectorize a function that returns multiple output tensors per call.
+///
+/// The closure must return a `Vec<Tensor<T>>` of fixed length per call
+/// (the length is detected from the first invocation). Each output's
+/// per-batch slices are stacked along `out_dim` independently, yielding
+/// a `Vec<Tensor<T>>` of stacked results.
+///
+/// Useful for ops that produce multiple results like `(values, indices)`
+/// from a topk, or `(mean, var)` from a stat block.
+pub fn vmap_multi_output<T, F>(
+    f: F,
+    in_dim: usize,
+    out_dim: usize,
+) -> impl Fn(&Tensor<T>) -> FerrotorchResult<Vec<Tensor<T>>>
+where
+    T: Float,
+    F: Fn(&Tensor<T>) -> FerrotorchResult<Vec<Tensor<T>>>,
+{
+    move |input: &Tensor<T>| {
+        if in_dim >= input.ndim() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "vmap_multi_output: in_dim {} is out of bounds for tensor with {} dims",
+                    in_dim,
+                    input.ndim()
+                ),
+            });
+        }
+        let batch_size = input.shape()[in_dim];
+        // per_call[batch_idx][output_idx] = Tensor
+        let mut per_call: Vec<Vec<Tensor<T>>> = Vec::with_capacity(batch_size);
+        let mut num_outputs: Option<usize> = None;
+        for i in 0..batch_size {
+            let slice = select(input, in_dim, i)?;
+            let outs = f(&slice)?;
+            match num_outputs {
+                None => num_outputs = Some(outs.len()),
+                Some(n) if n != outs.len() => {
+                    return Err(FerrotorchError::InvalidArgument {
+                        message: format!(
+                            "vmap_multi_output: closure returned {} outputs at batch index {} \
+                             but {} at the first call -- output count must be fixed",
+                            outs.len(),
+                            i,
+                            n
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+            per_call.push(outs);
+        }
+        let num_outputs = num_outputs.unwrap_or(0);
+
+        // Transpose: stacked[output_idx] = stack(per_call[*][output_idx], out_dim)
+        let mut stacked: Vec<Tensor<T>> = Vec::with_capacity(num_outputs);
+        for out_idx in 0..num_outputs {
+            let mut col: Vec<Tensor<T>> = Vec::with_capacity(batch_size);
+            for batch_outputs in &per_call {
+                col.push(batch_outputs[out_idx].clone());
+            }
+            stacked.push(stack(&col, out_dim)?);
+        }
+        Ok(stacked)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per_sample_grad — vmap of grad
+// ---------------------------------------------------------------------------
+
+/// Compute per-sample gradients of a scalar loss function with respect to
+/// a parameter tensor, by running the forward + backward once per sample.
+///
+/// This is the canonical "vmap of grad" operation requested by CL-312:
+/// instead of getting a single accumulated gradient over the whole batch,
+/// you get a stack of `[batch_size, *param.shape()]` per-sample gradients.
+///
+/// `loss_fn` takes one input slice and one parameter tensor, returns a
+/// scalar loss tensor. The parameter tensor is cloned per-call with
+/// `requires_grad = true` so each call accumulates an isolated gradient.
+///
+/// # Note on cost
+///
+/// This is the loop-based reference implementation: O(batch_size) forward
+/// + backward calls. A future fused per-sample-grad path may use the
+/// expand-trick (replicate the parameter, vmap the loss, batched backward)
+/// but this version is correct and useful immediately.
+pub fn per_sample_grad<T, F>(
+    loss_fn: F,
+    inputs: &Tensor<T>,
+    param: &Tensor<T>,
+    in_dim: usize,
+) -> FerrotorchResult<Tensor<T>>
+where
+    T: Float,
+    F: Fn(&Tensor<T>, &Tensor<T>) -> FerrotorchResult<Tensor<T>>,
+{
+    if in_dim >= inputs.ndim() {
+        return Err(FerrotorchError::InvalidArgument {
+            message: format!(
+                "per_sample_grad: in_dim {} out of bounds for input with {} dims",
+                in_dim,
+                inputs.ndim()
+            ),
+        });
+    }
+    let batch_size = inputs.shape()[in_dim];
+    let mut grads: Vec<Tensor<T>> = Vec::with_capacity(batch_size);
+
+    for i in 0..batch_size {
+        let slice = select(inputs, in_dim, i)?;
+        // Build a fresh leaf parameter that requires grad. We clone the
+        // underlying storage so each iteration gets an isolated gradient
+        // slot, then call the user's loss_fn with our leaf.
+        let p_data = param.data_vec()?;
+        let p_leaf = crate::tensor::Tensor::from_storage(
+            crate::storage::TensorStorage::cpu(p_data),
+            param.shape().to_vec(),
+            true,
+        )?;
+        let loss = loss_fn(&slice, &p_leaf)?;
+        if !loss.is_scalar() && loss.numel() != 1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "per_sample_grad: loss_fn must return a scalar tensor, got shape {:?}",
+                    loss.shape()
+                ),
+            });
+        }
+        loss.backward()?;
+        let g = p_leaf.grad()?.ok_or_else(|| FerrotorchError::InvalidArgument {
+            message: "per_sample_grad: parameter received no gradient -- check that loss_fn \
+                      uses the parameter argument and produces a differentiable result"
+                .into(),
+        })?;
+        grads.push(g);
+    }
+    // Stack along a new leading axis so the shape is [batch, *param.shape()].
+    stack(&grads, 0)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -556,5 +859,247 @@ mod tests {
         let s = stack(&[a, b, c], 0).unwrap();
         assert_eq!(s.shape(), &[3]);
         assert_eq!(s.data().unwrap(), &[1.0, 2.0, 3.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // CL-312: vmap3, vmap_many, vmap_multi_output, per_sample_grad,
+    // and nested vmap composability
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_vmap3_three_way_add() {
+        // f(a, b, c) = a + b + c, vmapped over dim 0.
+        let a = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = t(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
+        let c = t(&[100.0, 200.0, 300.0, 400.0], &[2, 2]);
+        let result = vmap3(
+            |x, y, z| {
+                use crate::grad_fns::arithmetic::add;
+                let xy = add(x, y)?;
+                add(&xy, z)
+            },
+            0,
+            0,
+            0,
+            0,
+        )(&a, &b, &c)
+        .unwrap();
+        assert_eq!(result.shape(), &[2, 2]);
+        assert_eq!(result.data().unwrap(), &[111.0, 222.0, 333.0, 444.0]);
+    }
+
+    #[test]
+    fn test_vmap3_batch_size_mismatch() {
+        let a = t(&[1.0, 2.0], &[2]);
+        let b = t(&[1.0, 2.0, 3.0], &[3]);
+        let c = t(&[1.0, 2.0], &[2]);
+        let result = vmap3(
+            |x, _y, _z| Ok(x.clone()),
+            0,
+            0,
+            0,
+            0,
+        )(&a, &b, &c);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vmap3_invalid_dim() {
+        let a = t(&[1.0, 2.0], &[2]);
+        let b = t(&[1.0, 2.0], &[2]);
+        let c = t(&[1.0, 2.0], &[2]);
+        let result =
+            vmap3(|x, _y, _z| Ok(x.clone()), 5, 0, 0, 0)(&a, &b, &c);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vmap_many_four_inputs() {
+        // sum of four batched vectors
+        let a = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = t(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
+        let c = t(&[100.0, 200.0, 300.0, 400.0], &[2, 2]);
+        let d = t(&[1000.0, 2000.0, 3000.0, 4000.0], &[2, 2]);
+        let result = vmap_many(
+            |slices: &[Tensor<f32>]| {
+                use crate::grad_fns::arithmetic::add;
+                let mut acc = slices[0].clone();
+                for s in &slices[1..] {
+                    acc = add(&acc, s)?;
+                }
+                Ok(acc)
+            },
+            vec![0, 0, 0, 0],
+            0,
+        )(&[&a, &b, &c, &d])
+        .unwrap();
+        assert_eq!(result.shape(), &[2, 2]);
+        assert_eq!(result.data().unwrap(), &[1111.0, 2222.0, 3333.0, 4444.0]);
+    }
+
+    #[test]
+    fn test_vmap_many_input_count_mismatch() {
+        let a = t(&[1.0, 2.0], &[2]);
+        let b = t(&[1.0, 2.0], &[2]);
+        let result = vmap_many(
+            |slices: &[Tensor<f32>]| Ok(slices[0].clone()),
+            vec![0, 0, 0],
+            0,
+        )(&[&a, &b]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vmap_many_empty_inputs_errors() {
+        let result = vmap_many(
+            |slices: &[Tensor<f32>]| Ok(slices[0].clone()),
+            vec![],
+            0,
+        )(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vmap_multi_output_two_outputs() {
+        // f(x) = (x, x*x) — duplicates input and squares it.
+        let x = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let outs = vmap_multi_output(
+            |slice| {
+                use crate::grad_fns::arithmetic::mul;
+                let sq = mul(slice, slice)?;
+                Ok(vec![slice.clone(), sq])
+            },
+            0,
+            0,
+        )(&x)
+        .unwrap();
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].shape(), &[2, 2]);
+        assert_eq!(outs[0].data().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(outs[1].shape(), &[2, 2]);
+        assert_eq!(outs[1].data().unwrap(), &[1.0, 4.0, 9.0, 16.0]);
+    }
+
+    #[test]
+    fn test_vmap_multi_output_single_output_acts_like_vmap() {
+        let x = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let outs =
+            vmap_multi_output(|s| Ok(vec![s.clone()]), 0, 0)(&x).unwrap();
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].shape(), &[2, 2]);
+        assert_eq!(outs[0].data().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_vmap_nested_composability() {
+        // vmap(vmap(f)) over a 3-D tensor.
+        // Inner vmap: identity per-row.
+        // Outer vmap: identity per-batch.
+        // Net: identity over a [2, 3, 4] tensor.
+        let x_data: Vec<f32> = (0..24).map(|v| v as f32).collect();
+        let x = t(&x_data, &[2, 3, 4]);
+
+        // Outer vmap takes each [3, 4] slice and applies an inner vmap
+        // that takes each [4] row and returns it unchanged.
+        let result = vmap(
+            |outer_slice| {
+                vmap(|inner_slice| Ok(inner_slice.clone()), 0, 0)(outer_slice)
+            },
+            0,
+            0,
+        )(&x)
+        .unwrap();
+        assert_eq!(result.shape(), &[2, 3, 4]);
+        // Element-by-element identity check.
+        let r = result.data().unwrap();
+        for (i, &v) in r.iter().enumerate() {
+            assert!((v - x_data[i]).abs() < 1e-6, "mismatch at {i}: {v} vs {}", x_data[i]);
+        }
+    }
+
+    #[test]
+    fn test_vmap_nested_double_negation() {
+        // vmap(vmap(neg)) over a [2, 3] tensor — outer vmaps along dim 0,
+        // inner vmaps along dim 0 of each [3] slice. Result should be
+        // -original elementwise.
+        let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let result = vmap(
+            |outer_slice| {
+                vmap(
+                    |inner_slice| crate::grad_fns::arithmetic::neg(inner_slice),
+                    0,
+                    0,
+                )(outer_slice)
+            },
+            0,
+            0,
+        )(&x)
+        .unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        assert_eq!(result.data().unwrap(), &[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
+    }
+
+    #[test]
+    fn test_per_sample_grad_simple_quadratic() {
+        // loss(x, p) = sum((x * p)^2)
+        // d/dp = 2 * sum(x * p) * x ... actually d(sum((xp)^2))/dp_i
+        //       = 2 * x_i^2 * p_i (per-element)
+        // For x in [1, 2, 3] and p = [0.5, 0.5, 0.5]:
+        //   d/dp_i = 2 * x_i^2 * 0.5 = x_i^2
+        // Per-sample with batch [[1,2,3], [4,5,6]]:
+        //   sample 0: [1, 4, 9]
+        //   sample 1: [16, 25, 36]
+        let inputs = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let param = t(&[0.5, 0.5, 0.5], &[3]);
+        let grads = per_sample_grad(
+            |x: &Tensor<f32>, p: &Tensor<f32>| {
+                use crate::grad_fns::arithmetic::mul;
+                use crate::grad_fns::reduction::sum;
+                let xp = mul(x, p)?;
+                let sq = mul(&xp, &xp)?;
+                sum(&sq)
+            },
+            &inputs,
+            &param,
+            0,
+        )
+        .unwrap();
+        assert_eq!(grads.shape(), &[2, 3]);
+        let g = grads.data().unwrap();
+        // sample 0
+        assert!((g[0] - 1.0).abs() < 1e-4);
+        assert!((g[1] - 4.0).abs() < 1e-4);
+        assert!((g[2] - 9.0).abs() < 1e-4);
+        // sample 1
+        assert!((g[3] - 16.0).abs() < 1e-4);
+        assert!((g[4] - 25.0).abs() < 1e-4);
+        assert!((g[5] - 36.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_per_sample_grad_invalid_dim() {
+        let x = t(&[1.0, 2.0], &[2]);
+        let p = t(&[0.5], &[1]);
+        let result = per_sample_grad(
+            |_x, _p| Ok(_p.clone()),
+            &x,
+            &p,
+            5,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_per_sample_grad_non_scalar_loss_errors() {
+        // loss_fn returns a non-scalar -- should error.
+        let x = t(&[1.0, 2.0], &[2]);
+        let p = t(&[0.5], &[1]);
+        let result = per_sample_grad(
+            |x: &Tensor<f32>, _p: &Tensor<f32>| Ok(x.clone()),
+            &x,
+            &p,
+            0,
+        );
+        assert!(result.is_err());
     }
 }
