@@ -1,0 +1,10 @@
+{
+  "uuid": "450479df-decb-424e-bec1-7c2f704a77b0",
+  "issue_uuid": "bf795597-12e9-4029-aee5-8beca457bbda",
+  "author": "y4rr",
+  "content": "Implemented via commit fd8e6e22. Added DimSpec (Static/Dynamic with optional min/max range), InputSpec, export_with_dynamic_shapes() entry point, and ExportedProgram.input_specs field in ferrotorch-jit. Wired through ferrotorch-serialize::export_from_program which merges program-level dynamic axes into OnnxExportConfig.dynamic_axes (caller overrides win on conflict), flowing symbolic names end-to-end into the ONNX dim_param output. 7 new tests; 3900 workspace tests pass.",
+  "created_at": "2026-04-07T22:12:28.042147649Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARjEnwnjh2k8NAbm1BokJMoOeex4h1qMUZElqej8ogBboobD1G4vxicgKARYs3subTvJmken5ku0WdSYOqaeIAQ=="
+}
