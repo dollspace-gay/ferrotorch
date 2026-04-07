@@ -44,16 +44,23 @@ pub fn backward_with_grad<T: Float>(
         }
         ext_grad.clone()
     } else {
-        // No external gradient: root must be scalar.
+        // No external gradient: root must be scalar (0-D) OR a single-element
+        // tensor (e.g. shape [1], [1,1], …). Both are commonly produced by
+        // user code and PyTorch accepts both as implicit-gradient sources.
         if !root.is_scalar() && root.numel() != 1 {
             return Err(FerrotorchError::BackwardNonScalar {
                 shape: root.shape().to_vec(),
             });
         }
 
-        // Seed gradient: d(root)/d(root) = 1, on the same device as root.
-        let ones_storage = crate::storage::TensorStorage::cpu(vec![<T as num_traits::One>::one()]);
-        let seed_cpu = Tensor::from_storage(ones_storage, vec![], false)?;
+        // Seed gradient: d(root)/d(root) = 1, with the SAME shape as root
+        // (not an empty shape) so subsequent backward arithmetic gets a
+        // matching gradient shape and reduce_grad_to_shape doesn't have
+        // to fix up a 0-D vs N-D mismatch -- which previously triggered
+        // an integer underflow when the root had shape [1] etc. CL-498.
+        let one = <T as num_traits::One>::one();
+        let ones_storage = crate::storage::TensorStorage::cpu(vec![one; root.numel().max(1)]);
+        let seed_cpu = Tensor::from_storage(ones_storage, root.shape().to_vec(), false)?;
         seed_cpu.to(root.device())?
     };
 
@@ -843,5 +850,84 @@ mod tests {
             Tensor::<f32>::from_storage(TensorStorage::cpu(vec![1.0, 2.0, 3.0]), vec![3], false)
                 .unwrap();
         assert!(t.backward().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: backward on a single-element non-scalar tensor must seed
+    // the gradient with the same shape as the root, not an empty shape.
+    // Previously this triggered an integer underflow inside
+    // reduce_grad_to_shape when AddBackward / MulBackward called it with
+    // grad_ndim < target_ndim. CL-498.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backward_one_element_tensor_seed_has_same_shape() {
+        // Build x = [3.0] with grad, compute y = x * x (= [9.0]),
+        // then backward — should populate x.grad without panicking.
+        let x = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![3.0]),
+            vec![1],
+            true,
+        )
+        .unwrap();
+        let y = crate::grad_fns::arithmetic::mul(&x, &x).unwrap();
+        assert_eq!(y.shape(), &[1]);
+        // backward without an explicit gradient must succeed for [1]-shaped
+        // single-element tensors.
+        y.backward().unwrap();
+        let g = x.grad().unwrap().expect("x should have gradient");
+        // d(x*x)/dx = 2x, at x=3 -> g = 6.
+        assert!((g.data().unwrap()[0] - 6.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_backward_one_element_through_pow_and_add() {
+        // Reproduces the AdamW convergence test pattern that previously
+        // panicked: f(x, y) = x^2 + y^2 where x, y are [1]-shaped Parameters.
+        // backward() should produce gradients [2x] and [2y].
+        let x = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![3.0]),
+            vec![1],
+            true,
+        )
+        .unwrap();
+        let y = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![-4.0]),
+            vec![1],
+            true,
+        )
+        .unwrap();
+        let xs = crate::grad_fns::arithmetic::pow(&x, 2.0).unwrap();
+        let ys = crate::grad_fns::arithmetic::pow(&y, 2.0).unwrap();
+        let loss = crate::grad_fns::arithmetic::add(&xs, &ys).unwrap();
+        assert_eq!(loss.shape(), &[1]);
+        loss.backward().unwrap();
+        let gx = x.grad().unwrap().unwrap();
+        let gy = y.grad().unwrap().unwrap();
+        // 2*3 = 6, 2*-4 = -8
+        assert!((gx.data().unwrap()[0] - 6.0).abs() < 1e-5);
+        assert!((gy.data().unwrap()[0] - (-8.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_grad_to_shape_returns_error_on_underflow() {
+        // Defensive guard: if any code path produces a gradient with
+        // fewer dims than the target, reduce_grad_to_shape should return
+        // a clean ShapeMismatch instead of panicking with subtract overflow.
+        let grad = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![1.0]),
+            vec![],
+            false,
+        )
+        .unwrap();
+        let result = crate::grad_fns::arithmetic::reduce_grad_to_shape(&grad, &[1]);
+        let err_msg = match result {
+            Ok(_) => panic!("expected error for grad_ndim < target_ndim"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            err_msg.contains("grad_ndim"),
+            "expected mismatch message, got: {err_msg}"
+        );
     }
 }

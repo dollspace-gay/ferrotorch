@@ -60,7 +60,7 @@ fn needs_grad_unary<T: Float>(a: &Tensor<T>) -> bool {
 /// For f32 GPU tensors, reduction is performed entirely on GPU via
 /// `sum_axis_f32` — no CPU roundtrip.  Other dtypes fall back to a
 /// CPU reduction loop and re-upload.
-fn reduce_grad_to_shape<T: Float>(
+pub(crate) fn reduce_grad_to_shape<T: Float>(
     grad: &Tensor<T>,
     target_shape: &[usize],
 ) -> FerrotorchResult<Tensor<T>> {
@@ -121,6 +121,23 @@ fn reduce_grad_to_shape<T: Float>(
     let grad_data = grad.data()?;
     let grad_ndim = grad_shape.len();
     let target_ndim = target_shape.len();
+
+    // Standard broadcasting requires grad_ndim >= target_ndim. The reverse
+    // case (gradient has fewer dims than target) used to trigger an integer
+    // underflow at `grad_ndim - target_ndim`. The graph::backward seed
+    // construction in #498 fixed the most common cause (root.shape() instead
+    // of a scalar []), but keep an explicit check here as a defense in
+    // depth — better a clean error than a panic if any other path produces
+    // a misshapen gradient. CL-498.
+    if grad_ndim < target_ndim {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "reduce_grad_to_shape: gradient has {} dim(s) but target has {} dim(s) ({:?} -> {:?}). \
+                 Standard broadcasting backward requires grad_ndim >= target_ndim.",
+                grad_ndim, target_ndim, grad_shape, target_shape
+            ),
+        });
+    }
 
     // Left-pad target_shape with 1s to match grad_ndim.
     let padded_target: Vec<usize> = if target_ndim < grad_ndim {
