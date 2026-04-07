@@ -151,6 +151,12 @@ pub fn mean<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::reduce_all(input)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("mean", "reduction", &[input.shape()], || {
+        mean_inner(input)
+    })
+}
+
+fn mean_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     // GPU path: use GPU sum kernel + scalar divide (avoids CPU round-trip).
     let is_f32 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>();
     let is_f64 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
@@ -280,6 +286,12 @@ pub fn prod<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::reduce_all(input)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("prod", "reduction", &[input.shape()], || {
+        prod_inner(input)
+    })
+}
+
+fn prod_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if input.is_cuda() {
         return Err(FerrotorchError::NotImplementedOnCuda { op: "prod" });
     }
@@ -389,6 +401,16 @@ pub fn sum_dim<T: Float>(
     if let Some(out) = crate::meta_propagate::reduce_dim(input, dim, keepdim)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("sum_dim", "reduction", &[input.shape()], || {
+        sum_dim_inner(input, dim, keepdim)
+    })
+}
+
+fn sum_dim_inner<T: Float>(
+    input: &Tensor<T>,
+    dim: i64,
+    keepdim: bool,
+) -> FerrotorchResult<Tensor<T>> {
     let ndim = input.ndim();
     if ndim == 0 {
         return Err(FerrotorchError::InvalidArgument {
@@ -584,6 +606,16 @@ pub fn mean_dim<T: Float>(
     if let Some(out) = crate::meta_propagate::reduce_dim(input, dim, keepdim)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("mean_dim", "reduction", &[input.shape()], || {
+        mean_dim_inner(input, dim, keepdim)
+    })
+}
+
+fn mean_dim_inner<T: Float>(
+    input: &Tensor<T>,
+    dim: i64,
+    keepdim: bool,
+) -> FerrotorchResult<Tensor<T>> {
     let ndim = input.ndim();
     if ndim == 0 {
         return Err(FerrotorchError::InvalidArgument {

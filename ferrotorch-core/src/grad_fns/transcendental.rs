@@ -92,6 +92,12 @@ impl<T: Float> GradFn<T> for ExpBackward<T> {
 
 /// Differentiable elementwise exponential: `c[i] = exp(x[i])`.
 pub fn exp<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    crate::profiler_hook::profile_op_scope("exp", "tensor_op", &[input.shape()], || {
+        exp_inner(input)
+    })
+}
+
+fn exp_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
         let handle = if is_f32::<T>() {
@@ -183,6 +189,12 @@ impl<T: Float> GradFn<T> for LogBackward<T> {
 
 /// Differentiable elementwise natural log: `c[i] = ln(x[i])`.
 pub fn log<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    crate::profiler_hook::profile_op_scope("log", "tensor_op", &[input.shape()], || {
+        log_inner(input)
+    })
+}
+
+fn log_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
         let handle = if is_f32::<T>() {
@@ -276,6 +288,12 @@ impl<T: Float> GradFn<T> for SinBackward<T> {
 
 /// Differentiable elementwise sine: `c[i] = sin(x[i])`.
 pub fn sin<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    crate::profiler_hook::profile_op_scope("sin", "tensor_op", &[input.shape()], || {
+        sin_inner(input)
+    })
+}
+
+fn sin_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let output = fast_sin(input)?;
 
     if needs_grad_unary(input) {
@@ -347,6 +365,12 @@ impl<T: Float> GradFn<T> for CosBackward<T> {
 
 /// Differentiable elementwise cosine: `c[i] = cos(x[i])`.
 pub fn cos<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    crate::profiler_hook::profile_op_scope("cos", "tensor_op", &[input.shape()], || {
+        cos_inner(input)
+    })
+}
+
+fn cos_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let output = fast_cos(input)?;
 
     if needs_grad_unary(input) {
