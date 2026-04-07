@@ -2,11 +2,12 @@
   "uuid": "cdc463c0-d334-41fe-9f24-7f8ca9ae985f",
   "display_id": 379,
   "title": "Profiler auto-instrumentation of tensor ops (currently manual record() calls only)",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-24T19:56:03.864998393Z",
-  "updated_at": "2026-04-07T14:51:08.596581180Z",
+  "updated_at": "2026-04-07T14:51:53.783562042Z",
+  "closed_at": "2026-04-07T14:51:53.783562042Z",
   "labels": [
     "feature"
   ],
