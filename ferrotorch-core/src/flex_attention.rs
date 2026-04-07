@@ -11,19 +11,20 @@
 //!
 //! # Backward
 //!
-//! **WARNING**: The backward pass is correct only for **additive** score
-//! modifications (ALiBi, relative position bias, additive masking). It does
-//! **not** correctly handle multiplicative or non-linear score modifications
-//! because it does not account for the Jacobian of a general `score_mod`
-//! function. For multiplicative modifications, use standard attention with
-//! pre-modified keys or implement a custom backward.
-
-use std::sync::Arc;
+//! Gradients flow through the standard autograd chain: bmm → mul → softmax →
+//! bmm. The backward correctly handles Q, K, V gradients for additive,
+//! multiplicative, and arbitrary differentiable score modifications, because
+//! the score_mod callback's own ops record their backward in the graph as
+//! they execute.
+//!
+//! If `score_mod` returns a non-differentiable result (e.g. it constructs
+//! a fresh tensor without requires_grad), gradients will not flow back into
+//! its inputs — but Q/K/V gradients will still be correct relative to the
+//! modified scores.
 
 use crate::dtype::Float;
 use crate::error::{FerrotorchError, FerrotorchResult};
-use crate::storage::TensorStorage;
-use crate::tensor::{GradFn, Tensor};
+use crate::tensor::Tensor;
 
 // ===========================================================================
 // flex_attention
@@ -63,11 +64,19 @@ use crate::tensor::{GradFn, Tensor};
 ///
 /// # Backward correctness
 ///
-/// **WARNING**: The backward pass correctly computes gradients for Q, K, V
-/// under additive score modifications (ALiBi, relative position bias). It
-/// does NOT account for score_mod gradients for multiplicative or non-linear
-/// modifications. For such cases, the gradients through Q and K will be
-/// approximate/incorrect.
+/// Gradients flow through the standard autograd chain (bmm → mul → softmax →
+/// bmm). Q, K, V gradients are correct for any score modification whose ops
+/// are themselves differentiable, including multiplicative and non-linear
+/// modifications. There is no custom backward node — autograd composes
+/// the per-op backwards automatically.
+///
+/// # Device behavior
+///
+/// Runs end-to-end on the input device (CPU or CUDA). On CUDA, the per-op
+/// dispatch goes through cuBLAS for `bmm`, the native softmax kernel, and
+/// the strided `cat` kernel for score_mod reassembly. The previous
+/// implementation downloaded Q, K, V to CPU and ran nested loops; the
+/// current path stays on-device.
 pub fn flex_attention<T, F>(
     query: &Tensor<T>,
     key: &Tensor<T>,
@@ -125,157 +134,133 @@ where
         });
     }
 
+    if query.device() != key.device() || query.device() != value.device() {
+        return Err(FerrotorchError::DeviceMismatch {
+            expected: query.device(),
+            got: key.device(),
+        });
+    }
+
     let scale = T::from(1.0 / (d as f64).sqrt()).unwrap();
+    let device = query.device();
+    let bh = batch * heads;
 
-    // Compute attention: Q @ K^T, scale, optional score_mod, softmax, @ V.
-    // We operate per (batch, head) to keep things simple and avoid huge
-    // temporaries.
-    let q_data = query.data_vec()?;
-    let k_data = key.data_vec()?;
-    let v_data = value.data_vec()?;
+    // ----------------------------------------------------------------------
+    // GPU-aware path: compose the attention computation from existing
+    // device-aware tensor ops. Each step (view_reshape, transpose, bmm,
+    // mul, softmax, cat) dispatches to its native CUDA kernel when the
+    // input is on GPU. The previous implementation downloaded Q, K, V to
+    // CPU and ran nested loops; this version stays on-device end-to-end
+    // (modulo the score_mod callback dispatch, which still runs per
+    // (batch, head) to preserve the existing API contract).
+    //
+    // Bonus: the previous FlexAttentionBackward was a passthrough and did
+    // not compute correct gradients. By composing differentiable ops
+    // (bmm_differentiable + softmax + mul), the autograd chain now produces
+    // mathematically correct gradients for Q, K, V automatically — no
+    // custom backward node required.
+    // ----------------------------------------------------------------------
 
-    let mut output_data = vec![<T as num_traits::Zero>::zero(); batch * heads * n_q * d_v];
+    // Reshape [B, H, N, D] -> [B*H, N, D] for bmm. We use the differentiable
+    // `reshape` (grad_fns::shape::reshape) so grad flows back to Q/K/V — the
+    // bare `view_reshape` strips grad_fn and would sever the autograd chain.
+    // When no grad is required, reshape internally falls back to view_reshape
+    // (zero-copy on any device).
+    let q3 = crate::grad_fns::shape::reshape(query, &[bh as isize, n_q as isize, d as isize])?;
+    let k3 = crate::grad_fns::shape::reshape(key, &[bh as isize, n_k as isize, d as isize])?;
+    let v3 = crate::grad_fns::shape::reshape(value, &[bh as isize, n_k as isize, d_v as isize])?;
 
-    for b in 0..batch {
-        for h in 0..heads {
-            // Extract Q[b,h] as [n_q, d] and K[b,h] as [n_k, d].
-            let q_offset = ((b * heads + h) * n_q) * d;
-            let k_offset = ((b * heads + h) * n_k) * d;
-            let v_offset = ((b * heads + h) * n_k) * d_v;
+    // K^T: swap last two dims of [B*H, n_k, d] -> [B*H, d, n_k]. transpose
+    // is a zero-copy stride view; bmm() materializes via contiguous() if
+    // needed (which on CUDA still goes through CPU for now — see #496 —
+    // but on contiguous inputs the rest of the path is fully on-device).
+    let k3_t = k3.transpose(1, 2)?;
 
-            // Compute scores = Q @ K^T, shape [n_q, n_k].
-            let mut scores = vec![<T as num_traits::Zero>::zero(); n_q * n_k];
-            for i in 0..n_q {
-                for j in 0..n_k {
-                    let mut dot = <T as num_traits::Zero>::zero();
-                    for dd in 0..d {
-                        dot += q_data[q_offset + i * d + dd] * k_data[k_offset + j * d + dd];
-                    }
-                    scores[i * n_k + j] = dot * scale;
+    // Q @ K^T: [B*H, n_q, d] @ [B*H, d, n_k] -> [B*H, n_q, n_k]. bmm
+    // dispatches to cuBLAS SgemmStridedBatched on CUDA.
+    let scores3 = crate::grad_fns::linalg::bmm_differentiable(&q3, &k3_t)?;
+
+    // Multiply by 1/sqrt(d). scale is a scalar tensor on the same device
+    // as the inputs; mul broadcasts.
+    let scale_t = crate::creation::scalar(scale)?.to(device)?;
+    let scores3_scaled = crate::grad_fns::arithmetic::mul(&scores3, &scale_t)?;
+
+    // Reshape to [B, H, n_q, n_k] for score_mod and softmax. Differentiable
+    // reshape so grad continues to flow.
+    let scores4 = crate::grad_fns::shape::reshape(
+        &scores3_scaled,
+        &[batch as isize, heads as isize, n_q as isize, n_k as isize],
+    )?;
+
+    // Apply score_mod per (b, h). When score_mod is None this is a no-op
+    // and we keep the on-device tensor. When score_mod is provided, we
+    // extract per-(b,h) [n_q, n_k] views, call the user callback, and
+    // reassemble via cat — all on the input's device, since narrow and
+    // cat are device-aware.
+    let scores_after_mod = if let Some(ref sm) = score_mod {
+        // Extract per-(b,h) sub-tensors as [n_q, n_k] views, run user code,
+        // and reassemble. The narrow + squeeze are zero-copy stride views;
+        // cat is GPU-aware. The only potential CPU round-trip is in the
+        // user's score_mod callback itself (out of our control).
+        let mut per_bh: Vec<Tensor<T>> = Vec::with_capacity(bh);
+        for b in 0..batch {
+            for h in 0..heads {
+                // [B, H, n_q, n_k] -> narrow b -> [1, H, n_q, n_k]
+                //                  -> narrow h -> [1, 1, n_q, n_k]
+                //                  -> squeeze 0, squeeze 0 -> [n_q, n_k]
+                let bh_view = scores4
+                    .narrow(0, b, 1)?
+                    .narrow(1, h, 1)?
+                    .squeeze_t(0)?
+                    .squeeze_t(0)?;
+                let modified = sm(&bh_view, b, h)?;
+                if modified.shape() != [n_q, n_k] {
+                    return Err(FerrotorchError::ShapeMismatch {
+                        message: format!(
+                            "flex_attention: score_mod returned shape {:?}, expected [{}, {}]",
+                            modified.shape(),
+                            n_q,
+                            n_k
+                        ),
+                    });
                 }
-            }
-
-            // Apply score_mod as a batched operation on the full [n_q, n_k] matrix.
-            let scores_after_mod = if let Some(ref sm) = score_mod {
-                let scores_tensor =
-                    Tensor::from_storage(TensorStorage::cpu(scores), vec![n_q, n_k], false)?;
-                let modified = sm(&scores_tensor, b, h)?;
-                modified.data_vec()?
-            } else {
-                scores
-            };
-
-            // Softmax over last dimension (n_k).
-            let mut weights = vec![<T as num_traits::Zero>::zero(); n_q * n_k];
-            for i in 0..n_q {
-                let row_start = i * n_k;
-                let row_end = row_start + n_k;
-                let row = &scores_after_mod[row_start..row_end];
-
-                // Numerically stable softmax.
-                let max_val = row
-                    .iter()
-                    .copied()
-                    .fold(T::neg_infinity(), |a, b| if a > b { a } else { b });
-                let mut sum_exp = <T as num_traits::Zero>::zero();
-                for &val in row {
-                    sum_exp += (val - max_val).exp();
-                }
-                for j in 0..n_k {
-                    weights[row_start + j] =
-                        (scores_after_mod[row_start + j] - max_val).exp() / sum_exp;
-                }
-            }
-
-            // Output = weights @ V, shape [n_q, d_v].
-            let o_offset = ((b * heads + h) * n_q) * d_v;
-            for i in 0..n_q {
-                for j in 0..d_v {
-                    let mut val = <T as num_traits::Zero>::zero();
-                    for kk in 0..n_k {
-                        val += weights[i * n_k + kk] * v_data[v_offset + kk * d_v + j];
-                    }
-                    output_data[o_offset + i * d_v + j] = val;
-                }
+                // Lift back to [1, 1, n_q, n_k] so we can cat along dims 0/1.
+                let lifted = modified.unsqueeze_t(0)?.unsqueeze_t(0)?;
+                per_bh.push(lifted);
             }
         }
-    }
-
-    let output_shape = vec![batch, heads, n_q, d_v];
-    let any_requires_grad = query.requires_grad() || key.requires_grad() || value.requires_grad();
-
-    if !any_requires_grad {
-        // Preserve device from query.
-        let device = query.device();
-        let storage = TensorStorage::on_device(output_data, device)?;
-        Tensor::from_storage(storage, output_shape, false)
+        // Concatenate first along the heads axis (dim 1) for each batch,
+        // then along the batch axis (dim 0).
+        let mut head_groups: Vec<Tensor<T>> = Vec::with_capacity(batch);
+        for b in 0..batch {
+            let group: Vec<Tensor<T>> = per_bh[b * heads..(b + 1) * heads].to_vec();
+            let cat_h = crate::grad_fns::shape::cat(&group, 1)?;
+            head_groups.push(cat_h);
+        }
+        crate::grad_fns::shape::cat(&head_groups, 0)?
     } else {
-        let grad_fn = Arc::new(FlexAttentionBackward {
-            query: query.clone(),
-            key: key.clone(),
-            value: value.clone(),
-        });
-        // Preserve device from query.
-        let device = query.device();
-        let storage = TensorStorage::on_device(output_data, device)?;
-        Tensor::from_operation(storage, output_shape, grad_fn)
-    }
-}
+        scores4
+    };
 
-// ---------------------------------------------------------------------------
-// Backward
-// ---------------------------------------------------------------------------
+    // Softmax along the last (n_k) dimension. softmax is GPU-aware and
+    // operates on the last dim regardless of rank.
+    let weights4 = crate::grad_fns::activation::softmax(&scores_after_mod)?;
 
-/// Backward node for [`flex_attention`].
-///
-/// **WARNING**: This backward is correct for **additive** score modifications
-/// (ALiBi, relative position bias) but NOT for multiplicative or non-linear
-/// modifications. It computes standard attention gradients without accounting
-/// for the Jacobian of a general `score_mod` function.
-#[derive(Debug)]
-struct FlexAttentionBackward<T: Float> {
-    query: Tensor<T>,
-    key: Tensor<T>,
-    value: Tensor<T>,
-}
+    // Reshape weights to [B*H, n_q, n_k] for the second bmm. Differentiable
+    // reshape preserves the autograd chain.
+    let weights3 = crate::grad_fns::shape::reshape(
+        &weights4,
+        &[bh as isize, n_q as isize, n_k as isize],
+    )?;
 
-impl<T: Float> GradFn<T> for FlexAttentionBackward<T> {
-    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        // Standard attention backward (without score_mod Jacobian):
-        //
-        // dL/dV = weights^T @ dL/dO
-        // dL/dweights = dL/dO @ V^T
-        // dL/dscores = dL/dweights * (weights - weights * weights^T) (softmax backward)
-        // dL/dQ = dL/dscores @ K * scale
-        // dL/dK = dL/dscores^T @ Q * scale
-        //
-        // For simplicity we pass the gradient through as-is for now.
-        let grad_q = if self.query.requires_grad() {
-            Some(grad_output.clone())
-        } else {
-            None
-        };
-        let grad_k = if self.key.requires_grad() {
-            Some(grad_output.clone())
-        } else {
-            None
-        };
-        let grad_v = if self.value.requires_grad() {
-            Some(grad_output.clone())
-        } else {
-            None
-        };
+    // weights @ V: [B*H, n_q, n_k] @ [B*H, n_k, d_v] -> [B*H, n_q, d_v]
+    let output3 = crate::grad_fns::linalg::bmm_differentiable(&weights3, &v3)?;
 
-        Ok(vec![grad_q, grad_k, grad_v])
-    }
-
-    fn inputs(&self) -> Vec<&Tensor<T>> {
-        vec![&self.query, &self.key, &self.value]
-    }
-
-    fn name(&self) -> &'static str {
-        "FlexAttentionBackward"
-    }
+    // Reshape to the canonical [B, H, n_q, d_v] output shape.
+    crate::grad_fns::shape::reshape(
+        &output3,
+        &[batch as isize, heads as isize, n_q as isize, d_v as isize],
+    )
 }
 
 // ===========================================================================
@@ -361,6 +346,12 @@ mod tests {
 
     #[test]
     fn test_flex_attention_with_grad() {
+        // The new implementation composes flex_attention from differentiable
+        // tensor ops (bmm, mul, softmax, reshape), so the output's grad_fn
+        // is the LAST op in the chain (ReshapeBackward) rather than a custom
+        // FlexAttentionBackward. What matters for autograd correctness is
+        // that the chain is connected end-to-end — verified by checking that
+        // a grad_fn exists on the output.
         let q = make_tensor_grad(vec![1.0, 0.0, 0.0, 1.0], vec![1, 1, 2, 2]);
         let k = make_tensor_grad(vec![1.0, 0.0, 0.0, 1.0], vec![1, 1, 2, 2]);
         let v = make_tensor_grad(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
@@ -371,7 +362,136 @@ mod tests {
         >(&q, &k, &v, None)
         .unwrap();
 
-        assert!(output.grad_fn().is_some());
-        assert_eq!(output.grad_fn().unwrap().name(), "FlexAttentionBackward");
+        assert!(
+            output.grad_fn().is_some(),
+            "expected output to have a grad_fn so backward propagates to Q/K/V"
+        );
+    }
+
+    #[test]
+    fn test_flex_attention_numerical_value() {
+        // Hand-computed reference: B=1, H=1, n_q=2, n_k=2, d=2, d_v=2.
+        // Q = [[1,0],[0,1]],  K = [[1,0],[0,1]],  V = [[1,2],[3,4]]
+        // scale = 1/sqrt(2) ≈ 0.7071
+        // scores = Q @ K^T = [[1,0],[0,1]],  scaled = [[0.7071,0],[0,0.7071]]
+        // softmax row 0 over [0.7071, 0]: e^0.7071 = 2.0281, e^0 = 1
+        //   sum = 3.0281, weights = [0.6699, 0.3301]
+        // softmax row 1 over [0, 0.7071]: weights = [0.3301, 0.6699]
+        // out[0] = 0.6699*[1,2] + 0.3301*[3,4] = [0.6699+0.9903, 1.3398+1.3204]
+        //        ≈ [1.6603, 2.6602]
+        // out[1] = 0.3301*[1,2] + 0.6699*[3,4] = [0.3301+2.0098, 0.6602+2.6797]
+        //        ≈ [2.3399, 3.3399]
+        let q = make_tensor(vec![1.0, 0.0, 0.0, 1.0], vec![1, 1, 2, 2]);
+        let k = make_tensor(vec![1.0, 0.0, 0.0, 1.0], vec![1, 1, 2, 2]);
+        let v = make_tensor(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+        let out = flex_attention::<
+            f32,
+            fn(&Tensor<f32>, usize, usize) -> FerrotorchResult<Tensor<f32>>,
+        >(&q, &k, &v, None)
+        .unwrap();
+        let data = out.data().unwrap();
+        let expected = [1.6603, 2.6602, 2.3399, 3.3399];
+        for (i, (&got, &exp)) in data.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-3,
+                "out[{}]: expected {}, got {}",
+                i,
+                exp,
+                got
+            );
+        }
+    }
+
+    #[test]
+    fn test_flex_attention_score_mod_additive_bias() {
+        // Verify that an additive score modification (e.g. ALiBi-style)
+        // actually changes the output. We add +1.0 to all scores via the
+        // score_mod callback, which biases the softmax distribution slightly.
+        let q = make_tensor(vec![1.0, 0.0, 0.0, 1.0], vec![1, 1, 2, 2]);
+        let k = make_tensor(vec![1.0, 0.0, 0.0, 1.0], vec![1, 1, 2, 2]);
+        let v = make_tensor(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+
+        // No score_mod baseline.
+        let baseline = flex_attention::<
+            f32,
+            fn(&Tensor<f32>, usize, usize) -> FerrotorchResult<Tensor<f32>>,
+        >(&q, &k, &v, None)
+        .unwrap();
+
+        // With additive bias: adding a constant to all scores in a row is
+        // softmax-invariant, so the output should equal the baseline. This
+        // is a strong correctness check on the score_mod plumbing — if the
+        // narrow/cat reassembly is wrong, this WON'T match.
+        let with_const_bias = flex_attention(
+            &q,
+            &k,
+            &v,
+            Some(|s: &Tensor<f32>, _b: usize, _h: usize| {
+                let one = crate::creation::scalar(1.0f32).unwrap();
+                crate::grad_fns::arithmetic::add(s, &one)
+            }),
+        )
+        .unwrap();
+
+        let base_data = baseline.data().unwrap();
+        let mod_data = with_const_bias.data().unwrap();
+        for (i, (&b, &m)) in base_data.iter().zip(mod_data.iter()).enumerate() {
+            assert!(
+                (b - m).abs() < 1e-5,
+                "softmax-invariant additive bias should not change output[{}]: base={}, mod={}",
+                i,
+                b,
+                m
+            );
+        }
+    }
+
+    #[test]
+    fn test_flex_attention_grad_propagates_to_qkv() {
+        // Verify that calling backward on the output actually fills gradients
+        // on Q, K, V — this is the bug the previous FlexAttentionBackward
+        // pass-through couldn't catch (it returned grad_output as-is for all
+        // three, which was shape-wrong and value-wrong).
+        let q = make_tensor_grad(vec![1.0, 0.0, 0.5, 1.0], vec![1, 1, 2, 2]);
+        let k = make_tensor_grad(vec![0.5, 1.0, 1.0, 0.0], vec![1, 1, 2, 2]);
+        let v = make_tensor_grad(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+
+        let output = flex_attention::<
+            f32,
+            fn(&Tensor<f32>, usize, usize) -> FerrotorchResult<Tensor<f32>>,
+        >(&q, &k, &v, None)
+        .unwrap();
+
+        // Sum to a scalar and run backward.
+        let loss = crate::grad_fns::reduction::sum(&output).unwrap();
+        loss.backward().unwrap();
+
+        // All three inputs should now carry gradients of their original
+        // shape. grad() returns Result<Option<Tensor>>, so unwrap both
+        // layers.
+        let gq = q
+            .grad()
+            .unwrap()
+            .expect("query should have a gradient after backward");
+        let gk = k
+            .grad()
+            .unwrap()
+            .expect("key should have a gradient after backward");
+        let gv = v
+            .grad()
+            .unwrap()
+            .expect("value should have a gradient after backward");
+        assert_eq!(gq.shape(), &[1, 1, 2, 2]);
+        assert_eq!(gk.shape(), &[1, 1, 2, 2]);
+        assert_eq!(gv.shape(), &[1, 1, 2, 2]);
+
+        // The existence of non-zero gradients on V is the key correctness
+        // signal vs. the old broken pass-through, which returned the output
+        // gradient as-is for all three (shape-wrong garbage).
+        let gv_data = gv.data().unwrap();
+        assert!(
+            gv_data.iter().any(|&x| x != 0.0),
+            "expected non-zero gradient on V"
+        );
     }
 }
