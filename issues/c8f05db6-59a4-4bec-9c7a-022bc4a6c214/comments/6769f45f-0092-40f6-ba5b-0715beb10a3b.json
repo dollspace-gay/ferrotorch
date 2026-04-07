@@ -1,0 +1,10 @@
+{
+  "uuid": "6769f45f-0092-40f6-ba5b-0715beb10a3b",
+  "issue_uuid": "c8f05db6-59a4-4bec-9c7a-022bc4a6c214",
+  "author": "y4rr",
+  "content": "Implemented via commit 08e523a6. Added ExportedProgram::check_inputs (validates runtime tensors against input_specs without running the graph) and run_with_guards (check + run). Validates input count, per-input rank, DimSpec::Static exact match, DimSpec::Dynamic [min, max] range, and rejects zero-sized dynamic dims. Builds on #396/#367 vocabulary. 8 new tests; 27 export tests pass.",
+  "created_at": "2026-04-07T22:52:21.624604463Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASPleYR5Hj+KUJUYJFEZHKTHJiK52V7QIhza2pWkSvUiaxr2NHoTa3RCdkXs65ZHSylWdJ/CymJEk7e4fusOxDg=="
+}
