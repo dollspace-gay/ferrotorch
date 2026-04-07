@@ -1,0 +1,10 @@
+{
+  "uuid": "b105002a-3693-468a-8fa8-33214c12ad22",
+  "issue_uuid": "270f76f3-e4f9-4ca7-a4ce-1ac1a86aa206",
+  "author": "y4rr",
+  "content": "Filed while closing #388. The foreach (on-device, tensor-op) update path was added to SgdConfig and AdamWConfig, but the other 17 optimizers in ferrotorch-optim still take the legacy CPU path:\n\n- adadelta, adafactor, adagrad, adamax, adam, asgd, lbfgs, muon, nadam, natural_gradient, radam, rmsprop, rprop, sparse_adam, ema, swa, grad_accumulator, grad_scaler\n\nThe pattern from sgd.rs and adamw.rs is reusable: add a `foreach: bool` field to the Config, store moments as Tensor<T> in a parallel state map, and dispatch in step(). Each optimizer is ~150 lines of new code. The parity tests at sgd.rs and adamw.rs serve as the template — verify the new path produces identical results to the legacy path for several step counts and config combinations.\n\nFor optimizers that use Vec<f64> internally for accuracy (like AdamW does), the foreach path will compute in T precision instead — this is a documented tradeoff users opt into via foreach=true.",
+  "created_at": "2026-04-07T13:10:51.483889989Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASXvialRvyykn6gCihMQXHCvp2E04IFDeI/GgVihUBQASn7PnoXb17jG8dWhdFVUkNeld+YlnlFF7LP8rbrV+Dg=="
+}
