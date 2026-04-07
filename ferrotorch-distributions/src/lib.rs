@@ -27,8 +27,11 @@
 //! | [`Poisson`] | `rate` | No (discrete) |
 //! | [`StudentT`] | `df`, `loc`, `scale` | Yes |
 //! | [`MultivariateNormal`] | `loc`, `scale_tril` | Yes |
+//! | [`LowRankMultivariateNormal`] | `loc`, `cov_factor`, `cov_diag` | Yes |
 //! | [`Dirichlet`] | `concentration` | Yes |
 //! | [`Multinomial`] | `total_count`, `probs` | No (discrete) |
+//! | [`Independent`] | base distribution + `reinterpreted_batch_ndims` | inherits |
+//! | [`MixtureSameFamily`] | mixing `Categorical` + components | No |
 //!
 //! # Infrastructure
 //!
@@ -48,9 +51,12 @@ mod exponential;
 mod gamma;
 mod gumbel;
 mod half_normal;
+mod independent;
 pub mod kl;
 mod laplace;
 mod lognormal;
+mod low_rank_multivariate_normal;
+mod mixture_same_family;
 mod multinomial;
 mod multivariate_normal;
 mod normal;
@@ -73,8 +79,11 @@ pub use exponential::Exponential;
 pub use gamma::Gamma;
 pub use gumbel::Gumbel;
 pub use half_normal::HalfNormal;
+pub use independent::Independent;
 pub use laplace::Laplace;
 pub use lognormal::LogNormal;
+pub use low_rank_multivariate_normal::LowRankMultivariateNormal;
+pub use mixture_same_family::MixtureSameFamily;
 pub use multinomial::Multinomial;
 pub use multivariate_normal::MultivariateNormal;
 pub use normal::Normal;
