@@ -45,6 +45,71 @@ pub fn autocast_dtype() -> AutocastDtype {
     AUTOCAST_DTYPE.with(|d| d.get())
 }
 
+/// A snapshot of the per-thread autocast state at a point in time.
+///
+/// Used by gradient checkpointing (and any other op that needs to recreate
+/// the same autocast context later) to restore the exact (enabled, dtype)
+/// pair that was active during the forward pass when the backward
+/// recomputation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutocastSnapshot {
+    /// Whether autocast was enabled when the snapshot was captured.
+    pub enabled: bool,
+    /// The autocast dtype at snapshot time. Only meaningful when `enabled`
+    /// is true, but we always carry it so the snapshot can round-trip
+    /// faithfully (e.g. if a future API also restores the dtype cell when
+    /// disabled).
+    pub dtype: AutocastDtype,
+}
+
+/// Capture the current per-thread autocast state.
+///
+/// Pair this with [`with_autocast_state`] to recreate the same autocast
+/// context later, e.g. for gradient checkpointing where the forward and
+/// recomputed-during-backward passes must produce numerically identical
+/// activations.
+pub fn current_autocast_snapshot() -> AutocastSnapshot {
+    AutocastSnapshot {
+        enabled: is_autocast_enabled(),
+        dtype: autocast_dtype(),
+    }
+}
+
+/// Execute a closure with the autocast state set to a captured snapshot.
+///
+/// On entry, the previous (enabled, dtype) is saved; on exit (including
+/// panic unwind), the previous state is restored via an RAII guard.
+///
+/// This is more general than [`autocast`]: it can also restore the
+/// "disabled" state if the snapshot was captured outside any autocast
+/// region. Used by gradient checkpointing to ensure the backward
+/// recomputation runs with the exact autocast configuration that was
+/// active when the original forward pass ran.
+pub fn with_autocast_state<F, R>(snapshot: AutocastSnapshot, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct StateGuard {
+        prev_enabled: bool,
+        prev_dtype: AutocastDtype,
+    }
+
+    impl Drop for StateGuard {
+        fn drop(&mut self) {
+            AUTOCAST_ENABLED.with(|e| e.set(self.prev_enabled));
+            AUTOCAST_DTYPE.with(|d| d.set(self.prev_dtype));
+        }
+    }
+
+    let _guard = StateGuard {
+        prev_enabled: is_autocast_enabled(),
+        prev_dtype: autocast_dtype(),
+    };
+    AUTOCAST_ENABLED.with(|e| e.set(snapshot.enabled));
+    AUTOCAST_DTYPE.with(|d| d.set(snapshot.dtype));
+    f()
+}
+
 /// Execute a closure with mixed-precision autocast enabled.
 ///
 /// Operations that benefit from lower precision (matmul, conv) will use
