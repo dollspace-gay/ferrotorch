@@ -1225,6 +1225,44 @@ mod tests {
     }
 
     #[test]
+    fn test_adamw_foreach_convergence_quadratic() {
+        // The foreach path should converge to the minimum of x^2 + y^2 just
+        // like the legacy path. This is the test that was previously
+        // commented out due to the reduce_grad_to_shape underflow bug
+        // (now fixed in CL-498). It exercises the full backward chain
+        // through pow + add on [1]-shaped parameters.
+        use ferrotorch_core::grad_fns::{
+            arithmetic::add as t_add, arithmetic::pow as t_pow,
+        };
+
+        let x = Parameter::from_slice(&[3.0f32], &[1]).unwrap();
+        let y = Parameter::from_slice(&[-4.0f32], &[1]).unwrap();
+        let mut opt = AdamW::new(
+            vec![x.clone(), y.clone()],
+            AdamWConfig {
+                lr: 1e-1,
+                weight_decay: 0.0,
+                foreach: true,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..400 {
+            opt.zero_grad().unwrap();
+            let xt = opt.param_groups[0].params[0].tensor().clone();
+            let yt = opt.param_groups[0].params[1].tensor().clone();
+            let loss = t_add(&t_pow(&xt, 2.0).unwrap(), &t_pow(&yt, 2.0).unwrap()).unwrap();
+            loss.backward().unwrap();
+            opt.step().unwrap();
+        }
+
+        let xv = opt.param_groups()[0].params[0].data().unwrap()[0];
+        let yv = opt.param_groups()[0].params[1].data().unwrap()[0];
+        assert!(xv.abs() < 0.1, "expected x near 0, got {xv}");
+        assert!(yv.abs() < 0.1, "expected y near 0, got {yv}");
+    }
+
+    #[test]
     fn test_adamw_foreach_long_run_drives_to_zero_with_zero_grad() {
         // Trivial sanity check: with zero gradients and weight decay only,
         // the foreach path's decoupled-weight-decay update should drive
