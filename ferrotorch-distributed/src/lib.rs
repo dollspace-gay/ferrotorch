@@ -53,6 +53,7 @@ pub mod error;
 pub mod fsdp;
 pub mod pipeline;
 pub mod rpc;
+pub mod sync_batch_norm;
 
 #[cfg(feature = "gpu")]
 pub mod gpu_collective;
@@ -79,6 +80,7 @@ pub use collective::{
 pub use ddp::DDP;
 pub use error::DistributedError;
 pub use fsdp::FSDP;
+pub use sync_batch_norm::SyncBatchNorm2d;
 pub use pipeline::{Pipeline, PipelineSchedule};
 pub use rpc::{RpcAgent, RpcError, TcpRpcBackend};
 
