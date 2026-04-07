@@ -1187,6 +1187,80 @@ impl<T: Float> Tensor<T> {
             MemoryFormat::ChannelsLast3d => channels_last_3d_strides(shape),
         };
 
+        // GPU fast path (CL-455): for non-meta CUDA tensors of rank
+        // <= 8, gather the source view directly into a fresh contiguous
+        // device buffer using gpu_strided_copy. The trick is that
+        // gpu_strided_copy iterates its output linearly using
+        // c-contiguous output strides — so we pass a *permuted* shape
+        // and src_stride pair such that the linear iteration order
+        // matches the target memory layout (e.g., NHWC for
+        // ChannelsLast). The gathered buffer is then naturally
+        // contiguous in the target format.
+        if self.is_cuda() && ndim <= 8 {
+            if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+                use std::any::TypeId;
+                let perm = format_permutation(format, ndim);
+                let permuted_shape: Vec<usize> = perm.iter().map(|&d| shape[d]).collect();
+                let permuted_src_strides: Vec<isize> =
+                    perm.iter().map(|&d| self.inner.strides[d]).collect();
+                let in_handle = self.gpu_handle()?;
+                let src_offset = self.inner.offset;
+
+                let out_handle = if TypeId::of::<T>() == TypeId::of::<f32>() {
+                    backend.strided_copy_f32(
+                        in_handle,
+                        &permuted_shape,
+                        &permuted_src_strides,
+                        src_offset,
+                    )
+                } else if TypeId::of::<T>() == TypeId::of::<f64>() {
+                    backend.strided_copy_f64(
+                        in_handle,
+                        &permuted_shape,
+                        &permuted_src_strides,
+                        src_offset,
+                    )
+                } else {
+                    // Unsupported dtype — fall through to CPU path.
+                    return self.materialize_format_cpu(format, target_strides);
+                };
+
+                if let Ok(handle) = out_handle {
+                    let storage = TensorStorage::gpu(handle);
+                    return Ok(Self {
+                        inner: Arc::new(TensorInner {
+                            id: TensorId::next(),
+                            storage: Arc::new(storage),
+                            shape: shape.to_vec(),
+                            strides: target_strides,
+                            offset: 0,
+                            grad: Mutex::new(None),
+                            grad_fn: None,
+                            requires_grad: self.inner.requires_grad,
+                            is_leaf: true,
+                            hooks: Mutex::new(
+                                crate::autograd::hooks::HookStorage::new(),
+                            ),
+                        }),
+                    });
+                }
+                // Kernel failure — fall through to CPU.
+            }
+        }
+
+        self.materialize_format_cpu(format, target_strides)
+    }
+
+    /// CPU path for [`materialize_format`]. Always valid for any
+    /// layout; used as a fallback when the GPU fast path declines or
+    /// errors. CL-455.
+    fn materialize_format_cpu(
+        &self,
+        _format: MemoryFormat,
+        target_strides: Vec<isize>,
+    ) -> FerrotorchResult<Self> {
+        let shape = &self.inner.shape;
+        let ndim = shape.len();
         let numel = self.numel();
         let src_strides = &self.inner.strides;
         let offset = self.inner.offset;
@@ -1308,6 +1382,41 @@ impl<T: Float> Tensor<T> {
 /// This matches PyTorch's contiguity semantics where a size-1 dimension
 /// does not constrain the stride because it only ever indexes at 0.
 ///
+/// Permutation that maps *output position d* (in linear iteration
+/// order over a buffer that's contiguous in `format`) to the
+/// corresponding *input dim*. Used by [`materialize_format`] to
+/// reuse [`gpu_strided_copy`](crate::gpu_dispatch::GpuBackend::strided_copy_f32)
+/// for non-c-contiguous targets like channels-last.
+///
+/// For an `ndim`-dimensional input shape `[d0, d1, ..., d_{n-1}]`:
+///
+/// - `Contiguous` → identity `[0, 1, 2, ..., n-1]`. Linear iteration
+///   over the c-contiguous output is the same as iterating dim 0
+///   slowest.
+/// - `ChannelsLast` (4D, NCHW input → NHWC output): `[0, 2, 3, 1]`.
+///   Iterating output[n*HWC + h*WC + w*C + c] linearly produces the
+///   coordinate sequence (n, h, w, c), so we want input dim mapping
+///   {output 0 → input N=0, output 1 → input H=2, output 2 → input
+///   W=3, output 3 → input C=1}.
+/// - `ChannelsLast3d` (5D, NCDHW → NDHWC): `[0, 2, 3, 4, 1]`. Same
+///   reasoning extended to volumetric tensors.
+///
+/// `ndim` is taken as a parameter so callers can pass it without
+/// re-computing from the input. The function only returns
+/// non-identity permutations for the formats whose rank constraints
+/// are satisfied; everything else returns the identity.
+///
+/// CL-455.
+fn format_permutation(format: MemoryFormat, ndim: usize) -> Vec<usize> {
+    match format {
+        MemoryFormat::ChannelsLast if ndim == 4 => vec![0, 2, 3, 1],
+        MemoryFormat::ChannelsLast3d if ndim == 5 => vec![0, 2, 3, 4, 1],
+        // Contiguous (or any rank-mismatched format that the caller
+        // already validated): identity permutation.
+        _ => (0..ndim).collect(),
+    }
+}
+
 /// [CL-309] WU-05: channels-last memory format support
 fn strides_match_with_size1(shape: &[usize], actual: &[isize], expected: &[isize]) -> bool {
     if actual.len() != expected.len() {
