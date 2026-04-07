@@ -464,6 +464,19 @@ pub fn rearrange<T: Float>(input: &Tensor<T>, pattern: &str) -> FerrotorchResult
 /// // Split a dimension: [B, C*H, W] -> [B, C, H, W] with C=3
 /// rearrange_with(&t, "b (c h) w -> b c h w", &[("c", 3)])?;
 /// ```
+///
+/// # Device behavior
+///
+/// When the operation reduces to a pure flatten/unflatten (no axis reordering
+/// at the elementary level — e.g. `"b c h w -> b (c h w)"` or
+/// `"b (c h) w -> b c h w"`), this is a zero-copy `view_reshape` and runs on
+/// any device with no data movement.
+///
+/// When the operation requires actual axis reordering (e.g. `"b h w c -> b c h w"`),
+/// it goes through `view_reshape → permute → contiguous → view_reshape`. The
+/// `permute` is a zero-copy stride view, but `contiguous` currently materializes
+/// non-contiguous CUDA tensors via a CPU round-trip — see issue #496 for the
+/// missing GPU `gpu_strided_copy` primitive that would close this gap.
 pub fn rearrange_with<T: Float>(
     input: &Tensor<T>,
     pattern: &str,
@@ -491,6 +504,62 @@ pub fn rearrange_with<T: Float>(
     }
 
     let out_shape = output_shape(&parsed.right, &sizes);
+    let left_elem_shape = elementary_shape(&parsed.left, &sizes);
+    let right_elem_shape = elementary_shape(&parsed.right, &sizes);
+
+    // Compute the permutation from left elementary order to right elementary
+    // order. Since left and right name the same axes, every right axis has a
+    // unique position in left.
+    let perm: Vec<usize> = right_names
+        .iter()
+        .map(|name| {
+            left_names
+                .iter()
+                .position(|n| n == name)
+                .expect("axis sets validated to match above")
+        })
+        .collect();
+
+    // Fast path: identity permutation. This covers the common cases of pure
+    // flatten (`"b c h w -> b (c h w)"`), pure unflatten
+    // (`"b (c h) w -> b c h w"`), and grouping rearrangements where the
+    // elementary axis order matches between left and right. No data movement
+    // — runs zero-copy on any device (CPU or CUDA) when input is contiguous.
+    let is_identity_perm = perm.iter().enumerate().all(|(i, &p)| i == p);
+    if is_identity_perm && input.is_contiguous() {
+        // Skip the intermediate elementary shape entirely — direct
+        // view_reshape from input shape to output shape.
+        return input.view_reshape(out_shape);
+    }
+
+    // General path: reshape to elementary form, permute, materialize, reshape
+    // to merged output. On CUDA, the contiguous() step currently materializes
+    // strided tensors via CPU (issue #496). On CPU it's all in-place loops.
+    //
+    // We try the tensor-op path first; if any step fails (e.g. an inner op
+    // doesn't yet support a particular shape), we fall back to the legacy
+    // index-walk implementation below.
+    if input.is_contiguous() {
+        if let Ok(result) = (|| -> FerrotorchResult<Tensor<T>> {
+            let elem_view = input.view_reshape(left_elem_shape.clone())?;
+            let permuted = elem_view.permute(&perm)?;
+            let contig = permuted.contiguous()?;
+            // Reshape from right_elem_shape (now contiguous) to merged output.
+            // contig already has shape == right_elem_shape; if out_shape merges
+            // some axes, view_reshape will collapse them.
+            if contig.shape() == out_shape.as_slice() {
+                Ok(contig)
+            } else {
+                contig.view_reshape(out_shape.clone())
+            }
+        })() {
+            return Ok(result);
+        }
+    }
+
+    // Legacy fallback: pure-CPU index-walk. Used when the tensor-op path
+    // refuses (e.g. non-contiguous input) or errors.
+    let _ = right_elem_shape; // silence unused warning when fast paths take over
     let device = input.device();
     let data = input.data_vec()?;
     let result_data = rearrange_impl(&data, input.shape(), &parsed, &sizes, &out_shape)?;
@@ -631,6 +700,125 @@ pub fn reduce<T: Float>(
     let right_elem_shape = elementary_shape(&parsed.right, &sizes);
     let out_shape = output_shape(&parsed.right, &sizes);
 
+    // ----------------------------------------------------------------------
+    // Fast path: axis-aligned reductions via existing GPU-aware tensor ops.
+    //
+    // This path triggers when:
+    //   1. The kept axes (left ∩ right) appear in the same relative order on
+    //      both sides (no reordering needed for the kept axes).
+    //   2. The reduced axes are contiguous in left elementary order — i.e.
+    //      they form a single run within the left axis sequence.
+    //
+    // When both hold, we can express the reduction as:
+    //   view_reshape(input, [outer_kept, reduced_combined, inner_kept])
+    //   → sum_dim(dim=1, keepdim=false)        for Sum/Mean
+    //   → cummax/cummin → narrow(last)         for Max/Min
+    //   → view_reshape(out_shape)
+    //
+    // All steps run on the input's native device — no CPU round-trip.
+    //
+    // For Mean, we follow the sum_dim with a scalar multiply by 1/reduce_count
+    // (cheaper than dividing every element through a separate kernel and
+    // works on GPU since `mul` is GPU-aware).
+    // ----------------------------------------------------------------------
+    let kept_left_positions: Vec<usize> = left_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| if right_names.contains(name) { Some(i) } else { None })
+        .collect();
+    let reduced_left_positions: Vec<usize> = left_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| if !right_names.contains(name) { Some(i) } else { None })
+        .collect();
+
+    // Are the reduced axes contiguous in left order?
+    let reduced_contiguous = reduced_left_positions.windows(2).all(|w| w[1] == w[0] + 1);
+
+    // Are the kept axes in the same relative order on right as on left?
+    // Build the sequence of kept names in left order, then check it matches
+    // the sequence of right_names that are kept (= all right names, since
+    // every right axis is kept by construction).
+    let kept_in_left_order: Vec<&String> = kept_left_positions
+        .iter()
+        .map(|&i| &left_names[i])
+        .collect();
+    let kept_order_matches = kept_in_left_order.len() == right_names.len()
+        && kept_in_left_order
+            .iter()
+            .zip(right_names.iter())
+            .all(|(a, b)| *a == b);
+
+    if reduced_contiguous && kept_order_matches && input.is_contiguous() {
+        let reduced_start = reduced_left_positions[0];
+        let reduced_len = reduced_left_positions.len();
+
+        // Build the 3-D view shape: [outer, reduced_combined, inner].
+        let outer: usize = left_elem_shape[..reduced_start].iter().product();
+        let reduced_combined: usize = left_elem_shape
+            [reduced_start..reduced_start + reduced_len]
+            .iter()
+            .product();
+        let inner: usize = left_elem_shape[reduced_start + reduced_len..].iter().product();
+
+        if let Ok(result) = (|| -> FerrotorchResult<Tensor<T>> {
+            let view = input.view_reshape(vec![outer, reduced_combined, inner])?;
+            let reduced_tensor = match reduction {
+                EinopsReduction::Sum => crate::grad_fns::reduction::sum_dim(&view, 1, false)?,
+                EinopsReduction::Mean => {
+                    // sum_dim is GPU-aware; mean_dim is not. Compose
+                    // sum_dim → multiply by 1/N to stay on-device.
+                    let summed = crate::grad_fns::reduction::sum_dim(&view, 1, false)?;
+                    let n_recip = <T as num_traits::One>::one()
+                        / T::from(reduced_combined).unwrap();
+                    let scale_t = crate::creation::scalar(n_recip)?.to(input.device())?;
+                    crate::grad_fns::arithmetic::mul(&summed, &scale_t)?
+                }
+                EinopsReduction::Max => {
+                    // cummax along dim 1, then narrow to the last index.
+                    // The running max ends with the global max along that axis.
+                    let cmax = crate::grad_fns::cumulative::cummax(&view, 1)?;
+                    let last = cmax
+                        .values
+                        .narrow(1, reduced_combined - 1, 1)?
+                        .squeeze_t(1)?;
+                    last
+                }
+                EinopsReduction::Min => {
+                    let cmin = crate::grad_fns::cumulative::cummin(&view, 1)?;
+                    let last = cmin
+                        .values
+                        .narrow(1, reduced_combined - 1, 1)?
+                        .squeeze_t(1)?;
+                    last
+                }
+            };
+            // reduced_tensor has shape [outer, inner] (non-keepdim sum) or
+            // [outer, inner] (cummax narrow→squeeze). Reshape to right
+            // elementary shape, then to the merged output shape.
+            let _ = right_elem_shape.clone(); // for documentation
+            let materialized = if reduced_tensor.is_contiguous() {
+                reduced_tensor
+            } else {
+                reduced_tensor.contiguous()?
+            };
+            let final_t = if materialized.shape() == out_shape.as_slice() {
+                materialized
+            } else {
+                materialized.view_reshape(out_shape.clone())?
+            };
+            Ok(final_t)
+        })() {
+            return Ok(result);
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Fallback: legacy CPU index-walk implementation. Used when the kept
+    // axes need reordering, or the reduced axes are not contiguous in the
+    // left layout, or any of the GPU-aware ops above bail. Functionally
+    // equivalent — same result, but does a CPU round-trip on CUDA inputs.
+    // ----------------------------------------------------------------------
     let out_numel: usize = right_elem_shape.iter().product();
     let device = input.device();
     let data = input.data_vec()?;
@@ -642,9 +830,6 @@ pub fn reduce<T: Float>(
         .map(|name| sizes.get(name.as_str()).unwrap())
         .product();
 
-    // Accumulate: for each input element, figure out which output element
-    // it contributes to.
-    // Initialize accumulators.
     let init_val = match reduction {
         EinopsReduction::Sum | EinopsReduction::Mean => <T as num_traits::Zero>::zero(),
         EinopsReduction::Max => T::neg_infinity(),
@@ -654,7 +839,6 @@ pub fn reduce<T: Float>(
 
     for (src_flat, &val) in data.iter().enumerate().take(in_numel) {
         let src_coords = flat_to_coords(src_flat, &left_elem_shape);
-        // Map to output coordinates: keep only the axes that survive.
         let mut dst_coords = Vec::with_capacity(right_elem_shape.len());
         for (i, name) in left_names.iter().enumerate() {
             if right_names.contains(name) {
@@ -680,7 +864,6 @@ pub fn reduce<T: Float>(
         }
     }
 
-    // For mean, divide by the number of reduced elements.
     if reduction == EinopsReduction::Mean {
         let n = T::from(reduce_count).unwrap();
         for v in &mut accum {
@@ -959,5 +1142,109 @@ mod tests {
             AxisSpec::Group(names) => assert_eq!(names, &["c", "h"]),
             _ => panic!("expected Group"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GPU-aware fast-path tests (run on CPU but exercise the same code path
+    // that is taken on CUDA — verifies the view_reshape / sum_dim / cummax
+    // compositions are correct).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rearrange_identity_perm_is_view() {
+        // Pure flatten — should hit the identity-permutation fast path and
+        // share storage with the input (zero-copy view).
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = leaf(&data, &[2, 3, 2, 2]);
+        let r = rearrange(&t, "b c h w -> b (c h w)").unwrap();
+        assert_eq!(r.shape(), &[2, 12]);
+        // Same buffer pointer indicates a zero-copy view (no materialization).
+        assert!(
+            std::ptr::eq(r.data().unwrap().as_ptr(), t.data().unwrap().as_ptr()),
+            "expected view_reshape fast path to share storage with input"
+        );
+    }
+
+    #[test]
+    fn test_rearrange_pure_unflatten_is_view() {
+        // Split a dim — also identity perm, also zero-copy.
+        let data: Vec<f32> = (0..48).map(|i| i as f32).collect();
+        let t = leaf(&data, &[2, 6, 4]);
+        let r = rearrange_with(&t, "b (c h) w -> b c h w", &[("c", 3)]).unwrap();
+        assert_eq!(r.shape(), &[2, 3, 2, 4]);
+        assert!(
+            std::ptr::eq(r.data().unwrap().as_ptr(), t.data().unwrap().as_ptr()),
+            "expected view_reshape fast path to share storage with input"
+        );
+    }
+
+    #[test]
+    fn test_reduce_sum_axis_aligned_fast_path() {
+        // "b c h w -> b c" with reduced axes (h,w) contiguous at the end —
+        // hits the sum_dim fast path. Verify correctness against PyTorch
+        // semantics: sum over h*w within each (b,c).
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = leaf(&data, &[1, 2, 3, 4]); // B=1, C=2, H=3, W=4
+        let r = reduce(&t, "b c h w -> b c", EinopsReduction::Sum).unwrap();
+        assert_eq!(r.shape(), &[1, 2]);
+        let out = r.data().unwrap();
+        // Channel 0: sum(0..12) = 66
+        // Channel 1: sum(12..24) = 210
+        assert!((out[0] - 66.0).abs() < 1e-5);
+        assert!((out[1] - 210.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_mean_axis_aligned_fast_path() {
+        // Same shape as above; verify mean = sum / N for the fast path.
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = leaf(&data, &[1, 2, 3, 4]);
+        let r = reduce(&t, "b c h w -> b c", EinopsReduction::Mean).unwrap();
+        assert_eq!(r.shape(), &[1, 2]);
+        let out = r.data().unwrap();
+        // Channel 0: 66 / 12 = 5.5
+        // Channel 1: 210 / 12 = 17.5
+        assert!((out[0] - 5.5).abs() < 1e-5);
+        assert!((out[1] - 17.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_max_axis_aligned_fast_path() {
+        // Reduced axis is contiguous — hits cummax fast path.
+        let data = vec![1.0f32, 5.0, 3.0, 2.0, 4.0, 6.0];
+        let t = leaf(&data, &[3, 2]);
+        let r = reduce(&t, "b c -> c", EinopsReduction::Max).unwrap();
+        assert_eq!(r.shape(), &[2]);
+        let out = r.data().unwrap();
+        // Reduced axis is `b`, which is left position 0, so the kept axis
+        // (c) appears AFTER the reduced axis. That means kept axes are not
+        // a leading prefix; depending on interpretation this may take the
+        // fallback. Either way the answer must be correct.
+        assert!((out[0] - 4.0).abs() < 1e-6);
+        assert!((out[1] - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reduce_min_axis_aligned_fast_path() {
+        let data = vec![1.0f32, 5.0, 3.0, 2.0, 4.0, 6.0];
+        let t = leaf(&data, &[3, 2]);
+        let r = reduce(&t, "b c -> c", EinopsReduction::Min).unwrap();
+        assert_eq!(r.shape(), &[2]);
+        let out = r.data().unwrap();
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        assert!((out[1] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reduce_sum_trailing_reduce_full_pool() {
+        // "b c h w -> b" reduces c, h, w (all contiguous trailing axes).
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = leaf(&data, &[2, 2, 2, 3]);
+        let r = reduce(&t, "b c h w -> b", EinopsReduction::Sum).unwrap();
+        assert_eq!(r.shape(), &[2]);
+        let out = r.data().unwrap();
+        // First batch: sum 0..12 = 66; second batch: sum 12..24 = 210.
+        assert!((out[0] - 66.0).abs() < 1e-5);
+        assert!((out[1] - 210.0).abs() < 1e-5);
     }
 }
