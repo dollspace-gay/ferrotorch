@@ -4,6 +4,57 @@ use std::sync::{LazyLock, RwLock};
 use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float};
 use ferrotorch_nn::Module;
 
+/// Helper used by registry constructors: build an architecture, then if
+/// `pretrained == true` look up `hub_name` in `ferrotorch_hub`, fetch
+/// the cached or downloaded weights, and load them into the model via
+/// `load_state_dict(strict=false)`.
+///
+/// Returns the same model as `build()` would when `pretrained == false`.
+/// When `pretrained == true` and the hub lookup fails (unknown name,
+/// network error, missing cache, SHA mismatch), the error is propagated
+/// to the caller — failing loudly is the right behavior here, since the
+/// caller explicitly asked for pretrained weights.
+fn maybe_load_pretrained<T, F, M>(
+    pretrained: bool,
+    hub_name: &str,
+    build: F,
+) -> FerrotorchResult<Box<dyn Module<T>>>
+where
+    T: Float,
+    F: FnOnce() -> FerrotorchResult<M>,
+    M: Module<T> + 'static,
+{
+    let mut model = build()?;
+    if pretrained {
+        // Look up by hub name. If the hub doesn't know this model yet
+        // (e.g. vit_b_16 isn't published), bubble up a helpful error.
+        let info = ferrotorch_hub::registry::get_model_info(hub_name).ok_or_else(|| {
+            FerrotorchError::InvalidArgument {
+                message: format!(
+                    "ferrotorch-vision: pretrained=true was requested for '{hub_name}' \
+                     but no entry exists in ferrotorch_hub::registry. Either pass \
+                     pretrained=false, register the model in ferrotorch_hub, or load \
+                     weights manually from a SafeTensors file."
+                ),
+            }
+        })?;
+        let cache = ferrotorch_hub::cache::HubCache::with_default_dir();
+        let path = ferrotorch_hub::download::download_weights(info, &cache)?;
+        let state_dict = match info.format {
+            ferrotorch_hub::registry::WeightsFormat::SafeTensors => {
+                ferrotorch_serialize::load_safetensors::<T>(&path)?
+            }
+            ferrotorch_hub::registry::WeightsFormat::FerrotorchStateDict => {
+                ferrotorch_serialize::load_state_dict::<T>(&path)?
+            }
+        };
+        // strict=false so missing keys (e.g. classifier head reshaped to
+        // a custom num_classes) don't break loading the backbone.
+        model.load_state_dict(&state_dict, false)?;
+    }
+    Ok(Box::new(model))
+}
+
 /// A factory function that constructs a model given `pretrained` and `num_classes`.
 pub type ModelConstructor<T> =
     Box<dyn Fn(bool, usize) -> FerrotorchResult<Box<dyn Module<T>>> + Send + Sync>;
@@ -60,91 +111,109 @@ impl<T: Float> ModelRegistry<T> {
 fn default_registry() -> ModelRegistry<f32> {
     let mut registry = ModelRegistry::new();
 
+    // Each constructor calls maybe_load_pretrained, which builds the
+    // architecture and (when pretrained == true) downloads + verifies
+    // weights via ferrotorch_hub and loads them with strict=false. The
+    // string passed to the helper is the registry key in
+    // ferrotorch_hub::registry; if the hub does not yet have an entry
+    // for this architecture, the user gets a clear error pointing them
+    // at how to fix it.
     registry.register_model(
         "resnet18",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::resnet::resnet18::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "resnet18", || {
+                super::resnet::resnet18::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "resnet34",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::resnet::resnet34::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "resnet34", || {
+                super::resnet::resnet34::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "resnet50",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::resnet::resnet50::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "resnet50", || {
+                super::resnet::resnet50::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "vgg11",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::vgg::vgg11::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "vgg11", || {
+                super::vgg::vgg11::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "vgg16",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::vgg::vgg16::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "vgg16", || {
+                super::vgg::vgg16::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "vit_b_16",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::vit::vit_b_16::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "vit_b_16", || {
+                super::vit::vit_b_16::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "efficientnet_b0",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::efficientnet::efficientnet_b0::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "efficientnet_b0", || {
+                super::efficientnet::efficientnet_b0::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "swin_tiny",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::swin::swin_tiny::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "swin_tiny", || {
+                super::swin::swin_tiny::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "unet",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::unet::unet::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "unet", || {
+                super::unet::unet::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "convnext_tiny",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::convnext::convnext_tiny::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "convnext_tiny", || {
+                super::convnext::convnext_tiny::<f32>(num_classes)
+            })
         }),
     );
 
     registry.register_model(
         "yolo",
-        Box::new(|_pretrained, num_classes| {
-            let model = super::yolo::yolo::<f32>(num_classes)?;
-            Ok(Box::new(model))
+        Box::new(|pretrained, num_classes| {
+            maybe_load_pretrained(pretrained, "yolo", || {
+                super::yolo::yolo::<f32>(num_classes)
+            })
         }),
     );
 
@@ -272,6 +341,38 @@ mod tests {
         assert!(result.is_ok(), "resnet18 should construct successfully");
         let model = result.unwrap();
         assert!(!model.parameters().is_empty());
+    }
+
+    #[test]
+    fn test_pretrained_lookup_known_model_in_hub() {
+        // Every architecture in the vision registry should also have an
+        // entry in the hub registry, so requesting pretrained=true at
+        // least gets past the get_model_info check. (We can't actually
+        // verify the download here without network access.)
+        let vision_names = list_models();
+        for name in vision_names {
+            let info = ferrotorch_hub::registry::get_model_info(&name);
+            assert!(
+                info.is_some(),
+                "vision model '{name}' has no entry in ferrotorch_hub::registry; \
+                 add one in ferrotorch-hub/src/registry.rs so pretrained=true works"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pretrained_false_constructs_without_network() {
+        // pretrained=false must never touch the network or hub cache.
+        // We can't easily prove "no network" here, but we can verify
+        // the path completes successfully for every registered model.
+        for name in list_models() {
+            let result = get_model(&name, false, 10);
+            assert!(
+                result.is_ok(),
+                "model '{name}' failed to construct with pretrained=false: {:?}",
+                result.err()
+            );
+        }
     }
 
     #[test]
