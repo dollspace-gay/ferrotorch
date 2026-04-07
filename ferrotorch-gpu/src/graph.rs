@@ -89,9 +89,24 @@ impl<T: DeviceRepr + ValidAsZeroBits + Copy> DeviceScalar<T> {
 /// Created via [`begin_capture`] + GPU ops + [`end_capture`].
 /// The graph holds references to all device memory used during capture.
 /// Those buffers must remain allocated for the lifetime of the graph.
+///
+/// **Allocator pool integration (CL-278).** When created via
+/// [`end_capture_with_pool`], the graph holds a strong reference to
+/// the [`CapturePool`] that recorded its allocations. The pool keeps
+/// every registered buffer alive until the last `CapturedGraph`
+/// referencing it is dropped, which guarantees the device pointers
+/// recorded in the graph remain valid across replays. Without the
+/// pool, callers must manually keep buffers alive (the original
+/// [`end_capture`] API).
 #[cfg(feature = "cuda")]
 pub struct CapturedGraph {
     graph: cudarc::driver::CudaGraph,
+    /// Optional reference to the pool that owns the graph's
+    /// allocations. Some(pool) when constructed via
+    /// [`end_capture_with_pool`]. Dropping the graph drops this
+    /// Arc, which (if it's the last reference) drops every buffer
+    /// the pool holds. CL-278.
+    pool: Option<Arc<CapturePool>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -104,6 +119,20 @@ impl CapturedGraph {
     pub fn launch(&self) -> GpuResult<()> {
         self.graph.launch()?;
         Ok(())
+    }
+
+    /// Number of buffers held alive by this graph's allocator pool.
+    /// Returns 0 if the graph was created without a pool. CL-278.
+    pub fn pool_buffer_count(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map(|p| p.buffer_count())
+            .unwrap_or(0)
+    }
+
+    /// True if this graph holds a CapturePool reference. CL-278.
+    pub fn has_pool(&self) -> bool {
+        self.pool.is_some()
     }
 }
 
@@ -135,6 +164,11 @@ pub fn begin_capture(stream: &Arc<CudaStream>) -> GpuResult<()> {
 /// End CUDA graph capture, instantiate, and return the replayable graph.
 ///
 /// Returns `Err` if capture was not active or if instantiation fails.
+///
+/// The returned graph has no [`CapturePool`] attached. The caller is
+/// responsible for keeping the buffers used by the captured kernels
+/// alive for the graph's lifetime. Use [`end_capture_with_pool`]
+/// for the lifetime-managed variant.
 #[cfg(feature = "cuda")]
 pub fn end_capture(stream: &Arc<CudaStream>) -> GpuResult<CapturedGraph> {
     let flags = cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
@@ -143,7 +177,31 @@ pub fn end_capture(stream: &Arc<CudaStream>) -> GpuResult<CapturedGraph> {
         .ok_or(GpuError::PtxCompileFailed {
             kernel: "CUDA graph capture returned null",
         })?;
-    Ok(CapturedGraph { graph })
+    Ok(CapturedGraph { graph, pool: None })
+}
+
+/// End CUDA graph capture and attach a [`CapturePool`] reference to
+/// the resulting [`CapturedGraph`]. CL-278.
+///
+/// The pool's tracked buffers are kept alive for the lifetime of the
+/// returned graph: dropping the graph drops its `Arc<CapturePool>`,
+/// which (if it's the last reference) drops every buffer the pool
+/// recorded. This guarantees that the device pointers recorded in
+/// the captured graph remain valid across replays.
+///
+/// Use this in concert with [`CapturePool::record_buffer`]: allocate
+/// every buffer used during capture before calling `begin_capture`,
+/// register each one with the pool, run the kernels under capture,
+/// then call `end_capture_with_pool(stream, pool)` to seal the
+/// lifetime relationship.
+#[cfg(feature = "cuda")]
+pub fn end_capture_with_pool(
+    stream: &Arc<CudaStream>,
+    pool: Arc<CapturePool>,
+) -> GpuResult<CapturedGraph> {
+    let mut graph = end_capture(stream)?;
+    graph.pool = Some(pool);
+    Ok(graph)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,24 +210,46 @@ pub fn end_capture(stream: &Arc<CudaStream>) -> GpuResult<CapturedGraph> {
 
 /// A dedicated memory pool for CUDA graph capture.
 ///
-/// During graph capture, allocations must come from a pool that is not
-/// sealed. Once sealed, the pool rejects new allocations — this is used
-/// to ensure that all buffers are pre-allocated before capture begins.
+/// Two responsibilities:
+///
+/// 1. **Sealed flag** — gates [`begin_capture_with_pool`] so the
+///    caller can express "no more allocations after this point"
+///    semantically. Sealed pools cannot satisfy new allocations
+///    during capture.
+///
+/// 2. **Buffer lifetime tracking (CL-278)** — registered buffers
+///    are kept alive by the pool itself, so they outlive any
+///    [`CapturedGraph`] that holds an `Arc<CapturePool>`. Dropping
+///    the graph drops the Arc, and dropping the last Arc drops
+///    every registered buffer in registration order.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// let pool = CapturePool::new();
-/// // ... allocate buffers from pool ...
-/// pool.seal();  // no more allocations allowed
+/// use std::sync::Arc;
+/// let pool = Arc::new(CapturePool::new());
 ///
-/// // begin_capture_with_pool(&pool, stream) would fail here because
-/// // the pool is sealed — you can't allocate during capture from a
-/// // sealed pool. Un-seal it first or use a fresh pool.
+/// // Allocate every buffer the captured kernels will read or
+/// // write, and register each one with the pool so it stays alive
+/// // for the graph's lifetime.
+/// let mut buf_a = alloc_zeros_f32(1024, &device)?;
+/// let mut buf_b = alloc_zeros_f32(1024, &device)?;
+/// pool.record_buffer(buf_a.try_clone()?);
+/// pool.record_buffer(buf_b.try_clone()?);
+///
+/// pool.seal();
+/// begin_capture_with_pool(&pool, stream)?;
+/// // ... launch kernels using buf_a and buf_b ...
+/// let graph = end_capture_with_pool(stream, Arc::clone(&pool))?;
+/// // Dropping `pool` here is safe — the graph holds its own Arc.
 /// ```
 #[cfg(feature = "cuda")]
 pub struct CapturePool {
     sealed: std::sync::atomic::AtomicBool,
+    /// Registered buffers (type-erased) kept alive for the graph's
+    /// lifetime. Each entry is a Box<dyn Any + Send + Sync> wrapping
+    /// the buffer's drop guard. CL-278.
+    buffers: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send + Sync + 'static>>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -178,6 +258,7 @@ impl CapturePool {
     pub fn new() -> Self {
         Self {
             sealed: std::sync::atomic::AtomicBool::new(false),
+            buffers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -196,6 +277,55 @@ impl CapturePool {
     /// Check whether the pool is sealed.
     pub fn is_capture_pool_sealed(&self) -> bool {
         self.sealed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Register a buffer with the pool so it stays alive for the
+    /// lifetime of any [`CapturedGraph`] that holds this pool.
+    /// CL-278.
+    ///
+    /// `buffer` can be any type that owns GPU memory (typically
+    /// `CudaBuffer<f32>`, `CudaBuffer<f64>`, or `Arc<CudaBuffer<T>>`).
+    /// The pool stores it in a type-erased `Box<dyn Any + Send +
+    /// Sync>` and drops it (in registration order) when the pool
+    /// itself is dropped.
+    ///
+    /// Returns the index of the registered buffer for diagnostic
+    /// purposes.
+    pub fn record_buffer<B>(&self, buffer: B) -> usize
+    where
+        B: Send + Sync + 'static,
+    {
+        let mut guard = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let idx = guard.len();
+        guard.push(Box::new(buffer));
+        idx
+    }
+
+    /// Number of buffers currently registered with the pool. CL-278.
+    pub fn buffer_count(&self) -> usize {
+        self.buffers
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or(0)
+    }
+
+    /// Drop every registered buffer immediately, in registration
+    /// order. The pool itself remains usable; new buffers can still
+    /// be registered after this call. CL-278.
+    ///
+    /// Use this when reusing a pool across multiple capture cycles.
+    /// Calling clear while a [`CapturedGraph`] still holds an Arc
+    /// to this pool is safe — the graph's strong reference keeps
+    /// the pool struct alive, but the buffer slots are reset.
+    pub fn clear_buffers(&self) {
+        let mut guard = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.clear();
     }
 }
 
@@ -226,22 +356,46 @@ pub fn begin_capture_with_pool(pool: &CapturePool, stream: &Arc<CudaStream>) -> 
     begin_capture(stream)
 }
 
-/// Stub CapturePool when cuda feature is disabled.
+/// Stub CapturePool when cuda feature is disabled. Provides the
+/// same surface API as the cuda-enabled type so callers compile on
+/// both feature configurations.
 #[cfg(not(feature = "cuda"))]
 pub struct CapturePool;
 
 #[cfg(not(feature = "cuda"))]
 impl CapturePool {
+    /// Create an empty CapturePool. Without the cuda feature the
+    /// pool has no internal state to initialize.
     pub fn new() -> Self {
         Self
     }
 
-    pub fn seal(&self) {}
+    /// No-op without the cuda feature: there is no real CUDA pool
+    /// to seal because no real allocations can happen.
+    pub fn seal(&self) {
+        // Without the cuda feature there is no allocator state to
+        // mutate; the CapturePool exists only so callers can write
+        // feature-portable code.
+    }
 
-    pub fn unseal(&self) {}
+    /// No-op without the cuda feature: there is no real CUDA pool
+    /// to unseal because no real allocations can happen.
+    pub fn unseal(&self) {
+        // Without the cuda feature there is no allocator state to
+        // mutate; the CapturePool exists only so callers can write
+        // feature-portable code.
+    }
 
+    /// Always returns `false` without the cuda feature since there
+    /// is no real pool that could be in either state.
     pub fn is_capture_pool_sealed(&self) -> bool {
         false
+    }
+
+    /// Always returns 0 without the cuda feature since no real
+    /// allocations can be tracked. CL-278.
+    pub fn buffer_count(&self) -> usize {
+        0
     }
 }
 
@@ -287,4 +441,88 @@ pub fn begin_capture<T>(_stream: &T) -> GpuResult<()> {
 #[cfg(not(feature = "cuda"))]
 pub fn end_capture<T>(_stream: &T) -> GpuResult<CapturedGraph> {
     Err(GpuError::NoCudaFeature)
+}
+
+/// Stub `end_capture_with_pool` when the cuda feature is not enabled.
+/// CL-278.
+#[cfg(not(feature = "cuda"))]
+pub fn end_capture_with_pool<T>(
+    _stream: &T,
+    _pool: std::sync::Arc<CapturePool>,
+) -> GpuResult<CapturedGraph> {
+    Err(GpuError::NoCudaFeature)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — CL-278 capture pool buffer tracking
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_pool_buffer_count_starts_at_zero() {
+        let pool = CapturePool::new();
+        assert_eq!(pool.buffer_count(), 0);
+    }
+
+    #[test]
+    fn capture_pool_record_buffer_increments_count() {
+        let pool = CapturePool::new();
+        let buf_a: Vec<f32> = vec![0.0; 10];
+        let idx = pool.record_buffer(buf_a);
+        assert_eq!(idx, 0);
+        assert_eq!(pool.buffer_count(), 1);
+
+        let buf_b: Vec<f64> = vec![0.0; 5];
+        let idx = pool.record_buffer(buf_b);
+        assert_eq!(idx, 1);
+        assert_eq!(pool.buffer_count(), 2);
+    }
+
+    #[test]
+    fn capture_pool_clear_buffers_resets_count_but_keeps_pool() {
+        let pool = CapturePool::new();
+        pool.record_buffer(vec![0u8; 16]);
+        pool.record_buffer(vec![0u8; 32]);
+        assert_eq!(pool.buffer_count(), 2);
+        pool.clear_buffers();
+        assert_eq!(pool.buffer_count(), 0);
+        // Pool is still usable.
+        pool.record_buffer(vec![0u8; 8]);
+        assert_eq!(pool.buffer_count(), 1);
+    }
+
+    #[test]
+    fn capture_pool_drop_releases_registered_buffers() {
+        // Use Arc to detect when the inner buffer is dropped.
+        let buf = Arc::new(vec![1.0f32, 2.0, 3.0]);
+        let pool = CapturePool::new();
+        pool.record_buffer(Arc::clone(&buf));
+        assert_eq!(Arc::strong_count(&buf), 2);
+        drop(pool);
+        // Pool dropped → recorded Arc dropped → strong count back to 1.
+        assert_eq!(Arc::strong_count(&buf), 1);
+    }
+
+    #[test]
+    fn capture_pool_records_heterogeneous_types() {
+        let pool = CapturePool::new();
+        pool.record_buffer(vec![0.0f32; 4]);
+        pool.record_buffer(vec![0.0f64; 4]);
+        pool.record_buffer(vec![0u8; 4]);
+        pool.record_buffer(Arc::new(42i32));
+        assert_eq!(pool.buffer_count(), 4);
+    }
+
+    #[test]
+    fn capture_pool_seal_unseal() {
+        let pool = CapturePool::new();
+        assert!(!pool.is_capture_pool_sealed());
+        pool.seal();
+        assert!(pool.is_capture_pool_sealed());
+        pool.unseal();
+        assert!(!pool.is_capture_pool_sealed());
+    }
 }
