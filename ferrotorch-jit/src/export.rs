@@ -126,6 +126,7 @@ impl InputSpec {
 /// covers the dominant inference dtype but means that models trained in
 /// f64 will have their weights truncated to f32 when exported. A future
 /// version will support generic or mixed-precision state dicts.
+#[derive(Debug, Clone)]
 pub struct ExportedProgram {
     /// The traced IR graph.
     pub graph: IrGraph,
@@ -159,6 +160,288 @@ impl ExportedProgram {
     /// returning a tuple of tensors) is planned for a future release.
     pub fn run<T: Float>(&self, inputs: &[Tensor<T>]) -> FerrotorchResult<Tensor<T>> {
         crate::interpret(&self.graph, inputs)
+    }
+
+    /// Serialize this `ExportedProgram` to a compact binary byte vector.
+    ///
+    /// The format is self-contained and deterministic: it layers a
+    /// magic header on top of the existing [`IrGraph::serialize`]
+    /// format and appends the `state_dict`, `input_shapes`,
+    /// `input_specs`, and `output_shape` sections. Use
+    /// [`ExportedProgram::deserialize`] to reconstruct.
+    ///
+    /// This is the preferred path for round-tripping an
+    /// `ExportedProgram` to disk — see [`save`](Self::save) for the
+    /// file-writing convenience wrapper. CL-296.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4096);
+
+        // Header: magic "FTEP" + version 1.
+        out.extend_from_slice(b"FTEP");
+        out.extend_from_slice(&1u32.to_le_bytes());
+
+        // Embed the graph via its own serializer. Prefix with length
+        // so the deserializer can skip it if the graph format is
+        // bumped independently of this one.
+        let graph_bytes = self.graph.serialize();
+        out.extend_from_slice(&(graph_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&graph_bytes);
+
+        // input_shapes: [n] × [rank, dims...]
+        out.extend_from_slice(&(self.input_shapes.len() as u32).to_le_bytes());
+        for shape in &self.input_shapes {
+            out.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+            for &d in shape {
+                out.extend_from_slice(&(d as u64).to_le_bytes());
+            }
+        }
+
+        // output_shape: [rank, dims...]
+        out.extend_from_slice(&(self.output_shape.len() as u32).to_le_bytes());
+        for &d in &self.output_shape {
+            out.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+
+        // input_specs: [n] × InputSpec. Each spec is [rank] ×
+        //   tag u8 — 0 = Static, 1 = Dynamic
+        //   if Static: u64 size
+        //   if Dynamic: string_len u32, string bytes, has_min u8,
+        //               (u64 min if has_min), has_max u8, (u64 max
+        //               if has_max).
+        out.extend_from_slice(&(self.input_specs.len() as u32).to_le_bytes());
+        for spec in &self.input_specs {
+            out.extend_from_slice(&(spec.shape.len() as u32).to_le_bytes());
+            for dim in &spec.shape {
+                match dim {
+                    DimSpec::Static(v) => {
+                        out.push(0);
+                        out.extend_from_slice(&(*v as u64).to_le_bytes());
+                    }
+                    DimSpec::Dynamic { name, min, max } => {
+                        out.push(1);
+                        let bytes = name.as_bytes();
+                        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        out.extend_from_slice(bytes);
+                        match min {
+                            Some(m) => {
+                                out.push(1);
+                                out.extend_from_slice(&(*m as u64).to_le_bytes());
+                            }
+                            None => out.push(0),
+                        }
+                        match max {
+                            Some(m) => {
+                                out.push(1);
+                                out.extend_from_slice(&(*m as u64).to_le_bytes());
+                            }
+                            None => out.push(0),
+                        }
+                    }
+                }
+            }
+        }
+
+        // state_dict: [n_entries] × [key_len u32, key bytes, data_len u32, data f32 LE bytes]
+        let mut keys: Vec<&String> = self.state_dict.keys().collect();
+        keys.sort(); // deterministic ordering
+        out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for key in keys {
+            let kb = key.as_bytes();
+            out.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+            out.extend_from_slice(kb);
+            let data = &self.state_dict[key];
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            for &v in data {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        out
+    }
+
+    /// Reconstruct an `ExportedProgram` from bytes produced by
+    /// [`ExportedProgram::serialize`]. CL-296.
+    pub fn deserialize(data: &[u8]) -> FerrotorchResult<Self> {
+        let mut pos = 0usize;
+
+        // Helper closures — indexed reads with bounds checking.
+        fn need<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> FerrotorchResult<&'a [u8]> {
+            if data.len() < *pos + n {
+                return Err(FerrotorchError::InvalidArgument {
+                    message: format!(
+                        "ExportedProgram deserialize: unexpected EOF at {pos}, need {n}, have {}",
+                        data.len() - *pos
+                    ),
+                });
+            }
+            let slice = &data[*pos..*pos + n];
+            *pos += n;
+            Ok(slice)
+        }
+        fn read_u32(data: &[u8], pos: &mut usize) -> FerrotorchResult<u32> {
+            let b = need(data, pos, 4)?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+        fn read_u64(data: &[u8], pos: &mut usize) -> FerrotorchResult<u64> {
+            let b = need(data, pos, 8)?;
+            Ok(u64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]))
+        }
+        fn read_u8(data: &[u8], pos: &mut usize) -> FerrotorchResult<u8> {
+            let b = need(data, pos, 1)?;
+            Ok(b[0])
+        }
+
+        // Header.
+        let magic = need(data, &mut pos, 4)?;
+        if magic != b"FTEP" {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "ExportedProgram deserialize: bad magic {magic:?}, expected b\"FTEP\""
+                ),
+            });
+        }
+        let version = read_u32(data, &mut pos)?;
+        if version != 1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("ExportedProgram deserialize: unsupported version {version}"),
+            });
+        }
+
+        // Graph.
+        let graph_len = read_u32(data, &mut pos)? as usize;
+        let graph_bytes = need(data, &mut pos, graph_len)?;
+        let graph = IrGraph::deserialize(graph_bytes)?;
+
+        // input_shapes.
+        let n_inputs = read_u32(data, &mut pos)? as usize;
+        let mut input_shapes: Vec<Vec<usize>> = Vec::with_capacity(n_inputs);
+        for _ in 0..n_inputs {
+            let rank = read_u32(data, &mut pos)? as usize;
+            let mut shape = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                shape.push(read_u64(data, &mut pos)? as usize);
+            }
+            input_shapes.push(shape);
+        }
+
+        // output_shape.
+        let out_rank = read_u32(data, &mut pos)? as usize;
+        let mut output_shape: Vec<usize> = Vec::with_capacity(out_rank);
+        for _ in 0..out_rank {
+            output_shape.push(read_u64(data, &mut pos)? as usize);
+        }
+
+        // input_specs.
+        let n_specs = read_u32(data, &mut pos)? as usize;
+        let mut input_specs: Vec<InputSpec> = Vec::with_capacity(n_specs);
+        for _ in 0..n_specs {
+            let rank = read_u32(data, &mut pos)? as usize;
+            let mut dims: Vec<DimSpec> = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                let tag = read_u8(data, &mut pos)?;
+                match tag {
+                    0 => {
+                        let v = read_u64(data, &mut pos)? as usize;
+                        dims.push(DimSpec::Static(v));
+                    }
+                    1 => {
+                        let name_len = read_u32(data, &mut pos)? as usize;
+                        let name_bytes = need(data, &mut pos, name_len)?;
+                        let name = String::from_utf8(name_bytes.to_vec()).map_err(|e| {
+                            FerrotorchError::InvalidArgument {
+                                message: format!(
+                                    "ExportedProgram deserialize: invalid UTF-8 in DimSpec::Dynamic name: {e}"
+                                ),
+                            }
+                        })?;
+                        let has_min = read_u8(data, &mut pos)?;
+                        let min = if has_min != 0 {
+                            Some(read_u64(data, &mut pos)? as usize)
+                        } else {
+                            None
+                        };
+                        let has_max = read_u8(data, &mut pos)?;
+                        let max = if has_max != 0 {
+                            Some(read_u64(data, &mut pos)? as usize)
+                        } else {
+                            None
+                        };
+                        dims.push(DimSpec::Dynamic { name, min, max });
+                    }
+                    other => {
+                        return Err(FerrotorchError::InvalidArgument {
+                            message: format!(
+                                "ExportedProgram deserialize: unknown DimSpec tag {other}"
+                            ),
+                        });
+                    }
+                }
+            }
+            input_specs.push(InputSpec { shape: dims });
+        }
+
+        // state_dict.
+        let n_entries = read_u32(data, &mut pos)? as usize;
+        let mut state_dict = HashMap::with_capacity(n_entries);
+        for _ in 0..n_entries {
+            let key_len = read_u32(data, &mut pos)? as usize;
+            let key_bytes = need(data, &mut pos, key_len)?;
+            let key = String::from_utf8(key_bytes.to_vec()).map_err(|e| {
+                FerrotorchError::InvalidArgument {
+                    message: format!(
+                        "ExportedProgram deserialize: invalid UTF-8 in state_dict key: {e}"
+                    ),
+                }
+            })?;
+            let data_len = read_u32(data, &mut pos)? as usize;
+            let mut values: Vec<f32> = Vec::with_capacity(data_len);
+            for _ in 0..data_len {
+                let b = need(data, &mut pos, 4)?;
+                values.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+            state_dict.insert(key, values);
+        }
+
+        Ok(Self {
+            graph,
+            state_dict,
+            input_shapes,
+            input_specs,
+            output_shape,
+        })
+    }
+
+    /// Write this `ExportedProgram` to a file at `path` in the format
+    /// produced by [`serialize`](Self::serialize).
+    ///
+    /// The canonical extension is `.ftep` ("ferrotorch exported
+    /// program") but the format is the same regardless of extension.
+    /// CL-296.
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> FerrotorchResult<()> {
+        let bytes = self.serialize();
+        let path = path.as_ref();
+        std::fs::write(path, &bytes).map_err(|e| FerrotorchError::InvalidArgument {
+            message: format!(
+                "ExportedProgram::save: failed to write {}: {e}",
+                path.display()
+            ),
+        })?;
+        Ok(())
+    }
+
+    /// Read an `ExportedProgram` from a file produced by
+    /// [`save`](Self::save). CL-296.
+    pub fn load(path: impl AsRef<std::path::Path>) -> FerrotorchResult<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|e| FerrotorchError::InvalidArgument {
+            message: format!(
+                "ExportedProgram::load: failed to read {}: {e}",
+                path.display()
+            ),
+        })?;
+        Self::deserialize(&bytes)
     }
 
     /// Serialize the exported program to a simple JSON representation.
@@ -769,5 +1052,138 @@ mod tests {
     fn test_input_spec_mixed_has_dynamic_dims() {
         let s = InputSpec::new(vec![DimSpec::dynamic("batch"), DimSpec::Static(10)]);
         assert!(s.has_dynamic_dims());
+    }
+
+    // --- CL-296: ExportedProgram save/load roundtrip ---------------------
+
+    fn build_dummy_program() -> ExportedProgram {
+        // Build a minimal IR graph: input -> relu -> output.
+        use crate::graph::{IrGraph, IrOpKind};
+        let mut g = IrGraph::new();
+        let x = g.add_input(vec![4, 10]);
+        let (_, outs) = g.add_node(IrOpKind::Relu, vec![x], vec![vec![4, 10]]);
+        g.set_outputs(vec![outs[0]]);
+
+        let mut state_dict = HashMap::new();
+        state_dict.insert("fc.weight".to_string(), vec![1.0f32, 2.0, 3.0, 4.0]);
+        state_dict.insert("fc.bias".to_string(), vec![0.1f32, 0.2]);
+
+        ExportedProgram {
+            graph: g,
+            state_dict,
+            input_shapes: vec![vec![4, 10]],
+            input_specs: vec![InputSpec::new(vec![
+                DimSpec::dynamic_range("batch", 1, 64),
+                DimSpec::Static(10),
+            ])],
+            output_shape: vec![4, 10],
+        }
+    }
+
+    #[test]
+    fn test_exported_program_serialize_deserialize_roundtrip() {
+        let original = build_dummy_program();
+        let bytes = original.serialize();
+        assert!(bytes.starts_with(b"FTEP"));
+        let parsed = ExportedProgram::deserialize(&bytes).unwrap();
+
+        // Input shapes and output shape preserved.
+        assert_eq!(parsed.input_shapes, original.input_shapes);
+        assert_eq!(parsed.output_shape, original.output_shape);
+
+        // State dict fully preserved.
+        assert_eq!(parsed.state_dict.len(), original.state_dict.len());
+        for (k, v) in &original.state_dict {
+            assert_eq!(parsed.state_dict.get(k), Some(v));
+        }
+
+        // Input specs preserved including symbolic names and range bounds.
+        assert_eq!(parsed.input_specs.len(), 1);
+        assert_eq!(parsed.input_specs[0].shape.len(), 2);
+        match &parsed.input_specs[0].shape[0] {
+            DimSpec::Dynamic { name, min, max } => {
+                assert_eq!(name, "batch");
+                assert_eq!(*min, Some(1));
+                assert_eq!(*max, Some(64));
+            }
+            _ => panic!("expected dynamic dim 0"),
+        }
+        assert_eq!(parsed.input_specs[0].shape[1], DimSpec::Static(10));
+
+        // Graph round-tripped via IrGraph::serialize.
+        assert_eq!(parsed.graph.nodes.len(), original.graph.nodes.len());
+        assert_eq!(parsed.graph.input_values, original.graph.input_values);
+    }
+
+    #[test]
+    fn test_exported_program_save_load_file_roundtrip() {
+        let original = build_dummy_program();
+        let dir = std::env::temp_dir().join("ferrotorch_test_ep_save_load");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("program.ftep");
+        original.save(&path).unwrap();
+        assert!(path.exists());
+
+        let loaded = ExportedProgram::load(&path).unwrap();
+        assert_eq!(loaded.input_shapes, original.input_shapes);
+        assert_eq!(loaded.output_shape, original.output_shape);
+        assert_eq!(loaded.state_dict.len(), original.state_dict.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_exported_program_deserialize_rejects_bad_magic() {
+        let mut bad = vec![0u8; 16];
+        bad[..4].copy_from_slice(b"XXXX");
+        let result = ExportedProgram::deserialize(&bad);
+        assert!(result.is_err());
+        let err = format!("{}", result.err().unwrap());
+        assert!(err.contains("bad magic"), "err = {err}");
+    }
+
+    #[test]
+    fn test_exported_program_deserialize_rejects_bad_version() {
+        let mut bytes = build_dummy_program().serialize();
+        // Bump the version byte at offset 4 to something unsupported.
+        bytes[4] = 99;
+        let result = ExportedProgram::deserialize(&bytes);
+        assert!(result.is_err());
+        let err = format!("{}", result.err().unwrap());
+        assert!(err.contains("unsupported version"), "err = {err}");
+    }
+
+    #[test]
+    fn test_exported_program_serialize_is_deterministic() {
+        // Two serializations of the same program should be byte-identical
+        // (important for content-addressed storage / caching).
+        let program = build_dummy_program();
+        let a = program.serialize();
+        let b = program.serialize();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_exported_program_roundtrip_all_static_dims() {
+        let mut state_dict = HashMap::new();
+        state_dict.insert("w".to_string(), vec![1.0f32; 8]);
+
+        use crate::graph::IrGraph;
+        let mut g = IrGraph::new();
+        let _x = g.add_input(vec![2, 4]);
+
+        let program = ExportedProgram {
+            graph: g,
+            state_dict,
+            input_shapes: vec![vec![2, 4]],
+            input_specs: vec![InputSpec::all_static(&[2, 4])],
+            output_shape: vec![2, 4],
+        };
+
+        let bytes = program.serialize();
+        let parsed = ExportedProgram::deserialize(&bytes).unwrap();
+        for dim in &parsed.input_specs[0].shape {
+            assert!(matches!(dim, DimSpec::Static(_)));
+        }
     }
 }
