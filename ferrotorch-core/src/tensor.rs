@@ -799,6 +799,57 @@ impl<T: Float> Tensor<T> {
         }
     }
 
+    /// Like [`to`](Self::to), but uses pinned (page-locked) host memory for
+    /// the CPU→CUDA transfer when applicable.
+    ///
+    /// On CPU→CUDA, allocates a temporary pinned host buffer, copies the
+    /// tensor data into it, and uses DMA to transfer to the device. This is
+    /// roughly 2x faster than the regular `to()` path for large buffers
+    /// because it avoids one extra page-locked staging copy inside the CUDA
+    /// driver. For small buffers (< ~64KB) the pinning overhead may
+    /// outweigh the gain — measure before defaulting to this path.
+    ///
+    /// Behaves identically to [`to`](Self::to) for CPU→CPU, CUDA→CPU, and
+    /// cross-GPU paths (which all bypass pinned memory).
+    ///
+    /// Used by `ferrotorch_data::DataLoader` when `pin_memory(true)` is set
+    /// alongside a target device.
+    pub fn to_pinned(&self, device: Device) -> FerrotorchResult<Tensor<T>> {
+        if self.device() == device {
+            return Ok(self.clone());
+        }
+
+        // Only the CPU→CUDA case benefits from pinned memory; for everything
+        // else fall through to the regular `to()` path.
+        match (self.device(), device) {
+            (Device::Cpu, Device::Cuda(_)) => {
+                let needs_grad_fn = self.requires_grad()
+                    && !self.is_leaf()
+                    && crate::autograd::no_grad::is_grad_enabled();
+
+                // Materialize non-contiguous tensors before upload.
+                let contiguous_self = if !self.is_contiguous() {
+                    crate::methods::contiguous_t(self)?
+                } else {
+                    self.clone()
+                };
+                let cpu_data = contiguous_self.data()?;
+                // on_device_pinned takes ownership of the Vec, so we copy.
+                let owned: Vec<T> = cpu_data.to_vec();
+                let storage = TensorStorage::on_device_pinned(owned, device)?;
+                if needs_grad_fn {
+                    let grad_fn = Arc::new(ToDeviceBackward {
+                        source: self.clone(),
+                    });
+                    Tensor::from_operation(storage, self.shape().to_vec(), grad_fn)
+                } else {
+                    Tensor::from_storage(storage, self.shape().to_vec(), self.requires_grad())
+                }
+            }
+            _ => self.to(device),
+        }
+    }
+
     /// Move to CUDA device 0.
     pub fn cuda(&self) -> FerrotorchResult<Tensor<T>> {
         self.to(Device::Cuda(0))
