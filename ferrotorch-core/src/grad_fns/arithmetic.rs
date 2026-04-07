@@ -620,6 +620,12 @@ pub fn div<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
         return Ok(out);
     }
 
+    crate::profiler_hook::profile_op_scope("div", "tensor_op", &[a.shape(), b.shape()], || {
+        div_inner(a, b)
+    })
+}
+
+fn div_inner<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
@@ -710,6 +716,10 @@ pub fn neg<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(a)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("neg", "tensor_op", &[a.shape()], || neg_inner(a))
+}
+
+fn neg_inner<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if a.is_cuda() {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
@@ -823,6 +833,12 @@ pub fn pow<T: Float>(a: &Tensor<T>, exp: f64) -> FerrotorchResult<Tensor<T>> {
         let _ = exp;
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("pow", "tensor_op", &[a.shape()], || {
+        pow_inner(a, exp)
+    })
+}
+
+fn pow_inner<T: Float>(a: &Tensor<T>, exp: f64) -> FerrotorchResult<Tensor<T>> {
     if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
@@ -918,6 +934,10 @@ pub fn sqrt<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(a)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("sqrt", "tensor_op", &[a.shape()], || sqrt_inner(a))
+}
+
+fn sqrt_inner<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
@@ -1011,6 +1031,10 @@ pub fn abs<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(a)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("abs", "tensor_op", &[a.shape()], || abs_inner(a))
+}
+
+fn abs_inner<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;

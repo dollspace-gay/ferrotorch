@@ -675,6 +675,12 @@ pub fn relu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(input)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("relu", "activation", &[input.shape()], || {
+        relu_inner(input)
+    })
+}
+
+fn relu_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend =
             crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
@@ -711,6 +717,12 @@ pub fn sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(input)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("sigmoid", "activation", &[input.shape()], || {
+        sigmoid_inner(input)
+    })
+}
+
+fn sigmoid_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
         let handle = if is_f32::<T>() {
@@ -755,6 +767,12 @@ pub fn tanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(input)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("tanh", "activation", &[input.shape()], || {
+        tanh_inner(input)
+    })
+}
+
+fn tanh_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
         let handle = if is_f32::<T>() {
@@ -879,7 +897,9 @@ pub fn gelu_with<T: Float>(
 /// This matches PyTorch's `nn.GELU(approximate="none")` default. For other
 /// modes, use [`gelu_with`].
 pub fn gelu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-    gelu_with(input, GeluApproximate::default())
+    crate::profiler_hook::profile_op_scope("gelu", "activation", &[input.shape()], || {
+        gelu_with(input, GeluApproximate::default())
+    })
 }
 
 /// Compute `silu(x) = x * sigmoid(x)`, attaching a backward node when
@@ -888,6 +908,12 @@ pub fn silu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     if let Some(out) = crate::meta_propagate::unary_same_shape(input)? {
         return Ok(out);
     }
+    crate::profiler_hook::profile_op_scope("silu", "activation", &[input.shape()], || {
+        silu_inner(input)
+    })
+}
+
+fn silu_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     // GPU fast path for f32/f64
     if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
         if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
@@ -1019,6 +1045,12 @@ fn softmax_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
 /// Compute `log_softmax(x)` along the last axis, attaching a backward node
 /// when gradients are enabled.
 pub fn log_softmax<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    crate::profiler_hook::profile_op_scope("log_softmax", "activation", &[input.shape()], || {
+        log_softmax_inner(input)
+    })
+}
+
+fn log_softmax_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let shape = input.shape();
 
     // GPU fast path for f32/f64
