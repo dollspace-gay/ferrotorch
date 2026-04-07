@@ -10,7 +10,7 @@ use crate::sampler::{RandomSampler, Sampler, SequentialSampler};
 
 /// Trait for sample types that can be transferred to a target [`Device`].
 ///
-/// Implement this for your `Dataset::Sample` type to enable automatic device
+/// Provide an impl on your `Dataset::Sample` type to enable automatic device
 /// transfer via [`DataLoader::device`].
 ///
 /// # Examples
@@ -31,15 +31,53 @@ use crate::sampler::{RandomSampler, Sampler, SequentialSampler};
 ///             labels: self.labels.to(device)?,
 ///         })
 ///     }
+///
+///     // Optional: override for the pinned-memory fast path. The default
+///     // forwards to `to_device` so existing impls keep working.
+///     fn to_device_pinned(&self, device: Device) -> FerrotorchResult<Self> {
+///         Ok(MyBatch {
+///             inputs: self.inputs.to_pinned(device)?,
+///             labels: self.labels.to_pinned(device)?,
+///         })
+///     }
 /// }
 /// ```
 pub trait ToDevice: Sized {
     /// Transfer this value to the given device.
     fn to_device(&self, device: Device) -> FerrotorchResult<Self>;
+
+    /// Transfer this value to the given device using pinned (page-locked)
+    /// host memory for any CPU→GPU copies.
+    ///
+    /// The default implementation forwards to [`to_device`](Self::to_device),
+    /// preserving compatibility with existing impls. Override this when your
+    /// sample type contains tensors and you want the
+    /// [`DataLoader::pin_memory`] fast path to actually use pinned memory.
+    /// Typical override: replace any `tensor.to(device)` calls with
+    /// `tensor.to_pinned(device)`.
+    fn to_device_pinned(&self, device: Device) -> FerrotorchResult<Self> {
+        self.to_device(device)
+    }
+}
+
+/// Blanket impl: a `Tensor<T>` is itself a `ToDevice` sample. Useful for
+/// loaders that yield raw tensor batches without a wrapper struct, e.g.
+/// `DataLoader<TensorDataset<f32>>`.
+impl<T: ferrotorch_core::Float> ToDevice for ferrotorch_core::Tensor<T> {
+    fn to_device(&self, device: Device) -> FerrotorchResult<Self> {
+        self.to(device)
+    }
+    fn to_device_pinned(&self, device: Device) -> FerrotorchResult<Self> {
+        self.to_pinned(device)
+    }
 }
 
 /// Type alias for the device-transfer function stored internally.
-type TransferFn<S> = Arc<dyn Fn(Vec<S>) -> FerrotorchResult<Vec<S>> + Send + Sync>;
+///
+/// The boolean argument is the `pin_memory` flag. When `true`, the closure
+/// uses `ToDevice::to_device_pinned` (page-locked host memory + DMA);
+/// when `false`, it uses `ToDevice::to_device` (regular pageable copy).
+type TransferFn<S> = Arc<dyn Fn(Vec<S>, bool) -> FerrotorchResult<Vec<S>> + Send + Sync>;
 
 /// Type alias for the collation function stored internally.
 type CollateFn<S> = Arc<dyn Fn(Vec<S>) -> FerrotorchResult<S> + Send + Sync>;
@@ -180,9 +218,21 @@ impl<D: Dataset> DataLoader<D> {
         D::Sample: ToDevice + 'static,
     {
         self.device = Some(device);
-        self.transfer_fn = Some(Arc::new(move |samples: Vec<D::Sample>| {
-            samples.into_iter().map(|s| s.to_device(device)).collect()
-        }));
+        // The closure receives `pin_memory` as a runtime flag so the user
+        // can flip pin_memory on or off via the builder after device() has
+        // been called. The branch picks the pinned vs. regular ToDevice
+        // method based on the flag's value at call time.
+        self.transfer_fn =
+            Some(Arc::new(move |samples: Vec<D::Sample>, pin_memory: bool| {
+                if pin_memory {
+                    samples
+                        .into_iter()
+                        .map(|s| s.to_device_pinned(device))
+                        .collect()
+                } else {
+                    samples.into_iter().map(|s| s.to_device(device)).collect()
+                }
+            }));
         self
     }
 
@@ -314,6 +364,7 @@ impl<D: Dataset> DataLoader<D> {
                 self.num_workers,
                 self.prefetch_factor,
                 self.transfer_fn.clone(),
+                self.pin_memory,
             ))
         } else {
             BatchIter::Sync(DataLoaderIter {
@@ -323,6 +374,7 @@ impl<D: Dataset> DataLoader<D> {
                 drop_last: self.drop_last,
                 num_workers: self.num_workers,
                 transfer_fn: self.transfer_fn.as_ref(),
+                pin_memory: self.pin_memory,
                 pos: 0,
             })
         }
@@ -377,6 +429,9 @@ pub struct DataLoaderIter<'a, D: Dataset> {
     drop_last: bool,
     num_workers: usize,
     transfer_fn: Option<&'a TransferFn<D::Sample>>,
+    /// Whether to use pinned-memory CPU→GPU transfers in the transfer_fn.
+    /// Only meaningful when transfer_fn is set and the target device is CUDA.
+    pin_memory: bool,
     pos: usize,
 }
 
@@ -417,9 +472,10 @@ where
             Ok(batch)
         };
 
-        // Apply device transfer if configured.
+        // Apply device transfer if configured. Pass the pin_memory flag so
+        // the transfer_fn closure picks the pinned vs. regular path.
         let batch = match (batch, &self.transfer_fn) {
-            (Ok(samples), Some(f)) => f(samples),
+            (Ok(samples), Some(f)) => f(samples, self.pin_memory),
             (result, _) => result,
         };
 
@@ -467,6 +523,7 @@ where
         num_workers: usize,
         prefetch_factor: usize,
         transfer_fn: Option<TransferFn<D::Sample>>,
+        pin_memory: bool,
     ) -> Self {
         let total_batches = compute_batch_count(indices.len(), batch_size, drop_last);
 
@@ -482,6 +539,7 @@ where
                 drop_last,
                 num_workers,
                 transfer_fn,
+                pin_memory,
                 tx,
             );
         });
@@ -505,6 +563,7 @@ where
         drop_last: bool,
         num_workers: usize,
         transfer_fn: Option<TransferFn<D::Sample>>,
+        pin_memory: bool,
         tx: SyncSender<FerrotorchResult<Vec<D::Sample>>>,
     ) {
         let mut pos = 0;
@@ -544,9 +603,11 @@ where
                 }
             };
 
-            // Apply device transfer if configured.
+            // Apply device transfer if configured. Pass pin_memory so the
+            // transfer_fn closure picks the pinned-memory CPU→GPU path
+            // when both pin_memory and a CUDA target device are set.
             let batch = match (batch, &transfer_fn) {
-                (Ok(samples), Some(f)) => f(samples),
+                (Ok(samples), Some(f)) => f(samples, pin_memory),
                 (result, _) => result,
             };
 
@@ -1185,10 +1246,13 @@ mod tests {
     // ── device transfer ─────────────────────────────────────────────
 
     /// A sample type that implements ToDevice for testing.
+    /// `pinned` records which transfer method was called: `Some(true)` if
+    /// `to_device_pinned`, `Some(false)` if `to_device`, `None` if neither.
     #[derive(Debug, Clone, PartialEq)]
     struct DeviceSample {
         value: i32,
         device: Device,
+        pinned: Option<bool>,
     }
 
     impl ToDevice for DeviceSample {
@@ -1196,6 +1260,14 @@ mod tests {
             Ok(DeviceSample {
                 value: self.value,
                 device,
+                pinned: Some(false),
+            })
+        }
+        fn to_device_pinned(&self, device: Device) -> FerrotorchResult<Self> {
+            Ok(DeviceSample {
+                value: self.value,
+                device,
+                pinned: Some(true),
             })
         }
     }
@@ -1229,6 +1301,7 @@ mod tests {
                 .map(|v| DeviceSample {
                     value: v,
                     device: Device::Cpu,
+                    pinned: None,
                 })
                 .collect(),
         })
@@ -1312,6 +1385,7 @@ mod tests {
                 Ok(DeviceSample {
                     value: batch.iter().map(|s| s.value).sum(),
                     device: batch[0].device,
+                    pinned: batch[0].pinned,
                 })
             });
 
@@ -1322,6 +1396,154 @@ mod tests {
         assert_eq!(collated[1].device, Device::Cuda(0));
         assert_eq!(collated[0].value, 0 + 1 + 2);
         assert_eq!(collated[1].value, 3 + 4 + 5);
+    }
+
+    // ── pin_memory ──────────────────────────────────────────────────
+    //
+    // pin_memory is a runtime flag passed to the transfer_fn closure built
+    // by .device(). When set, the closure dispatches to
+    // ToDevice::to_device_pinned instead of ToDevice::to_device. The
+    // DeviceSample test impl tracks which method was called via the
+    // `pinned` field, letting us verify the dispatch path is correct
+    // without needing a real CUDA device. CL-378
+
+    #[test]
+    fn test_pin_memory_default_off_uses_to_device() {
+        // pin_memory not set -> closure should call to_device (pinned=Some(false))
+        let loader = DataLoader::new(make_device_dataset(2), 2)
+            .prefetch_factor(0)
+            .device(Device::Cuda(0));
+        assert!(!loader.is_pin_memory());
+        let batches: Vec<Vec<DeviceSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        for sample in &batches[0] {
+            assert_eq!(sample.pinned, Some(false));
+        }
+    }
+
+    #[test]
+    fn test_pin_memory_on_uses_to_device_pinned_sync() {
+        // pin_memory(true) + device(Cuda) + sync iter -> to_device_pinned
+        let loader = DataLoader::new(make_device_dataset(4), 2)
+            .prefetch_factor(0)
+            .device(Device::Cuda(0))
+            .pin_memory(true);
+        assert!(loader.is_pin_memory());
+        let batches: Vec<Vec<DeviceSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        for batch in &batches {
+            for sample in batch {
+                assert_eq!(sample.pinned, Some(true));
+                assert_eq!(sample.device, Device::Cuda(0));
+            }
+        }
+    }
+
+    #[test]
+    fn test_pin_memory_on_uses_to_device_pinned_prefetch() {
+        // pin_memory(true) + device(Cuda) + prefetch iter -> to_device_pinned
+        let loader = DataLoader::new(make_device_dataset(6), 2)
+            .prefetch_factor(2)
+            .device(Device::Cuda(0))
+            .pin_memory(true);
+        let batches: Vec<Vec<DeviceSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 3);
+        for batch in &batches {
+            for sample in batch {
+                assert_eq!(sample.pinned, Some(true));
+            }
+        }
+    }
+
+    #[test]
+    fn test_pin_memory_set_after_device_takes_effect() {
+        // The pin_memory flag is read at iter time (via the closure
+        // parameter), not at device() construction time. So calling
+        // pin_memory(true) AFTER device() must still flip the path.
+        let loader = DataLoader::new(make_device_dataset(2), 2)
+            .device(Device::Cuda(0))
+            .pin_memory(true);
+        let batches: Vec<Vec<DeviceSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        for sample in &batches[0] {
+            assert_eq!(sample.pinned, Some(true));
+        }
+    }
+
+    #[test]
+    fn test_pin_memory_set_before_device_takes_effect() {
+        // Order independent: pin_memory before device should also work.
+        let loader = DataLoader::new(make_device_dataset(2), 2)
+            .pin_memory(true)
+            .device(Device::Cuda(0));
+        let batches: Vec<Vec<DeviceSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        for sample in &batches[0] {
+            assert_eq!(sample.pinned, Some(true));
+        }
+    }
+
+    #[test]
+    fn test_pin_memory_without_device_is_noop() {
+        // pin_memory without device() should be a no-op (no transfer
+        // happens at all). Samples retain their original device and
+        // pinned=None.
+        let loader = DataLoader::new(make_device_dataset(2), 2)
+            .pin_memory(true);
+        let batches: Vec<Vec<DeviceSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        for sample in &batches[0] {
+            assert_eq!(sample.pinned, None);
+            assert_eq!(sample.device, Device::Cpu);
+        }
+    }
+
+    #[test]
+    fn test_pin_memory_default_for_to_device_pinned_trait() {
+        // A type that implements only ToDevice::to_device (using the
+        // default to_device_pinned forwarder) should still work — the
+        // default impl forwards to to_device, so the result device is
+        // correct even though the pinned-ness flag isn't tracked.
+        #[derive(Debug, Clone)]
+        struct NoPinSample {
+            value: i32,
+            device: Device,
+        }
+        impl ToDevice for NoPinSample {
+            fn to_device(&self, device: Device) -> FerrotorchResult<Self> {
+                Ok(NoPinSample {
+                    value: self.value,
+                    device,
+                })
+            }
+            // No to_device_pinned override -- uses the default forwarder.
+        }
+        struct NoPinDataset {
+            data: Vec<NoPinSample>,
+        }
+        impl Dataset for NoPinDataset {
+            type Sample = NoPinSample;
+            fn len(&self) -> usize {
+                self.data.len()
+            }
+            fn get(&self, index: usize) -> FerrotorchResult<Self::Sample> {
+                Ok(self.data[index].clone())
+            }
+        }
+
+        let ds = Arc::new(NoPinDataset {
+            data: vec![
+                NoPinSample {
+                    value: 1,
+                    device: Device::Cpu,
+                },
+                NoPinSample {
+                    value: 2,
+                    device: Device::Cpu,
+                },
+            ],
+        });
+        let loader = DataLoader::new(ds, 2).device(Device::Cuda(0)).pin_memory(true);
+        let batches: Vec<Vec<NoPinSample>> = loader.iter(0).map(|b| b.unwrap()).collect();
+        for sample in &batches[0] {
+            // Default impl forwards to to_device, so device is set correctly.
+            assert_eq!(sample.device, Device::Cuda(0));
+        }
     }
 
     // ── prefetch_factor builder ─────────────────────────────────────
