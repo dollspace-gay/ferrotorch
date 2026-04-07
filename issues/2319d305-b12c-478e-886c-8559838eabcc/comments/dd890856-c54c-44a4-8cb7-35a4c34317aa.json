@@ -1,0 +1,10 @@
+{
+  "uuid": "dd890856-c54c-44a4-8cb7-35a4c34317aa",
+  "issue_uuid": "2319d305-b12c-478e-886c-8559838eabcc",
+  "author": "y4rr",
+  "content": "Implemented via commit 5ec21c20. Added ferrotorch-jit::autotune module with Autotuner (candidate benchmarking, median of N samples, warmup, cache keyed by graph fingerprint + input shapes), AutotuneCandidate, AutotuneResult, AutotuneKey. Shape/op sensitive cache keys; cache hit re-compiles only the winner. 8 tests; 251 ferrotorch-jit tests pass.",
+  "created_at": "2026-04-07T21:48:01.343543381Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIQnnA7df7ARu1v+1jC+roZB+Uro1W+3/eskBpU2xtpFVw4ohJQ3QsZCY7rJb4pti3azRB3xLzi2qUB+vHh8lBg=="
+}
