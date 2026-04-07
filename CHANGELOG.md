@@ -57,6 +57,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix CUDA graph capture on legacy default stream — fork non-blocking stream via `GpuDevice::fork_for_capture()`
 
 ### Added
+- GPU `strided_copy` primitive: PTX kernel and backend dispatch for N-d strided→contiguous gather entirely on-device, wired into `Tensor::contiguous()` so non-contiguous CUDA tensors no longer roundtrip through CPU (#496)
 - torch.export-style runtime guards: `ExportedProgram::check_inputs` and `run_with_guards` validate runtime inputs against `input_specs` (static dim match, dynamic dim range) before graph execution (#461)
 - Profiler auto-instrumentation extended to div/neg/pow/sqrt/abs, exp/log/sin/cos, mean/prod/sum_dim/mean_dim, and relu/sigmoid/tanh/gelu/silu/log_softmax — trace output now covers the core tensor op surface area (#501)
 - Add Claude skill with ferrotorch API usage hints (#192)

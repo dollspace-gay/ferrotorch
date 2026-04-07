@@ -499,10 +499,62 @@ pub fn view_t<T: Float>(input: &Tensor<T>, shape: &[i64]) -> FerrotorchResult<Te
 /// If the tensor is already contiguous this returns a cheap clone.
 /// Otherwise it gathers the data in C-order and creates a new
 /// contiguous tensor, preserving the original device.
+///
+/// **GPU fast path (CL-496).** For non-contiguous CUDA tensors of rank
+/// ≤ 8, this dispatches to the backend's `strided_copy_{f32,f64}`
+/// kernel which gathers the view on-device and avoids the CPU
+/// roundtrip that `data_vec()` would otherwise incur. Higher ranks
+/// or missing GPU backends fall back to the host-memory path.
 pub fn contiguous_t<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    use std::any::TypeId;
+
     if input.is_contiguous() {
         return Ok(input.clone());
     }
+    let device = input.device();
+
+    // GPU fast path: dispatch to the backend's strided_copy kernel
+    // when the input is a non-contiguous CUDA tensor with rank ≤ 8.
+    if device.is_cuda() && input.shape().len() <= 8 {
+        if let Some(backend) = crate::gpu_dispatch::gpu_backend() {
+            let in_handle = input.gpu_handle()?;
+            let out_shape = input.shape().to_vec();
+            let src_strides = input.strides().to_vec();
+            let src_offset = input.storage_offset();
+
+            let out_handle = if TypeId::of::<T>() == TypeId::of::<f32>() {
+                backend.strided_copy_f32(in_handle, &out_shape, &src_strides, src_offset)
+            } else if TypeId::of::<T>() == TypeId::of::<f64>() {
+                backend.strided_copy_f64(in_handle, &out_shape, &src_strides, src_offset)
+            } else {
+                // Unsupported dtype — fall through to CPU path.
+                return contiguous_t_cpu(input);
+            };
+
+            if let Ok(handle) = out_handle {
+                let storage = TensorStorage::gpu(handle);
+                return if crate::autograd::no_grad::is_grad_enabled()
+                    && input.requires_grad()
+                {
+                    let grad_fn = std::sync::Arc::new(ContiguousBackward {
+                        input: input.clone(),
+                    });
+                    Tensor::from_operation(storage, out_shape, grad_fn)
+                } else {
+                    Tensor::from_storage(storage, out_shape, false)
+                };
+            }
+            // Kernel failure (negative strides, overflow, etc.) —
+            // fall through to the host path which handles any layout.
+        }
+    }
+
+    contiguous_t_cpu(input)
+}
+
+/// CPU path for [`contiguous_t`]. Always valid for any layout; used
+/// as a fallback when the GPU fast path declines or errors.
+fn contiguous_t_cpu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let device = input.device();
     let data = input.data_vec()?;
     let storage = TensorStorage::on_device(data, device)?;
