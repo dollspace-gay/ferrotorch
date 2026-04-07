@@ -2,11 +2,12 @@
   "uuid": "2e7fd775-9fcf-4678-91a4-1209226cf524",
   "display_id": 322,
   "title": "Add stream priority levels and CUDA graph memory isolation",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-24T12:01:39.456200275Z",
-  "updated_at": "2026-03-24T12:01:40.918118388Z",
+  "updated_at": "2026-04-07T23:21:13.555445103Z",
+  "closed_at": "2026-04-07T23:21:13.555445103Z",
   "labels": [
     "feature"
   ]
