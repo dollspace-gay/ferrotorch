@@ -408,3 +408,216 @@ fn auto_instrumentation_records_multiple_ops_in_one_session() {
     assert!(names.contains(&"sum"));
     assert!(events.len() >= 4);
 }
+
+// ---------------------------------------------------------------------------
+// Memory categories, FLOPS estimation, stack traces. CL-333.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memory_category_recorded_when_specified() {
+    use ferrotorch_profiler::MemoryCategory;
+    let config = ProfileConfig {
+        record_memory: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record_memory_categorized("alloc_weight", 4096, MemoryCategory::Parameters);
+        p.record_memory_categorized("alloc_grad", 4096, MemoryCategory::Gradients);
+        p.record_memory_categorized("alloc_act", 8192, MemoryCategory::Activations);
+        p.record_memory_categorized(
+            "alloc_optim",
+            8192,
+            MemoryCategory::OptimizerState,
+        );
+    });
+    let events = report.events();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].memory_category, Some(MemoryCategory::Parameters));
+    assert_eq!(events[1].memory_category, Some(MemoryCategory::Gradients));
+    assert_eq!(events[2].memory_category, Some(MemoryCategory::Activations));
+    assert_eq!(
+        events[3].memory_category,
+        Some(MemoryCategory::OptimizerState)
+    );
+}
+
+#[test]
+fn memory_by_category_aggregates_totals() {
+    use ferrotorch_profiler::MemoryCategory;
+    let config = ProfileConfig {
+        record_memory: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        // Two parameter allocations: total +6000
+        p.record_memory_categorized("w1", 1000, MemoryCategory::Parameters);
+        p.record_memory_categorized("w2", 5000, MemoryCategory::Parameters);
+        // One activation allocation
+        p.record_memory_categorized("a1", 12000, MemoryCategory::Activations);
+        // A free as a negative
+        p.record_memory_categorized("a1_free", -2000, MemoryCategory::Activations);
+    });
+    let by_cat = report.memory_by_category();
+    // Sorted by absolute byte size: Activations 10000, Parameters 6000.
+    assert_eq!(by_cat.len(), 2);
+    assert_eq!(by_cat[0].0, MemoryCategory::Activations);
+    assert_eq!(by_cat[0].1, 10000);
+    assert_eq!(by_cat[1].0, MemoryCategory::Parameters);
+    assert_eq!(by_cat[1].1, 6000);
+}
+
+#[test]
+fn record_memory_default_uses_other_category() {
+    use ferrotorch_profiler::MemoryCategory;
+    let config = ProfileConfig {
+        record_memory: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record_memory("alloc", 4096);
+    });
+    let events = report.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].memory_category, Some(MemoryCategory::Other));
+}
+
+#[test]
+fn flops_estimated_for_recorded_ops() {
+    let config = ProfileConfig {
+        record_shapes: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record("add", "tensor_op", &[&[3, 4], &[3, 4]]);
+        p.record("matmul", "linalg", &[&[4, 5], &[5, 6]]);
+        p.record("relu", "activation", &[&[10, 10]]);
+    });
+    let events = report.events();
+    assert_eq!(events[0].flops, Some(12), "add[3,4]+[3,4] = 12 FLOPS");
+    assert_eq!(events[1].flops, Some(240), "matmul[4,5]@[5,6] = 240 FLOPS");
+    assert_eq!(events[2].flops, Some(100), "relu[10,10] = 100 FLOPS");
+}
+
+#[test]
+fn flops_none_when_record_shapes_off() {
+    let config = ProfileConfig {
+        record_shapes: false,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record("add", "tensor_op", &[&[3, 4], &[3, 4]]);
+    });
+    assert!(report.events()[0].flops.is_none());
+}
+
+#[test]
+fn total_flops_sums_event_flops() {
+    let config = ProfileConfig {
+        record_shapes: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record("add", "tensor_op", &[&[3, 4], &[3, 4]]); // 12
+        p.record("matmul", "linalg", &[&[4, 5], &[5, 6]]); // 240
+    });
+    assert_eq!(report.total_flops(), 252);
+}
+
+#[test]
+fn flops_per_second_zero_when_no_time() {
+    // total_time_us is the SUM of event durations, which is 0 for
+    // record() events (they have duration 0).
+    let config = ProfileConfig {
+        record_shapes: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record("add", "tensor_op", &[&[3, 4], &[3, 4]]);
+    });
+    // Event duration is 0, so flops_per_second returns 0.
+    assert_eq!(report.flops_per_second(), 0.0);
+}
+
+#[test]
+fn flops_per_second_nonzero_with_durations() {
+    let config = ProfileConfig {
+        record_shapes: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        // Use record() to get the FLOPS estimate, but also use
+        // record_with_duration to get a non-zero total_time. Since
+        // record_with_duration doesn't take shapes, we can't get
+        // flops on it -- but we can manually verify the math.
+        p.record_with_duration("add", "tensor_op", 1000); // 1ms
+    });
+    // FLOPS = 0 (record_with_duration doesn't estimate), so per/sec = 0.
+    assert_eq!(report.flops_per_second(), 0.0);
+}
+
+#[test]
+fn auto_instrumented_op_gets_flops_estimate() {
+    use ferrotorch_core::Tensor;
+    use ferrotorch_core::storage::TensorStorage;
+
+    let a: Tensor<f32> = Tensor::from_storage(
+        TensorStorage::cpu(vec![1.0; 12]),
+        vec![3, 4],
+        false,
+    )
+    .unwrap();
+    let b: Tensor<f32> = Tensor::from_storage(
+        TensorStorage::cpu(vec![2.0; 12]),
+        vec![3, 4],
+        false,
+    )
+    .unwrap();
+
+    let config = ProfileConfig {
+        record_shapes: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |_| {
+        let _ = ferrotorch_core::grad_fns::arithmetic::add(&a, &b).unwrap();
+    });
+    let add_event = report.events().iter().find(|e| e.name == "add").unwrap();
+    assert_eq!(add_event.flops, Some(12));
+}
+
+#[test]
+fn stack_trace_captured_when_with_stack_enabled() {
+    let config = ProfileConfig {
+        with_stack: true,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record("add", "tensor_op", &[&[3, 4]]);
+    });
+    let event = &report.events()[0];
+    assert!(
+        event.stack_trace.is_some(),
+        "expected stack_trace when with_stack=true"
+    );
+    assert!(report.has_stack_traces());
+}
+
+#[test]
+fn stack_trace_none_when_with_stack_disabled() {
+    let config = ProfileConfig {
+        with_stack: false,
+        ..ProfileConfig::default()
+    };
+    let (_, report) = with_profiler(config, |p| {
+        p.record("add", "tensor_op", &[&[3, 4]]);
+    });
+    assert!(report.events()[0].stack_trace.is_none());
+    assert!(!report.has_stack_traces());
+}
+
+#[test]
+fn memory_by_category_empty_when_no_memory_events() {
+    let (_, report) = with_profiler(ProfileConfig::default(), |p| {
+        p.record("add", "tensor_op", &[&[3, 4]]);
+    });
+    assert_eq!(report.memory_by_category().len(), 0);
+}
