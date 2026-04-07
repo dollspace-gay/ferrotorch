@@ -1,0 +1,10 @@
+{
+  "uuid": "a3b648dc-34da-41c7-841e-889174bbf34c",
+  "issue_uuid": "4bf16a89-0741-4e77-917b-d4e302743236",
+  "author": "y4rr",
+  "content": "Implemented via commit 4fd2ffc4. Added ferrotorch-jit::symbolic module with ShapeSignature (range-constrained symbolic dims), Guard (runtime validation), SymbolicTracedModule<T>, compile_symbolic(), and patch_reshape_for_symbolic_dims() which rewrites concrete reshape targets to -1 for symbolic positions. 14 new tests; 243 ferrotorch-jit tests pass.",
+  "created_at": "2026-04-07T20:41:02.033170861Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgGlKyFL1vXkiWcQBR3gOZoMgfQg5bTqYsxCUOwLy+cvNynJCfe2mpCFQeOFX/3PIbMTQP7zJ2/EgP3MdL8bfDA=="
+}
