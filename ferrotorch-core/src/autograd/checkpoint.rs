@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use crate::autograd::autocast::{
+    AutocastSnapshot, current_autocast_snapshot, with_autocast_state,
+};
 use crate::dtype::Float;
 use crate::error::FerrotorchResult;
 use crate::gpu_dispatch::GpuRngState;
@@ -73,6 +76,13 @@ where
     // backward recomputation. This ensures dropout masks are identical.
     let saved_gpu_rng = save_gpu_rng_state(input);
 
+    // Capture the autocast state at forward time so the recomputation during
+    // backward runs in the same mixed-precision context. Without this, a
+    // checkpoint declared inside `autocast(F16, ...)` would produce f32
+    // matmul outputs during recompute (different from forward) and the
+    // gradients would be numerically inconsistent.
+    let saved_autocast = current_autocast_snapshot();
+
     // Forward pass without recording the graph (saves memory).
     let output = no_grad(|| f(input))?;
 
@@ -86,6 +96,7 @@ where
         input: input.clone(),
         output_shape: output.shape().to_vec(),
         saved_gpu_rng,
+        saved_autocast,
     });
 
     let device = output.device();
@@ -114,6 +125,7 @@ where
     }
 
     let saved_gpu_rng = save_gpu_rng_state(&inputs[0]);
+    let saved_autocast = current_autocast_snapshot();
 
     let output = no_grad(|| f(inputs))?;
 
@@ -127,6 +139,7 @@ where
         inputs: inputs.to_vec(),
         output_shape: output.shape().to_vec(),
         saved_gpu_rng,
+        saved_autocast,
     });
 
     let device = output.device();
@@ -178,6 +191,10 @@ struct CheckpointBackward<T: Float> {
     /// GPU RNG state saved before the forward pass. Restored during backward
     /// recomputation so that stochastic ops (dropout) produce identical masks.
     saved_gpu_rng: Option<GpuRngState>,
+    /// Autocast (enabled, dtype) state captured at forward time. Restored
+    /// for the duration of the recomputation so mixed-precision ops produce
+    /// numerically identical activations.
+    saved_autocast: AutocastSnapshot,
 }
 
 impl<T: Float> std::fmt::Debug for CheckpointBackward<T> {
@@ -186,6 +203,7 @@ impl<T: Float> std::fmt::Debug for CheckpointBackward<T> {
             .field("input_shape", &self.input.shape())
             .field("output_shape", &self.output_shape)
             .field("has_gpu_rng_state", &self.saved_gpu_rng.is_some())
+            .field("autocast_enabled", &self.saved_autocast.enabled)
             .finish()
     }
 }
@@ -210,25 +228,30 @@ impl<T: Float> crate::tensor::GradFn<T> for CheckpointBackward<T> {
             None
         };
 
-        let input_with_grad = self.input.clone().requires_grad_(true);
-        let recomputed = (self.func)(&input_with_grad)?;
+        // Run the recomputation inside an autocast context that exactly
+        // matches the forward pass. with_autocast_state uses an RAII guard,
+        // so the surrounding (caller's) autocast state is restored even if
+        // the recomputation panics.
+        with_autocast_state(self.saved_autocast, || {
+            let input_with_grad = self.input.clone().requires_grad_(true);
+            let recomputed = (self.func)(&input_with_grad)?;
 
-        // Use autograd to compute gradients with grad_output as the upstream gradient.
-        // We need to compute d(recomputed)/d(input) * grad_output.
-        // Since backward() on a non-scalar needs an external gradient, we compute
-        // the scalar sum(recomputed * grad_output) and backprop through that.
-        // This correctly propagates grad_output through the chain rule.
-        use crate::grad_fns::arithmetic::mul;
-        use crate::grad_fns::reduction::sum;
-        let weighted = mul(
-            &recomputed,
-            &grad_output.clone().requires_grad_(false).detach(),
-        )?;
-        let scalar = sum(&weighted)?;
-        scalar.backward()?;
+            // Use autograd to compute gradients with grad_output as the
+            // upstream gradient. We compute the scalar
+            // sum(recomputed * grad_output) and backprop through that;
+            // this correctly propagates grad_output through chain rule.
+            use crate::grad_fns::arithmetic::mul;
+            use crate::grad_fns::reduction::sum;
+            let weighted = mul(
+                &recomputed,
+                &grad_output.clone().requires_grad_(false).detach(),
+            )?;
+            let scalar = sum(&weighted)?;
+            scalar.backward()?;
 
-        let input_grad = input_with_grad.grad()?;
-        Ok(vec![input_grad])
+            let input_grad = input_with_grad.grad()?;
+            Ok(vec![input_grad])
+        })
     }
 
     fn inputs(&self) -> Vec<&Tensor<T>> {
@@ -249,6 +272,7 @@ struct CheckpointMultiBackward<T: Float> {
     inputs: Vec<Tensor<T>>,
     output_shape: Vec<usize>,
     saved_gpu_rng: Option<GpuRngState>,
+    saved_autocast: AutocastSnapshot,
 }
 
 impl<T: Float> std::fmt::Debug for CheckpointMultiBackward<T> {
@@ -257,6 +281,7 @@ impl<T: Float> std::fmt::Debug for CheckpointMultiBackward<T> {
             .field("num_inputs", &self.inputs.len())
             .field("output_shape", &self.output_shape)
             .field("has_gpu_rng_state", &self.saved_gpu_rng.is_some())
+            .field("autocast_enabled", &self.saved_autocast.enabled)
             .finish()
     }
 }
@@ -274,41 +299,46 @@ impl<T: Float> crate::tensor::GradFn<T> for CheckpointMultiBackward<T> {
             None
         };
 
-        // Re-run forward with grad tracking on all inputs that need it.
-        let inputs_with_grad: Vec<Tensor<T>> = self
-            .inputs
-            .iter()
-            .map(|t| {
-                if t.requires_grad() {
-                    t.clone().requires_grad_(true)
+        // Run recomputation under the same autocast state as the forward
+        // pass. The RAII guard inside with_autocast_state restores the
+        // caller's state on exit, including panic unwind.
+        with_autocast_state(self.saved_autocast, || {
+            // Re-run forward with grad tracking on all inputs that need it.
+            let inputs_with_grad: Vec<Tensor<T>> = self
+                .inputs
+                .iter()
+                .map(|t| {
+                    if t.requires_grad() {
+                        t.clone().requires_grad_(true)
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect();
+
+            let recomputed = (self.func)(&inputs_with_grad)?;
+
+            // Backprop via weighted sum trick.
+            use crate::grad_fns::arithmetic::mul;
+            use crate::grad_fns::reduction::sum;
+            let weighted = mul(
+                &recomputed,
+                &grad_output.clone().requires_grad_(false).detach(),
+            )?;
+            let scalar = sum(&weighted)?;
+            scalar.backward()?;
+
+            // Collect gradients for each input.
+            let mut grads = Vec::with_capacity(self.inputs.len());
+            for (orig, with_grad) in self.inputs.iter().zip(inputs_with_grad.iter()) {
+                if orig.requires_grad() {
+                    grads.push(with_grad.grad()?);
                 } else {
-                    t.clone()
+                    grads.push(None);
                 }
-            })
-            .collect();
-
-        let recomputed = (self.func)(&inputs_with_grad)?;
-
-        // Backprop via weighted sum trick.
-        use crate::grad_fns::arithmetic::mul;
-        use crate::grad_fns::reduction::sum;
-        let weighted = mul(
-            &recomputed,
-            &grad_output.clone().requires_grad_(false).detach(),
-        )?;
-        let scalar = sum(&weighted)?;
-        scalar.backward()?;
-
-        // Collect gradients for each input.
-        let mut grads = Vec::with_capacity(self.inputs.len());
-        for (orig, with_grad) in self.inputs.iter().zip(inputs_with_grad.iter()) {
-            if orig.requires_grad() {
-                grads.push(with_grad.grad()?);
-            } else {
-                grads.push(None);
             }
-        }
-        Ok(grads)
+            Ok(grads)
+        })
     }
 
     fn inputs(&self) -> Vec<&Tensor<T>> {
@@ -317,5 +347,401 @@ impl<T: Float> crate::tensor::GradFn<T> for CheckpointMultiBackward<T> {
 
     fn name(&self) -> &'static str {
         "CheckpointMultiBackward"
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::autograd::autocast::{AutocastDtype, autocast, is_autocast_enabled};
+    use crate::creation::{from_slice, scalar};
+    use crate::grad_fns::arithmetic::{add, mul};
+    use crate::grad_fns::reduction::sum;
+    use crate::storage::TensorStorage;
+
+    fn leaf_grad(data: &[f32], shape: &[usize]) -> Tensor<f32> {
+        Tensor::from_storage(TensorStorage::cpu(data.to_vec()), shape.to_vec(), true).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-input checkpoint correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkpoint_single_input_basic() {
+        // f(x) = (x * x) + x  -- df/dx = 2x + 1
+        // For x = [1, 2, 3], grad should be [3, 5, 7].
+        let x = leaf_grad(&[1.0, 2.0, 3.0], &[3]);
+        let y = checkpoint(
+            |t: &Tensor<f32>| {
+                let sq = mul(t, t)?;
+                add(&sq, t)
+            },
+            &x,
+        )
+        .unwrap();
+        // sum(y) = 1+1 + 4+2 + 9+3 = 20
+        let s = sum(&y).unwrap();
+        assert!((s.item().unwrap() - 20.0).abs() < 1e-5);
+
+        s.backward().unwrap();
+        let g = x.grad().unwrap().expect("x should have a gradient");
+        let gd = g.data().unwrap();
+        assert!((gd[0] - 3.0).abs() < 1e-5);
+        assert!((gd[1] - 5.0).abs() < 1e-5);
+        assert!((gd[2] - 7.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_checkpoint_no_grad_input_returns_output_only() {
+        // When input does not require grad, checkpoint should still produce
+        // the correct output but skip wrapping in a backward node.
+        let x = from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+        let y = checkpoint(
+            |t: &Tensor<f32>| {
+                let two = scalar(2.0f32)?;
+                mul(t, &two)
+            },
+            &x,
+        )
+        .unwrap();
+        let yd = y.data().unwrap();
+        assert_eq!(yd, &[2.0, 4.0, 6.0]);
+        // No grad_fn since input had no grad.
+        assert!(y.grad_fn().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-input checkpoint correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkpoint_multi_two_inputs_both_grad() {
+        // f(a, b) = a * b + a  -- df/da = b + 1, df/db = a
+        let a = leaf_grad(&[1.0, 2.0, 3.0], &[3]);
+        let b = leaf_grad(&[4.0, 5.0, 6.0], &[3]);
+        let y = checkpoint_multi(
+            |ts: &[Tensor<f32>]| {
+                let prod = mul(&ts[0], &ts[1])?;
+                add(&prod, &ts[0])
+            },
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+        // y = [4+1, 10+2, 18+3] = [5, 12, 21]
+        let s = sum(&y).unwrap();
+        s.backward().unwrap();
+
+        // df/da = b + 1 = [5, 6, 7]
+        let ga = a.grad().unwrap().expect("a should have a gradient");
+        let gad = ga.data().unwrap();
+        assert!((gad[0] - 5.0).abs() < 1e-5);
+        assert!((gad[1] - 6.0).abs() < 1e-5);
+        assert!((gad[2] - 7.0).abs() < 1e-5);
+
+        // df/db = a = [1, 2, 3]
+        let gb = b.grad().unwrap().expect("b should have a gradient");
+        let gbd = gb.data().unwrap();
+        assert!((gbd[0] - 1.0).abs() < 1e-5);
+        assert!((gbd[1] - 2.0).abs() < 1e-5);
+        assert!((gbd[2] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_checkpoint_multi_partial_grad() {
+        // Only the second input requires grad.
+        let a = from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+        let b = leaf_grad(&[4.0, 5.0, 6.0], &[3]);
+        let y = checkpoint_multi(
+            |ts: &[Tensor<f32>]| mul(&ts[0], &ts[1]),
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+        let s = sum(&y).unwrap();
+        s.backward().unwrap();
+
+        // a has no grad, b's grad should be a.
+        assert!(a.grad().unwrap().is_none());
+        let gb = b.grad().unwrap().expect("b should have a gradient");
+        let gbd = gb.data().unwrap();
+        assert_eq!(gbd, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_checkpoint_multi_empty_inputs_errors() {
+        let result = checkpoint_multi(|_: &[Tensor<f32>]| panic!("should not run"), &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_checkpoint_multi_no_grad_inputs_returns_output_only() {
+        // None of the inputs need grad — output is computed but no backward.
+        let a = from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let b = from_slice(&[3.0f32, 4.0], &[2]).unwrap();
+        let y = checkpoint_multi(
+            |ts: &[Tensor<f32>]| add(&ts[0], &ts[1]),
+            &[a, b],
+        )
+        .unwrap();
+        let yd = y.data().unwrap();
+        assert_eq!(yd, &[4.0, 6.0]);
+        assert!(y.grad_fn().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Autocast snapshot helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_current_autocast_snapshot_outside_region() {
+        let snap = current_autocast_snapshot();
+        assert!(!snap.enabled);
+    }
+
+    #[test]
+    fn test_current_autocast_snapshot_inside_region() {
+        autocast(AutocastDtype::BF16, || {
+            let snap = current_autocast_snapshot();
+            assert!(snap.enabled);
+            assert_eq!(snap.dtype, AutocastDtype::BF16);
+        });
+    }
+
+    #[test]
+    fn test_with_autocast_state_restores_disabled() {
+        // Snapshot disabled state, then call with_autocast_state from
+        // inside an enabled region — the closure should see disabled.
+        let disabled = AutocastSnapshot {
+            enabled: false,
+            dtype: AutocastDtype::F16,
+        };
+        autocast(AutocastDtype::F16, || {
+            assert!(is_autocast_enabled());
+            with_autocast_state(disabled, || {
+                assert!(!is_autocast_enabled());
+            });
+            // After the closure, the surrounding autocast region is restored.
+            assert!(is_autocast_enabled());
+        });
+    }
+
+    #[test]
+    fn test_with_autocast_state_overrides_dtype() {
+        let f16_state = AutocastSnapshot {
+            enabled: true,
+            dtype: AutocastDtype::F16,
+        };
+        autocast(AutocastDtype::BF16, || {
+            with_autocast_state(f16_state, || {
+                assert!(is_autocast_enabled());
+                assert_eq!(crate::autograd::autocast::autocast_dtype(), AutocastDtype::F16);
+            });
+            // Restored.
+            assert_eq!(crate::autograd::autocast::autocast_dtype(), AutocastDtype::BF16);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint preserves autocast state across backward recomputation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkpoint_captures_autocast_snapshot() {
+        // When checkpoint is called inside an autocast region, the saved
+        // snapshot should reflect that. We can verify this by checking the
+        // Debug output of the backward node — its `autocast_enabled` field
+        // tracks the snapshot state.
+        let x = leaf_grad(&[1.0f32, 2.0, 3.0], &[3]);
+        let y_inside = autocast(AutocastDtype::F16, || {
+            checkpoint(|t: &Tensor<f32>| mul(t, t), &x)
+        })
+        .unwrap();
+        let dbg = format!("{:?}", y_inside.grad_fn().unwrap());
+        assert!(
+            dbg.contains("autocast_enabled: true"),
+            "expected captured autocast=true in debug repr, got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_outside_autocast_captures_disabled() {
+        let x = leaf_grad(&[1.0f32, 2.0, 3.0], &[3]);
+        let y = checkpoint(|t: &Tensor<f32>| mul(t, t), &x).unwrap();
+        let dbg = format!("{:?}", y.grad_fn().unwrap());
+        assert!(
+            dbg.contains("autocast_enabled: false"),
+            "expected captured autocast=false in debug repr, got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_recomputation_uses_saved_autocast() {
+        // The checkpoint is created inside autocast(F16). Backward is called
+        // OUTSIDE any autocast region. During recomputation, autocast must
+        // be re-enabled (with F16) so the inner ops see the same context.
+        // We verify by inspecting the autocast state from inside the
+        // recomputation closure via a shared flag.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let saw_autocast = StdArc::new(AtomicBool::new(false));
+        let saw_autocast_clone = StdArc::clone(&saw_autocast);
+
+        let x = leaf_grad(&[1.0f32, 2.0, 3.0], &[3]);
+        let y = autocast(AutocastDtype::F16, || {
+            checkpoint(
+                move |t: &Tensor<f32>| {
+                    saw_autocast_clone.store(is_autocast_enabled(), Ordering::SeqCst);
+                    mul(t, t)
+                },
+                &x,
+            )
+        })
+        .unwrap();
+
+        // Reset the flag — forward set it to true (we were in autocast).
+        saw_autocast.store(false, Ordering::SeqCst);
+
+        // Backward runs OUTSIDE any autocast region.
+        assert!(!is_autocast_enabled());
+        let s = sum(&y).unwrap();
+        s.backward().unwrap();
+
+        // The recomputation closure should have observed autocast = true,
+        // because the saved snapshot was restored before the recomputation.
+        assert!(
+            saw_autocast.load(Ordering::SeqCst),
+            "checkpoint backward should re-enable autocast during recomputation"
+        );
+
+        // After backward returns, the caller's autocast state is restored
+        // (still disabled outside the region).
+        assert!(!is_autocast_enabled());
+    }
+
+    #[test]
+    fn test_checkpoint_multi_recomputation_uses_saved_autocast() {
+        // Same as the single-input test but for checkpoint_multi.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let observed = StdArc::new(AtomicUsize::new(0));
+        let observed_clone = StdArc::clone(&observed);
+
+        let a = leaf_grad(&[1.0f32, 2.0], &[2]);
+        let b = leaf_grad(&[3.0f32, 4.0], &[2]);
+
+        let y = autocast(AutocastDtype::BF16, || {
+            checkpoint_multi(
+                move |ts: &[Tensor<f32>]| {
+                    let dtype = crate::autograd::autocast::autocast_dtype();
+                    let val = if is_autocast_enabled() {
+                        match dtype {
+                            AutocastDtype::F16 => 1,
+                            AutocastDtype::BF16 => 2,
+                        }
+                    } else {
+                        0
+                    };
+                    observed_clone.store(val, Ordering::SeqCst);
+                    add(&ts[0], &ts[1])
+                },
+                &[a.clone(), b.clone()],
+            )
+        })
+        .unwrap();
+
+        // Forward observed BF16 (= 2). Reset.
+        observed.store(0, Ordering::SeqCst);
+
+        let s = sum(&y).unwrap();
+        s.backward().unwrap();
+
+        // Backward recomputation should also observe BF16.
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            2,
+            "expected recomputation to see autocast(BF16), got code {}",
+            observed.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_recomputation_does_not_leak_autocast() {
+        // If the checkpoint was created INSIDE autocast and backward is
+        // called OUTSIDE autocast, after backward returns we should still
+        // be outside autocast (the with_autocast_state RAII guard restores).
+        let x = leaf_grad(&[1.0f32, 2.0], &[2]);
+        let y = autocast(AutocastDtype::F16, || {
+            checkpoint(|t: &Tensor<f32>| mul(t, t), &x)
+        })
+        .unwrap();
+
+        assert!(!is_autocast_enabled());
+        let s = sum(&y).unwrap();
+        s.backward().unwrap();
+        assert!(
+            !is_autocast_enabled(),
+            "checkpoint backward should not leak autocast state to caller"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_recomputation_inside_different_autocast() {
+        // Forward in F16, backward called from inside BF16 region.
+        // Recomputation should TEMPORARILY switch to F16, then restore BF16.
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let observed = StdArc::new(AtomicU8::new(0));
+        let observed_clone = StdArc::clone(&observed);
+
+        let x = leaf_grad(&[1.0f32, 2.0], &[2]);
+        let y = autocast(AutocastDtype::F16, || {
+            checkpoint(
+                move |t: &Tensor<f32>| {
+                    let code: u8 = if is_autocast_enabled() {
+                        match crate::autograd::autocast::autocast_dtype() {
+                            AutocastDtype::F16 => 1,
+                            AutocastDtype::BF16 => 2,
+                        }
+                    } else {
+                        0
+                    };
+                    observed_clone.store(code, Ordering::SeqCst);
+                    mul(t, t)
+                },
+                &x,
+            )
+        })
+        .unwrap();
+
+        observed.store(0, Ordering::SeqCst);
+
+        autocast(AutocastDtype::BF16, || {
+            let s = sum(&y).unwrap();
+            s.backward().unwrap();
+            // The surrounding BF16 region must be restored after backward
+            // (the saved F16 snapshot only applies during the recomputation
+            // closure).
+            assert_eq!(
+                crate::autograd::autocast::autocast_dtype(),
+                AutocastDtype::BF16,
+                "with_autocast_state should restore caller's BF16 state"
+            );
+        });
+
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "expected recomputation to see F16 (saved snapshot), got code {}",
+            observed.load(Ordering::SeqCst)
+        );
     }
 }
