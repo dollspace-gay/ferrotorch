@@ -2,11 +2,12 @@
   "uuid": "9e17ae95-5ae5-4720-8769-bf2bcc79a1f7",
   "display_id": 333,
   "title": "Add profiler scheduling, memory categories, FLOPS estimation, and stack traces",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-24T12:02:48.576225553Z",
-  "updated_at": "2026-03-24T12:02:50.244465118Z",
+  "updated_at": "2026-04-07T18:41:57.155201300Z",
+  "closed_at": "2026-04-07T18:41:57.155201300Z",
   "labels": [
     "feature"
   ]
