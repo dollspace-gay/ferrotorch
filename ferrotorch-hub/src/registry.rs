@@ -31,6 +31,12 @@ pub struct ModelInfo {
 }
 
 /// Static registry of known pretrained models.
+///
+/// Each entry uses the all-zero SHA-256 placeholder; the download path
+/// detects the placeholder and skips integrity verification with a
+/// warning. Real checksums should be pinned as the upstream weights are
+/// published. The placeholder lets us wire the registry plumbing now
+/// without blocking on every checkpoint being uploaded.
 static MODELS: &[ModelInfo] = &[
     ModelInfo {
         name: "resnet18",
@@ -41,12 +47,28 @@ static MODELS: &[ModelInfo] = &[
         num_parameters: 11_689_512,
     },
     ModelInfo {
+        name: "resnet34",
+        description: "ResNet-34 trained on ImageNet-1K (top-1 acc ~73.3%)",
+        weights_url: "https://huggingface.co/ferrotorch/resnet34/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 21_797_672,
+    },
+    ModelInfo {
         name: "resnet50",
         description: "ResNet-50 trained on ImageNet-1K (top-1 acc ~76.1%)",
         weights_url: "https://huggingface.co/ferrotorch/resnet50/resolve/main/model.safetensors",
         weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
         format: WeightsFormat::SafeTensors,
         num_parameters: 25_557_032,
+    },
+    ModelInfo {
+        name: "vgg11",
+        description: "VGG-11 trained on ImageNet-1K (top-1 acc ~69.0%)",
+        weights_url: "https://huggingface.co/ferrotorch/vgg11/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 132_863_336,
     },
     ModelInfo {
         name: "vgg16",
@@ -63,6 +85,48 @@ static MODELS: &[ModelInfo] = &[
         weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
         format: WeightsFormat::SafeTensors,
         num_parameters: 86_567_656,
+    },
+    ModelInfo {
+        name: "efficientnet_b0",
+        description: "EfficientNet-B0 trained on ImageNet-1K (top-1 acc ~77.7%)",
+        weights_url:
+            "https://huggingface.co/ferrotorch/efficientnet_b0/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 5_288_548,
+    },
+    ModelInfo {
+        name: "swin_tiny",
+        description: "Swin Transformer Tiny trained on ImageNet-1K (top-1 acc ~81.2%)",
+        weights_url: "https://huggingface.co/ferrotorch/swin_tiny/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 28_288_354,
+    },
+    ModelInfo {
+        name: "convnext_tiny",
+        description: "ConvNeXt Tiny trained on ImageNet-1K (top-1 acc ~82.1%)",
+        weights_url:
+            "https://huggingface.co/ferrotorch/convnext_tiny/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 28_589_128,
+    },
+    ModelInfo {
+        name: "unet",
+        description: "U-Net for semantic segmentation (Carvana / generic)",
+        weights_url: "https://huggingface.co/ferrotorch/unet/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 31_037_633,
+    },
+    ModelInfo {
+        name: "yolo",
+        description: "YOLOv3 backbone for object detection (Darknet-53)",
+        weights_url: "https://huggingface.co/ferrotorch/yolo/resolve/main/model.safetensors",
+        weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        format: WeightsFormat::SafeTensors,
+        num_parameters: 61_949_149,
     },
 ];
 
@@ -128,6 +192,32 @@ mod tests {
     #[test]
     fn test_get_model_info_empty_string() {
         assert!(get_model_info("").is_none());
+    }
+
+    #[test]
+    fn test_registry_includes_all_vision_architectures() {
+        // CL-385: every architecture exposed by ferrotorch_vision::models
+        // should have an entry here so the vision registry's
+        // pretrained=true path can resolve a download URL.
+        let expected = [
+            "resnet18",
+            "resnet34",
+            "resnet50",
+            "vgg11",
+            "vgg16",
+            "vit_b_16",
+            "efficientnet_b0",
+            "swin_tiny",
+            "convnext_tiny",
+            "unet",
+            "yolo",
+        ];
+        for name in expected {
+            assert!(
+                get_model_info(name).is_some(),
+                "ferrotorch_hub registry is missing entry for vision arch '{name}'"
+            );
+        }
     }
 
     #[test]

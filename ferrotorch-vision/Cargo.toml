@@ -16,6 +16,8 @@ readme = "README.md"
 ferrotorch-core = { workspace = true }
 ferrotorch-nn = { workspace = true }
 ferrotorch-data = { workspace = true }
+ferrotorch-hub = { workspace = true }
+ferrotorch-serialize = { workspace = true }
 num-traits = { workspace = true }
 image = { workspace = true }
 

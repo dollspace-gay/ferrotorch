@@ -1703,7 +1703,9 @@ version = "0.2.3"
 dependencies = [
  "ferrotorch-core",
  "ferrotorch-data",
+ "ferrotorch-hub",
  "ferrotorch-nn",
+ "ferrotorch-serialize",
  "image",
  "num-traits",
  "tempfile",
