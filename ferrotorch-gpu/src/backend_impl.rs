@@ -2154,6 +2154,41 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer(result, input.device_ordinal()))
     }
 
+    fn strided_copy_f32(
+        &self,
+        input: &GpuBufferHandle,
+        out_shape: &[usize],
+        src_strides: &[isize],
+        src_offset: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let in_buf = Self::unwrap_buffer(input)?;
+        let dev = self.device(input.device_ordinal())?;
+        let result =
+            crate::kernels::gpu_strided_copy(in_buf, out_shape, src_strides, src_offset, dev)
+                .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, input.device_ordinal()))
+    }
+
+    fn strided_copy_f64(
+        &self,
+        input: &GpuBufferHandle,
+        out_shape: &[usize],
+        src_strides: &[isize],
+        src_offset: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let in_buf = Self::unwrap_buffer_f64(input)?;
+        let dev = self.device(input.device_ordinal())?;
+        let result = crate::kernels::gpu_strided_copy_f64(
+            in_buf,
+            out_shape,
+            src_strides,
+            src_offset,
+            dev,
+        )
+        .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(result, input.device_ordinal()))
+    }
+
     fn strided_cat_f32(
         &self,
         input: &GpuBufferHandle,

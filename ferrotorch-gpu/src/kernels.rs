@@ -8078,6 +8078,152 @@ DONE:
 ";
 
 
+/// PTX source for `strided_copy_kernel`: general strided→contiguous
+/// gather with up to 8 dimensions. CL-496.
+///
+/// Thread `i` computes:
+///   flat = i
+///   src = src_offset_base
+///   for d in 0..8:
+///       coord = flat / out_stride[d]
+///       flat  = flat % out_stride[d]
+///       src  += coord * src_stride[d]
+///   out[i] = in[src]
+///
+/// For tensors with fewer than 8 dims, unused positions must be
+/// padded with `out_stride[d] = n + 1` (so `flat / out_stride[d] = 0`)
+/// and `src_stride[d] = 0` (so the contribution is zero).
+///
+/// Each stride is passed as an individual u32 kernel parameter to
+/// avoid needing a device-side stride array. 20 params total is well
+/// within the ~4KB param limit.
+#[cfg(feature = "cuda")]
+pub(crate) const STRIDED_COPY_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry strided_copy_kernel(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 src_offset_base,
+    .param .u32 n,
+    .param .u32 os0, .param .u32 os1, .param .u32 os2, .param .u32 os3,
+    .param .u32 os4, .param .u32 os5, .param .u32 os6, .param .u32 os7,
+    .param .u32 ss0, .param .u32 ss1, .param .u32 ss2, .param .u32 ss3,
+    .param .u32 ss4, .param .u32 ss5, .param .u32 ss6, .param .u32 ss7
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u32 %flat, %src_idx, %coord, %tmp, %os, %ss;
+    .reg .u64 %in, %out, %off;
+    .reg .f32 %val;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [input_ptr];
+    ld.param.u64 %out, [output_ptr];
+    ld.param.u32 %src_idx, [src_offset_base];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    mov.u32 %flat, %r_tid;
+
+    // Dim 0
+    ld.param.u32 %os, [os0];
+    ld.param.u32 %ss, [ss0];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 1
+    ld.param.u32 %os, [os1];
+    ld.param.u32 %ss, [ss1];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 2
+    ld.param.u32 %os, [os2];
+    ld.param.u32 %ss, [ss2];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 3
+    ld.param.u32 %os, [os3];
+    ld.param.u32 %ss, [ss3];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 4
+    ld.param.u32 %os, [os4];
+    ld.param.u32 %ss, [ss4];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 5
+    ld.param.u32 %os, [os5];
+    ld.param.u32 %ss, [ss5];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 6
+    ld.param.u32 %os, [os6];
+    ld.param.u32 %ss, [ss6];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Dim 7
+    ld.param.u32 %os, [os7];
+    ld.param.u32 %ss, [ss7];
+    div.u32 %coord, %flat, %os;
+    mul.lo.u32 %tmp, %coord, %os;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ss;
+    add.u32 %src_idx, %src_idx, %tmp;
+
+    // Load from in[src_idx]
+    cvt.u64.u32 %off, %src_idx;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %in, %off;
+    ld.global.f32 %val, [%off];
+
+    // Store to out[r_tid]
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %out, %off;
+    st.global.f32 [%off], %val;
+
+DONE:
+    ret;
+}
+";
+
+
 /// PTX source for `div_kernel`: `out[i] = a[i] / b[i]`.
 #[cfg(feature = "cuda")]
 pub(crate) const DIV_PTX: &str = "\
@@ -11575,6 +11721,299 @@ pub fn gpu_strided_cat(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public API -- Strided copy (general N-d gather) -- CL-496
+// ---------------------------------------------------------------------------
+
+/// Maximum rank supported by [`gpu_strided_copy`] and [`gpu_strided_copy_f64`].
+/// Matches the unrolled PTX kernel's dimension count.
+pub const STRIDED_COPY_MAX_DIMS: usize = 8;
+
+/// Pad-and-validate the (out_shape, src_strides) pair for the
+/// strided-copy kernel.
+///
+/// Returns a fixed-size `[MAX_DIMS]` pair of arrays where:
+/// - `out_stride[d]` is the contiguous output stride (in elements)
+///   for that dim, with unused trailing dims filled with `n + 1` so
+///   that `flat / out_stride[d] == 0` in the kernel (no contribution).
+/// - `src_stride[d]` is the source stride (in elements) for that
+///   dim, with unused trailing dims filled with 0 so the source-
+///   offset contribution is zero.
+///
+/// `out_shape` and `src_strides` must have the same length, at most
+/// `STRIDED_COPY_MAX_DIMS`. `n` is the product of `out_shape`.
+#[cfg(feature = "cuda")]
+fn pad_strided_copy_params(
+    out_shape: &[usize],
+    src_strides: &[isize],
+    n: usize,
+) -> GpuResult<([u32; STRIDED_COPY_MAX_DIMS], [u32; STRIDED_COPY_MAX_DIMS])> {
+    if out_shape.len() != src_strides.len() {
+        return Err(GpuError::ShapeMismatch {
+            op: "strided_copy_pad",
+            expected: vec![out_shape.len()],
+            got: vec![src_strides.len()],
+        });
+    }
+    if out_shape.len() > STRIDED_COPY_MAX_DIMS {
+        return Err(GpuError::ShapeMismatch {
+            op: "strided_copy_pad",
+            expected: vec![STRIDED_COPY_MAX_DIMS],
+            got: vec![out_shape.len()],
+        });
+    }
+    // Reject negative source strides — the kernel treats them as u32
+    // which would wrap around and produce garbage indices.
+    for &s in src_strides {
+        if s < 0 {
+            return Err(GpuError::ShapeMismatch {
+                op: "strided_copy_pad_negative_stride",
+                expected: vec![0],
+                got: vec![s.unsigned_abs()],
+            });
+        }
+    }
+
+    let rank = out_shape.len();
+    // Compute contiguous output strides: stride[rank-1] = 1,
+    // stride[d] = stride[d+1] * shape[d+1].
+    let mut out_stride = [0u32; STRIDED_COPY_MAX_DIMS];
+    if rank > 0 {
+        let mut acc: usize = 1;
+        for d in (0..rank).rev() {
+            if acc > u32::MAX as usize {
+                return Err(GpuError::ShapeMismatch {
+                    op: "strided_copy_stride_overflow",
+                    expected: vec![u32::MAX as usize],
+                    got: vec![acc],
+                });
+            }
+            out_stride[d] = acc as u32;
+            acc = acc.saturating_mul(out_shape[d]);
+        }
+    }
+
+    // Pad unused dims with `n + 1` so `flat / out_stride[d] == 0`
+    // in the kernel (any flat < n is strictly less than n + 1).
+    let pad_val = (n as u32).saturating_add(1).max(1);
+    for d in rank..STRIDED_COPY_MAX_DIMS {
+        out_stride[d] = pad_val;
+    }
+
+    // src_stride with 0 fill for unused dims (no contribution).
+    let mut src_stride_out = [0u32; STRIDED_COPY_MAX_DIMS];
+    for d in 0..rank {
+        let s = src_strides[d];
+        if s as usize > u32::MAX as usize {
+            return Err(GpuError::ShapeMismatch {
+                op: "strided_copy_src_stride_overflow",
+                expected: vec![u32::MAX as usize],
+                got: vec![s as usize],
+            });
+        }
+        src_stride_out[d] = s as u32;
+    }
+
+    Ok((out_stride, src_stride_out))
+}
+
+/// Gather a non-contiguous strided view of `input` into a new
+/// contiguous output buffer, entirely on GPU. CL-496.
+///
+/// # Arguments
+///
+/// * `input`      — the storage backing the strided view. Must be
+///   on `device`.
+/// * `out_shape`  — shape of the contiguous output (and of the
+///   logical view). `out_shape.len() <= STRIDED_COPY_MAX_DIMS`.
+/// * `src_strides` — source element strides per dim, aligned with
+///   `out_shape`. Must be non-negative (no reverse views yet).
+/// * `src_offset`  — base element offset into `input` for the view.
+/// * `device`     — CUDA device.
+///
+/// # Returns
+///
+/// A contiguous `CudaBuffer<f32>` with `product(out_shape)` elements.
+///
+/// # Errors
+///
+/// - [`GpuError::DeviceMismatch`] if `input` and `device` differ.
+/// - [`GpuError::ShapeMismatch`] on rank mismatch, too many dims,
+///   negative strides, or stride overflow of `u32::MAX`.
+/// - [`GpuError::Driver`] on CUDA runtime errors.
+#[cfg(feature = "cuda")]
+pub fn gpu_strided_copy(
+    input: &CudaBuffer<f32>,
+    out_shape: &[usize],
+    src_strides: &[isize],
+    src_offset: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_unary(input, device)?;
+
+    let n: usize = out_shape.iter().product();
+    let (out_stride, src_stride) = pad_strided_copy_params(out_shape, src_strides, n)?;
+
+    if n == 0 {
+        return alloc_zeros_f32(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        STRIDED_COPY_PTX,
+        "strided_copy_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback — decode indices on the host.
+            let host = gpu_to_cpu(input, device)?;
+            let mut result = vec![0.0f32; n];
+            for i in 0..n {
+                let mut flat = i as u32;
+                let mut src_idx = src_offset as u32;
+                for d in 0..STRIDED_COPY_MAX_DIMS {
+                    let os = out_stride[d];
+                    let ss = src_stride[d];
+                    let coord = flat / os;
+                    flat -= coord * os;
+                    src_idx += coord * ss;
+                }
+                result[i] = host[src_idx as usize];
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let src_offset_u32 = src_offset as u32;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&src_offset_u32)
+            .arg(&n_u32)
+            .arg(&out_stride[0])
+            .arg(&out_stride[1])
+            .arg(&out_stride[2])
+            .arg(&out_stride[3])
+            .arg(&out_stride[4])
+            .arg(&out_stride[5])
+            .arg(&out_stride[6])
+            .arg(&out_stride[7])
+            .arg(&src_stride[0])
+            .arg(&src_stride[1])
+            .arg(&src_stride[2])
+            .arg(&src_stride[3])
+            .arg(&src_stride[4])
+            .arg(&src_stride[5])
+            .arg(&src_stride[6])
+            .arg(&src_stride[7])
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+/// f64 variant of [`gpu_strided_copy`]. CL-496.
+#[cfg(feature = "cuda")]
+pub fn gpu_strided_copy_f64(
+    input: &CudaBuffer<f64>,
+    out_shape: &[usize],
+    src_strides: &[isize],
+    src_offset: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    validate_device(input, device)?;
+
+    let n: usize = out_shape.iter().product();
+    let (out_stride, src_stride) = pad_strided_copy_params(out_shape, src_strides, n)?;
+
+    if n == 0 {
+        return alloc_zeros_f64(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(
+        &CACHE,
+        STRIDED_COPY_PTX,
+        "strided_copy_kernel",
+        "strided_copy_f64_kernel",
+    );
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "strided_copy_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut result = vec![0.0f64; n];
+            for i in 0..n {
+                let mut flat = i as u32;
+                let mut src_idx = src_offset as u32;
+                for d in 0..STRIDED_COPY_MAX_DIMS {
+                    let os = out_stride[d];
+                    let ss = src_stride[d];
+                    let coord = flat / os;
+                    flat -= coord * os;
+                    src_idx += coord * ss;
+                }
+                result[i] = host[src_idx as usize];
+            }
+            return cpu_to_gpu(&result, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let src_offset_u32 = src_offset as u32;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&src_offset_u32)
+            .arg(&n_u32)
+            .arg(&out_stride[0])
+            .arg(&out_stride[1])
+            .arg(&out_stride[2])
+            .arg(&out_stride[3])
+            .arg(&out_stride[4])
+            .arg(&out_stride[5])
+            .arg(&out_stride[6])
+            .arg(&out_stride[7])
+            .arg(&src_stride[0])
+            .arg(&src_stride[1])
+            .arg(&src_stride[2])
+            .arg(&src_stride[3])
+            .arg(&src_stride[4])
+            .arg(&src_stride[5])
+            .arg(&src_stride[6])
+            .arg(&src_stride[7])
+            .launch(cfg)?;
+    }
+
+    Ok(out)
 }
 
 /// Scalar multiply: `out[i] = a[i] * scalar`.
@@ -16233,6 +16672,35 @@ pub fn gpu_strided_cat(
     Err(GpuError::NoCudaFeature)
 }
 
+/// Maximum rank stub for feature-disabled builds. Kept in sync with
+/// the cuda-enabled definition above.
+#[cfg(not(feature = "cuda"))]
+pub const STRIDED_COPY_MAX_DIMS: usize = 8;
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_strided_copy(
+    _input: &CudaBuffer<f32>,
+    _out_shape: &[usize],
+    _src_strides: &[isize],
+    _src_offset: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_strided_copy_f64(
+    _input: &CudaBuffer<f64>,
+    _out_shape: &[usize],
+    _src_strides: &[isize],
+    _src_offset: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
+
 // ---------------------------------------------------------------------------
 // f32-to-f16 GPU conversion
 // ---------------------------------------------------------------------------
@@ -17826,5 +18294,136 @@ mod tests {
                 (cb - ours).abs()
             );
         }
+    }
+
+    // -- gpu_strided_copy (CL-496) -------------------------------------
+
+    #[test]
+    fn strided_copy_identity_contiguous_2d() {
+        // 2x3 contiguous — source strides are C-contiguous.
+        // Source: [0, 1, 2, 3, 4, 5]
+        // Expected output == source (identity copy).
+        let data: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let (dev, input) = setup(&data);
+        let out = gpu_strided_copy(&input, &[2, 3], &[3, 1], 0, &dev)
+            .expect("strided_copy identity");
+        assert_buf_eq(&out, &dev, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn strided_copy_transpose_2d() {
+        // Source 2x3 contiguous:
+        //   [[0, 1, 2],
+        //    [3, 4, 5]]
+        // Transposed view shape [3, 2] with strides [1, 3]:
+        //   out[i, j] = src[j, i]
+        //   Expected: [[0, 3], [1, 4], [2, 5]] flat = [0, 3, 1, 4, 2, 5]
+        let data: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let (dev, input) = setup(&data);
+        let out = gpu_strided_copy(&input, &[3, 2], &[1, 3], 0, &dev)
+            .expect("strided_copy transpose");
+        assert_buf_eq(&out, &dev, &[0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn strided_copy_sliced_column() {
+        // Source 3x4 contiguous:
+        //   [[0, 1, 2, 3],
+        //    [4, 5, 6, 7],
+        //    [8, 9, 10, 11]]
+        // Select column 2 via src_offset=2, shape=[3], stride=[4]:
+        //   Expected: [2, 6, 10]
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let (dev, input) = setup(&data);
+        let out = gpu_strided_copy(&input, &[3], &[4], 2, &dev)
+            .expect("strided_copy col slice");
+        assert_buf_eq(&out, &dev, &[2.0, 6.0, 10.0]);
+    }
+
+    #[test]
+    fn strided_copy_3d_permute() {
+        // Source [2, 3, 4] contiguous, C-strides [12, 4, 1].
+        // Permute (0, 2, 1) → view shape [2, 4, 3] with strides [12, 1, 4].
+        //
+        // out[b, i, j] = src[b, j, i]
+        //
+        // Build expected by doing the permute on the host.
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let (dev, input) = setup(&data);
+        let out =
+            gpu_strided_copy(&input, &[2, 4, 3], &[12, 1, 4], 0, &dev).expect("strided_copy 3d");
+
+        let mut expected = vec![0.0f32; 24];
+        for b in 0..2 {
+            for i in 0..4 {
+                for j in 0..3 {
+                    let dst = b * 12 + i * 3 + j;
+                    let src = b * 12 + j * 4 + i;
+                    expected[dst] = data[src];
+                }
+            }
+        }
+        assert_buf_eq(&out, &dev, &expected);
+    }
+
+    #[test]
+    fn strided_copy_4d_max_rank_supported() {
+        // Rank 4 identity copy works.
+        let shape = [2usize, 3, 2, 2];
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let (dev, input) = setup(&data);
+        // C-contiguous strides: [12, 4, 2, 1]
+        let out = gpu_strided_copy(&input, &shape, &[12, 4, 2, 1], 0, &dev)
+            .expect("strided_copy 4d");
+        assert_buf_eq(&out, &dev, &data);
+    }
+
+    #[test]
+    fn strided_copy_rejects_too_many_dims() {
+        let (dev, input) = setup(&[0.0f32; 16]);
+        // 9 dims > STRIDED_COPY_MAX_DIMS (8)
+        let result = gpu_strided_copy(
+            &input,
+            &[1, 1, 1, 1, 1, 1, 1, 1, 16],
+            &[1; 9],
+            0,
+            &dev,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strided_copy_rejects_shape_stride_length_mismatch() {
+        let (dev, input) = setup(&[0.0f32; 12]);
+        let result = gpu_strided_copy(&input, &[3, 4], &[4, 1, 1], 0, &dev);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strided_copy_rejects_negative_stride() {
+        let (dev, input) = setup(&[0.0f32; 6]);
+        let result = gpu_strided_copy(&input, &[2, 3], &[3, -1], 0, &dev);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strided_copy_empty_output() {
+        let (dev, input) = setup(&[1.0f32, 2.0, 3.0]);
+        let out = gpu_strided_copy(&input, &[0, 3], &[3, 1], 0, &dev)
+            .expect("strided_copy empty");
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn strided_copy_f64_transpose_matches_f32() {
+        // Same transpose test as the f32 version, using f64.
+        let data: Vec<f64> = (0..6).map(|i| i as f64).collect();
+        let dev = GpuDevice::new(0).expect("CUDA device 0");
+        let input = cpu_to_gpu(&data, &dev).expect("cpu_to_gpu f64");
+        let out = gpu_strided_copy_f64(&input, &[3, 2], &[1, 3], 0, &dev)
+            .expect("strided_copy_f64 transpose");
+        let host = gpu_to_cpu(&out, &dev).expect("gpu_to_cpu f64");
+        assert_eq!(host, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
     }
 }

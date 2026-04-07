@@ -1354,6 +1354,31 @@ pub trait GpuBackend: Send + Sync {
         })
     }
 
+    // Strided copy: gather an N-d strided view into a contiguous
+    // output buffer entirely on GPU. CL-496.
+    fn strided_copy_f32(
+        &self,
+        _input: &GpuBufferHandle,
+        _out_shape: &[usize],
+        _src_strides: &[isize],
+        _src_offset: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "strided_copy_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn strided_copy_f64(
+        &self,
+        _input: &GpuBufferHandle,
+        _out_shape: &[usize],
+        _src_strides: &[isize],
+        _src_offset: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "strided_copy_f64 GPU op not yet implemented".into(),
+        })
+    }
+
     // Strided cat: write a sub-tensor into a larger buffer at an offset along one axis on GPU.
     #[allow(clippy::too_many_arguments)]
     fn strided_cat_f32(
