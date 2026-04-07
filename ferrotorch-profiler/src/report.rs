@@ -80,6 +80,50 @@ impl ProfileReport {
             .any(|e| e.device_type == DeviceType::Cuda)
     }
 
+    /// Sum of estimated FLOPS across all events that had a FLOPS
+    /// estimate. Events with `flops == None` (op not recognized,
+    /// shapes not recorded) are skipped. CL-333.
+    pub fn total_flops(&self) -> u64 {
+        self.events.iter().filter_map(|e| e.flops).sum()
+    }
+
+    /// Estimated total FLOPS divided by the wall-clock CPU time
+    /// (microseconds) of the run, expressed as FLOPS per second
+    /// (i.e. multiply by 1e6 from MFLOPS, which is what dividing by
+    /// microseconds gives you). Returns 0 when there are no events
+    /// or no time elapsed. CL-333.
+    pub fn flops_per_second(&self) -> f64 {
+        let total = self.total_flops() as f64;
+        let elapsed_us = self.total_time_us() as f64;
+        if elapsed_us > 0.0 {
+            total * 1_000_000.0 / elapsed_us
+        } else {
+            0.0
+        }
+    }
+
+    /// Group memory events by their `MemoryCategory`, returning
+    /// `(category, net_bytes)` pairs. Allocations are positive, frees
+    /// are negative; the result is the running net allocation per
+    /// category. CL-333.
+    pub fn memory_by_category(&self) -> Vec<(crate::event::MemoryCategory, i64)> {
+        let mut totals: HashMap<crate::event::MemoryCategory, i64> = HashMap::new();
+        for event in &self.events {
+            if let (Some(bytes), Some(cat)) = (event.memory_bytes, event.memory_category) {
+                *totals.entry(cat).or_insert(0) += bytes;
+            }
+        }
+        let mut out: Vec<(crate::event::MemoryCategory, i64)> = totals.into_iter().collect();
+        // Sort by absolute byte size descending so largest category first.
+        out.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
+        out
+    }
+
+    /// Whether any events have a non-empty stack trace. CL-333.
+    pub fn has_stack_traces(&self) -> bool {
+        self.events.iter().any(|e| e.stack_trace.is_some())
+    }
+
     /// Top operations sorted by cumulative time (descending).
     pub fn top_ops(&self, n: usize) -> Vec<OpSummary> {
         // Per-op accumulator.

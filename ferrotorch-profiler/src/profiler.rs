@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::event::{DeviceType, GpuTimingPair, ProfileEvent};
+use crate::event::{DeviceType, GpuTimingPair, MemoryCategory, ProfileEvent};
+use crate::flops;
 use crate::report::ProfileReport;
 use ferrotorch_core::profiler_hook;
 
@@ -74,20 +75,30 @@ impl Profiler {
             return;
         }
         let start_us = self.elapsed_us();
-        let input_shapes = if self.config.record_shapes {
+        let input_shapes_vec: Vec<Vec<usize>> = if self.config.record_shapes {
             shapes.iter().map(|s| s.to_vec()).collect()
         } else {
             Vec::new()
+        };
+        // FLOPS estimate from shapes (only when record_shapes is on,
+        // otherwise we have nothing to estimate from).
+        let flops = if self.config.record_shapes {
+            flops::estimate(name, &input_shapes_vec)
+        } else {
+            None
         };
         let event = ProfileEvent {
             name: name.to_owned(),
             category: category.to_owned(),
             start_us,
             duration_us: 0,
-            input_shapes,
+            input_shapes: input_shapes_vec,
             memory_bytes: None,
+            memory_category: None,
             thread_id: current_thread_id(),
             device_type: DeviceType::Cpu,
+            flops,
+            stack_trace: self.maybe_capture_stack(),
         };
         self.push_event(event);
     }
@@ -105,14 +116,31 @@ impl Profiler {
             duration_us,
             input_shapes: Vec::new(),
             memory_bytes: None,
+            memory_category: None,
             thread_id: current_thread_id(),
             device_type: DeviceType::Cpu,
+            flops: None,
+            stack_trace: self.maybe_capture_stack(),
         };
         self.push_event(event);
     }
 
-    /// Record a memory allocation or free event.
+    /// Record a memory allocation or free event with the default
+    /// "Other" category. Use [`record_memory_categorized`] to attach
+    /// a specific category.
     pub fn record_memory(&self, name: &str, bytes: i64) {
+        self.record_memory_categorized(name, bytes, MemoryCategory::Other);
+    }
+
+    /// Record a memory allocation or free event with a specific
+    /// category (Activations, Parameters, OptimizerState, Gradients,
+    /// Other). CL-333.
+    pub fn record_memory_categorized(
+        &self,
+        name: &str,
+        bytes: i64,
+        category: MemoryCategory,
+    ) {
         if !self.active.load(Ordering::Relaxed) || !self.config.record_memory {
             return;
         }
@@ -123,8 +151,11 @@ impl Profiler {
             duration_us: 0,
             input_shapes: Vec::new(),
             memory_bytes: Some(bytes),
+            memory_category: Some(category),
             thread_id: current_thread_id(),
             device_type: DeviceType::Cpu,
+            flops: None,
+            stack_trace: self.maybe_capture_stack(),
         };
         self.push_event(event);
     }
@@ -157,11 +188,27 @@ impl Profiler {
             duration_us: timing.end_us.saturating_sub(timing.start_us),
             input_shapes: Vec::new(),
             memory_bytes: None,
+            memory_category: None,
             thread_id: current_thread_id(),
             // BUG-17 fix: always Cuda for GPU ops, even when timed by CPU fallback.
             device_type: DeviceType::Cuda,
+            flops: None,
+            stack_trace: self.maybe_capture_stack(),
         };
         self.push_event_returning_index(event)
+    }
+
+    /// Capture a stack trace if `with_stack` is enabled in the config.
+    /// Uses [`std::backtrace::Backtrace::capture`] which is a no-op
+    /// (returns a Disabled backtrace) unless the `RUST_BACKTRACE` env
+    /// var is set, so the cost when stack capture is requested but the
+    /// env var is unset is just a few atomic loads.
+    fn maybe_capture_stack(&self) -> Option<String> {
+        if !self.config.with_stack {
+            return None;
+        }
+        let bt = std::backtrace::Backtrace::capture();
+        Some(format!("{bt}"))
     }
 
     /// Whether the profiler is currently active.
@@ -238,20 +285,29 @@ impl profiler_hook::OpProfiler for Profiler {
             return;
         }
         let start_us = self.elapsed_us().saturating_sub(duration_us);
-        let input_shapes = if self.config.record_shapes {
+        let input_shapes_vec: Vec<Vec<usize>> = if self.config.record_shapes {
             shapes.iter().map(|s| s.to_vec()).collect()
         } else {
             Vec::new()
+        };
+        // Estimate FLOPS from shapes when shape recording is on. CL-333.
+        let flops = if self.config.record_shapes {
+            flops::estimate(name, &input_shapes_vec)
+        } else {
+            None
         };
         let event = ProfileEvent {
             name: name.to_owned(),
             category: category.to_owned(),
             start_us,
             duration_us,
-            input_shapes,
+            input_shapes: input_shapes_vec,
             memory_bytes: None,
+            memory_category: None,
             thread_id: current_thread_id(),
             device_type: DeviceType::Cpu,
+            flops,
+            stack_trace: self.maybe_capture_stack(),
         };
         self.push_event(event);
     }

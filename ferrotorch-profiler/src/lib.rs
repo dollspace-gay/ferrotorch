@@ -21,11 +21,12 @@
 //! ```
 
 mod event;
+pub mod flops;
 mod profiler;
 mod report;
 pub mod schedule;
 
-pub use event::ProfileEvent;
+pub use event::{MemoryCategory, ProfileEvent};
 pub use profiler::{ProfileConfig, Profiler, with_profiler};
 pub use report::{OpSummary, ProfileReport};
 pub use schedule::{ProfileSchedule, SchedulePhase};
