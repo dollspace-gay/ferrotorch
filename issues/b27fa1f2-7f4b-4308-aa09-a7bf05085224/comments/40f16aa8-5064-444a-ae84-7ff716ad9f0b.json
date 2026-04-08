@@ -1,0 +1,10 @@
+{
+  "uuid": "40f16aa8-5064-444a-ae84-7ff716ad9f0b",
+  "issue_uuid": "b27fa1f2-7f4b-4308-aa09-a7bf05085224",
+  "author": "y4rr",
+  "content": "Implemented via commit bd8bb3c8. Added fake_quantize_differentiable tensor-level op in grad_fns::quantize_grad that integrates clipped STE with the autograd engine. Forward: round+clamp+dequantize. Backward: zero gradient for values outside [(qmin-zp)*scale, (qmax-zp)*scale], pass-through for in-range. Wired as a real GradFn so it composes with every other op. 12 tests covering forward correctness, asymmetric zero-point, clamping, STE backward for in/out-of-range, no_grad context, and chained Relu composition. 989 ferrotorch-core tests pass.",
+  "created_at": "2026-04-08T00:25:26.986607675Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABApvjMBtu7rCjLog4w00lh6yBe2Q7KwIf2eH3FT0an5HO/01maKNAyGbJYyZ9PjW/DuImTnFM+2fWjMB2dcRfeAg=="
+}
