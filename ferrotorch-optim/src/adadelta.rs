@@ -14,9 +14,10 @@
 
 use std::collections::HashMap;
 
-use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, no_grad};
+use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, Tensor, no_grad};
 use ferrotorch_nn::Parameter;
 
+use crate::foreach_utils::f64_scalar_on;
 use crate::optimizer::{Optimizer, OptimizerState, ParamGroup};
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,8 @@ pub struct AdadeltaConfig {
     pub eps: f64,
     /// Weight decay coefficient (default: 0.0).
     pub weight_decay: f64,
+    /// When `true`, use the on-device tensor-op update path. CL-497
+    pub foreach: bool,
 }
 
 impl Default for AdadeltaConfig {
@@ -45,6 +48,7 @@ impl Default for AdadeltaConfig {
             rho: 0.9,
             eps: 1e-6,
             weight_decay: 0.0,
+            foreach: false,
         }
     }
 }
@@ -60,6 +64,14 @@ struct AdadeltaParamState {
     square_avg: Vec<f64>,
     /// Running average of squared parameter deltas.
     acc_delta: Vec<f64>,
+}
+
+/// On-device foreach state for Adadelta.
+#[derive(Debug)]
+struct AdadeltaForeachState<T: Float> {
+    step_count: u64,
+    square_avg: Tensor<T>,
+    acc_delta: Tensor<T>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +96,8 @@ pub struct Adadelta<T: Float> {
     param_groups: Vec<ParamGroup<T>>,
     config: AdadeltaConfig,
     state: HashMap<String, AdadeltaParamState>,
+    /// Foreach (on-device) state. Used when `config.foreach == true`.
+    foreach_state: HashMap<String, AdadeltaForeachState<T>>,
 }
 
 impl<T: Float> Adadelta<T> {
@@ -95,6 +109,7 @@ impl<T: Float> Adadelta<T> {
             param_groups: vec![group],
             config,
             state: HashMap::new(),
+            foreach_state: HashMap::new(),
         }
     }
 
@@ -102,10 +117,112 @@ impl<T: Float> Adadelta<T> {
     fn param_key(group_idx: usize, param_idx: usize) -> String {
         format!("g{group_idx}_p{param_idx}")
     }
+
+    /// Foreach (on-device, tensor-op) update path. CL-497
+    fn step_foreach(&mut self) -> FerrotorchResult<()> {
+        use ferrotorch_core::creation::zeros;
+        use ferrotorch_core::grad_fns::arithmetic::{add, div, mul, sqrt, sub};
+
+        let config = self.config;
+        let rho = config.rho;
+
+        for gi in 0..self.param_groups.len() {
+            let group_lr = self.param_groups[gi].lr;
+            let group_wd = self.param_groups[gi].weight_decay;
+
+            for pi in 0..self.param_groups[gi].params.len() {
+                let grad_opt = self.param_groups[gi].params[pi].grad()?;
+                let grad_tensor = match grad_opt {
+                    Some(g) => g,
+                    None => continue,
+                };
+
+                let param_t =
+                    self.param_groups[gi].params[pi].tensor().clone();
+                let device = param_t.device();
+                let key = Self::param_key(gi, pi);
+
+                if !self.foreach_state.contains_key(&key) {
+                    self.foreach_state.insert(
+                        key.clone(),
+                        AdadeltaForeachState {
+                            step_count: 0,
+                            square_avg: zeros::<T>(param_t.shape())?.to(device)?,
+                            acc_delta: zeros::<T>(param_t.shape())?.to(device)?,
+                        },
+                    );
+                }
+
+                no_grad(|| {
+                    // grad with L2 decay if enabled.
+                    let mut grad: Tensor<T> = grad_tensor.clone();
+                    if group_wd > 0.0 {
+                        let wd_t = f64_scalar_on::<T>(group_wd, device)?;
+                        let weighted = mul(&param_t, &wd_t)?;
+                        grad = add(&grad, &weighted)?;
+                    }
+
+                    let rho_t = f64_scalar_on::<T>(rho, device)?;
+                    let one_minus_rho = f64_scalar_on::<T>(1.0 - rho, device)?;
+                    let eps_t = f64_scalar_on::<T>(config.eps, device)?;
+
+                    // square_avg = rho * square_avg + (1 - rho) * g^2
+                    let sq_old = self.foreach_state[&key].square_avg.clone();
+                    let g_sq = mul(&grad, &grad)?;
+                    let square_avg_new = add(
+                        &mul(&sq_old, &rho_t)?,
+                        &mul(&g_sq, &one_minus_rho)?,
+                    )?;
+
+                    // std = sqrt(square_avg + eps)
+                    let std_sq = add(&square_avg_new, &eps_t)?;
+                    let std = sqrt(&std_sq)?;
+
+                    // delta = sqrt(acc_delta + eps) / std * grad
+                    let acc_delta_old =
+                        self.foreach_state[&key].acc_delta.clone();
+                    let ad_plus_eps = add(&acc_delta_old, &eps_t)?;
+                    let sqrt_ad = sqrt(&ad_plus_eps)?;
+                    let ratio = div(&sqrt_ad, &std)?;
+                    let delta = mul(&ratio, &grad)?;
+
+                    // acc_delta = rho * acc_delta + (1 - rho) * delta^2
+                    let delta_sq = mul(&delta, &delta)?;
+                    let acc_delta_new = add(
+                        &mul(&acc_delta_old, &rho_t)?,
+                        &mul(&delta_sq, &one_minus_rho)?,
+                    )?;
+
+                    // param = param - lr * delta
+                    let lr_t = f64_scalar_on::<T>(group_lr, device)?;
+                    let scaled = mul(&delta, &lr_t)?;
+                    let new_param = sub(&param_t, &scaled)?;
+
+                    // Commit.
+                    let (storage, _) = new_param.into_storage_and_shape()?;
+                    // SAFETY: optimizer step inside no_grad, exclusive access.
+                    unsafe { param_t.update_storage(storage)? };
+
+                    let state = self.foreach_state.get_mut(&key).unwrap();
+                    state.step_count += 1;
+                    state.square_avg = square_avg_new;
+                    state.acc_delta = acc_delta_new;
+
+                    Ok::<(), ferrotorch_core::FerrotorchError>(())
+                })?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<T: Float> Optimizer<T> for Adadelta<T> {
     fn step(&mut self) -> FerrotorchResult<()> {
+        if self.config.foreach {
+            return self.step_foreach();
+        }
+
         let config = self.config;
         let rho = config.rho;
 
@@ -413,5 +530,96 @@ mod tests {
             val < 5.0,
             "param should decrease with positive gradient, got {val}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Foreach mode parity tests. CL-497
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_adadelta_foreach_basic_parity() {
+        let p_legacy = Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
+        let p_foreach = Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
+
+        let mut legacy = Adadelta::new(vec![p_legacy.clone()], AdadeltaConfig::default());
+        let mut foreach = Adadelta::new(
+            vec![p_foreach.clone()],
+            AdadeltaConfig {
+                foreach: true,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..5 {
+            let g = Tensor::from_storage(
+                TensorStorage::cpu(vec![0.1f32, 0.2, -0.3, 0.4]),
+                vec![4],
+                false,
+            )
+            .unwrap();
+            p_legacy.set_grad(Some(g.clone())).unwrap();
+            p_foreach.set_grad(Some(g)).unwrap();
+            legacy.step().unwrap();
+            foreach.step().unwrap();
+        }
+
+        let l = legacy.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        let f = foreach.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        for (a, b) in l.iter().zip(f.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "adadelta foreach parity: legacy={a}, foreach={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adadelta_foreach_parity_with_weight_decay() {
+        let p_legacy = Parameter::from_slice(&[5.0f32, -3.0, 2.0], &[3]).unwrap();
+        let p_foreach = Parameter::from_slice(&[5.0f32, -3.0, 2.0], &[3]).unwrap();
+
+        let cfg = AdadeltaConfig {
+            weight_decay: 0.02,
+            ..Default::default()
+        };
+        let mut legacy = Adadelta::new(vec![p_legacy.clone()], cfg);
+        let mut foreach = Adadelta::new(
+            vec![p_foreach.clone()],
+            AdadeltaConfig { foreach: true, ..cfg },
+        );
+
+        for _ in 0..6 {
+            let g = Tensor::from_storage(
+                TensorStorage::cpu(vec![0.5f32, -0.5, 1.0]),
+                vec![3],
+                false,
+            )
+            .unwrap();
+            p_legacy.set_grad(Some(g.clone())).unwrap();
+            p_foreach.set_grad(Some(g)).unwrap();
+            legacy.step().unwrap();
+            foreach.step().unwrap();
+        }
+
+        let l = legacy.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        let f = foreach.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        for (a, b) in l.iter().zip(f.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "adadelta wd parity: legacy={a}, foreach={b}"
+            );
+        }
     }
 }

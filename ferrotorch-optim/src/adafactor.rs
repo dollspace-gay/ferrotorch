@@ -343,7 +343,7 @@ mod tests {
             false,
         )
         .unwrap();
-        param.tensor().set_grad(Some(g));
+        param.tensor().set_grad(Some(g)).unwrap();
     }
 
     #[test]
