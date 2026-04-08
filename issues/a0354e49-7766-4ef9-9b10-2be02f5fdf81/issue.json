@@ -2,11 +2,12 @@
   "uuid": "a0354e49-7766-4ef9-9b10-2be02f5fdf81",
   "display_id": 398,
   "title": "CubeCL actual GPU kernels — currently all ops fall back to CPU despite abstraction",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "anon-a7c6025f",
   "created_at": "2026-03-24T19:57:12.958623575Z",
-  "updated_at": "2026-03-24T19:57:14.455799229Z",
+  "updated_at": "2026-04-08T04:29:10.926445766Z",
+  "closed_at": "2026-04-08T04:29:10.926445766Z",
   "labels": [
     "feature"
   ]
