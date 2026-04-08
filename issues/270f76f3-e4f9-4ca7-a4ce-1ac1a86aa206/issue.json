@@ -2,11 +2,12 @@
   "uuid": "270f76f3-e4f9-4ca7-a4ce-1ac1a86aa206",
   "display_id": 497,
   "title": "Add foreach (on-device) update path to remaining optimizers",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-04-07T13:10:27.147537603Z",
-  "updated_at": "2026-04-07T13:10:28.723711923Z",
+  "updated_at": "2026-04-08T05:22:03.341933261Z",
+  "closed_at": "2026-04-08T05:22:03.341933261Z",
   "labels": [
     "feature"
   ]
