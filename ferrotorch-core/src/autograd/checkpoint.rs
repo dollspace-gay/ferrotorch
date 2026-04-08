@@ -153,7 +153,12 @@ where
 fn save_gpu_rng_state<T: Float>(tensor: &Tensor<T>) -> Option<GpuRngState> {
     let device_ordinal = match tensor.device() {
         crate::device::Device::Cuda(id) => id,
-        crate::device::Device::Cpu | crate::device::Device::Meta => return None,
+        // XPU has no CUDA-style RNG state to save: ferrotorch-xpu
+        // delegates to the cubecl wgpu runtime which manages its own
+        // RNG. Treat XPU like CPU here. CL-452.
+        crate::device::Device::Xpu(_)
+        | crate::device::Device::Cpu
+        | crate::device::Device::Meta => return None,
     };
     let backend = crate::gpu_dispatch::gpu_backend()?;
     backend.save_rng_state(device_ordinal).ok()

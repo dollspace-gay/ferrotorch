@@ -73,6 +73,7 @@ impl<T: Element> TensorStorage<T> {
                 let handle = backend.cpu_to_gpu(bytes, std::mem::size_of::<T>(), ordinal)?;
                 Ok(Self::gpu(handle))
             }
+            Device::Xpu(ordinal) => Ok(Self::xpu(data, ordinal)),
             Device::Meta => {
                 // Discard the data; only the element count matters.
                 Ok(Self::meta(data.len()))
@@ -103,7 +104,20 @@ impl<T: Element> TensorStorage<T> {
                     backend.cpu_to_gpu_pinned(bytes, std::mem::size_of::<T>(), ordinal)?;
                 Ok(Self::gpu(handle))
             }
+            Device::Xpu(ordinal) => Ok(Self::xpu(data, ordinal)),
             Device::Meta => Ok(Self::meta(data.len())),
+        }
+    }
+
+    /// Create XPU storage with the given ordinal. The data is held as a
+    /// CPU-resident `Vec<T>` (no DMA today); the device marker drives
+    /// dispatch through the `ferrotorch-xpu` crate, which uses a
+    /// CubeCL wgpu runtime to actually run kernels on Intel GPUs.
+    /// CL-452.
+    pub fn xpu(data: Vec<T>, ordinal: usize) -> Self {
+        Self {
+            data: StorageBuffer::Cpu(data),
+            device: Device::Xpu(ordinal),
         }
     }
 

@@ -813,6 +813,54 @@ impl<T: Float> Tensor<T> {
                 let cpu = self.to(Device::Cpu)?;
                 cpu.to(Device::Cuda(b))
             }
+            // CPU → XPU: zero-copy retag. XPU storage is a CPU `Vec<T>`
+            // today; the device marker drives op dispatch through
+            // ferrotorch-xpu. CL-452.
+            (Device::Cpu, Device::Xpu(ordinal)) => {
+                let contiguous_self = if !self.is_contiguous() {
+                    crate::methods::contiguous_t(self)?
+                } else {
+                    self.clone()
+                };
+                let data = contiguous_self.data()?.to_vec();
+                let storage = TensorStorage::xpu(data, ordinal);
+                if needs_grad_fn {
+                    let grad_fn = Arc::new(ToDeviceBackward {
+                        source: self.clone(),
+                    });
+                    Tensor::from_operation(storage, self.shape().to_vec(), grad_fn)
+                } else {
+                    Tensor::from_storage(storage, self.shape().to_vec(), self.requires_grad())
+                }
+            }
+            // XPU → CPU: retag back as CPU storage. Zero-copy. CL-452.
+            (Device::Xpu(_), Device::Cpu) => {
+                let data = self.data()?.to_vec();
+                let storage = TensorStorage::cpu(data);
+                if needs_grad_fn {
+                    let grad_fn = Arc::new(ToDeviceBackward {
+                        source: self.clone(),
+                    });
+                    Tensor::from_operation(storage, self.shape().to_vec(), grad_fn)
+                } else {
+                    Tensor::from_storage(storage, self.shape().to_vec(), self.requires_grad())
+                }
+            }
+            // XPU → XPU on a different ordinal: route through CPU for
+            // now. CL-452.
+            (Device::Xpu(a), Device::Xpu(b)) if a != b => {
+                let cpu = self.to(Device::Cpu)?;
+                cpu.to(Device::Xpu(b))
+            }
+            // CUDA ↔ XPU: round-trip via CPU. CL-452.
+            (Device::Cuda(_), Device::Xpu(_)) => {
+                let cpu = self.to(Device::Cpu)?;
+                cpu.to(device)
+            }
+            (Device::Xpu(_), Device::Cuda(_)) => {
+                let cpu = self.to(Device::Cpu)?;
+                cpu.to(device)
+            }
             // Move TO the meta device: drop the data, keep shape only.
             // Works from any source device.
             (_, Device::Meta) => {

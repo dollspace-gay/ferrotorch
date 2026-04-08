@@ -1718,6 +1718,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrotorch-xpu"
+version = "0.2.3"
+dependencies = [
+ "ferrotorch-core",
+ "ferrotorch-cubecl",
+ "num-traits",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"

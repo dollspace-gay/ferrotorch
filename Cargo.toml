@@ -14,6 +14,7 @@ members = [
     "ferrotorch-gpu",
     "ferrotorch-distributed",
     "ferrotorch-cubecl",
+    "ferrotorch-xpu",
     "ferrotorch-distributions",
     "ferrotorch-profiler",
     "ferrotorch-hub",
@@ -44,6 +45,7 @@ ferrotorch-gpu = { version = "0.2.3", path = "ferrotorch-gpu" }
 ferrotorch-distributed = { version = "0.2.3", path = "ferrotorch-distributed" }
 ferrotorch-train = { version = "0.2.3", path = "ferrotorch-train" }
 ferrotorch-cubecl = { version = "0.2.3", path = "ferrotorch-cubecl" }
+ferrotorch-xpu = { version = "0.2.3", path = "ferrotorch-xpu" }
 ferrotorch-distributions = { version = "0.2.3", path = "ferrotorch-distributions" }
 ferrotorch-profiler = { version = "0.2.3", path = "ferrotorch-profiler" }
 ferrotorch-hub = { version = "0.2.3", path = "ferrotorch-hub" }
