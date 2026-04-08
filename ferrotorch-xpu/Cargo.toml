@@ -1,0 +1,24 @@
+[package]
+name = "ferrotorch-xpu"
+description = "Intel XPU (Arc / Data Center GPU Max) backend for ferrotorch via CubeCL wgpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Default-on: ferrotorch-xpu only makes sense if a real GPU runtime is
+# available. The "wgpu" feature wires up the cubecl wgpu runtime which
+# targets Intel via the Vulkan API.
+default = ["wgpu"]
+wgpu = ["ferrotorch-cubecl/wgpu"]
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ferrotorch-cubecl = { workspace = true }
+num-traits = { workspace = true }

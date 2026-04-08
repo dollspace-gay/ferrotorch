@@ -5,6 +5,10 @@
 /// They are useful for shape inference, dry-run model construction, and
 /// inspecting parameter counts of huge models without actually allocating
 /// the weights. Mirrors `torch.device("meta")`.
+///
+/// `Xpu` mirrors PyTorch's `torch.device("xpu")` and addresses Intel
+/// GPUs (Arc series, Data Center GPU Max) via the portable CubeCL
+/// wgpu runtime that the `ferrotorch-xpu` crate wraps. CL-452.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Device {
     /// CPU main memory.
@@ -12,6 +16,10 @@ pub enum Device {
     Cpu,
     /// CUDA GPU with the given device index.
     Cuda(usize),
+    /// Intel XPU (Arc / Data Center GPU Max) with the given device index.
+    /// Accessed via `ferrotorch-xpu` which wraps a CubeCL wgpu runtime.
+    /// CL-452.
+    Xpu(usize),
     /// Meta device — shape-only, no backing storage. Operations that need
     /// data return an error; operations that only manipulate metadata
     /// (reshape, view, permute, narrow, transpose, …) work normally and
@@ -32,6 +40,12 @@ impl Device {
         matches!(self, Device::Cuda(_))
     }
 
+    /// Returns `true` if this is an Intel XPU device. CL-452.
+    #[inline]
+    pub fn is_xpu(&self) -> bool {
+        matches!(self, Device::Xpu(_))
+    }
+
     /// Returns `true` if this is the meta device (shape-only, no data).
     #[inline]
     pub fn is_meta(&self) -> bool {
@@ -44,6 +58,7 @@ impl core::fmt::Display for Device {
         match self {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
+            Device::Xpu(id) => write!(f, "xpu:{id}"),
             Device::Meta => write!(f, "meta"),
         }
     }
