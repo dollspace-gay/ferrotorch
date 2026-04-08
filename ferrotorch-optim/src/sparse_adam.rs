@@ -217,7 +217,7 @@ mod tests {
             false,
         )
         .unwrap();
-        param.tensor().set_grad(Some(grad));
+        param.tensor().set_grad(Some(grad)).unwrap();
 
         let mut opt = SparseAdam::new(vec![param.clone()], SparseAdamConfig::default());
         opt.step().unwrap();
@@ -244,7 +244,7 @@ mod tests {
             false,
         )
         .unwrap();
-        param.tensor().set_grad(Some(grad));
+        param.tensor().set_grad(Some(grad)).unwrap();
 
         let mut opt = SparseAdam::new(vec![param.clone()], SparseAdamConfig::default());
         opt.step().unwrap();
@@ -274,7 +274,8 @@ mod tests {
             .unwrap();
             opt.param_groups[0].params[0]
                 .tensor()
-                .set_grad(Some(grad));
+                .set_grad(Some(grad))
+                .unwrap();
             opt.step().unwrap();
         }
 
@@ -295,7 +296,7 @@ mod tests {
             false,
         )
         .unwrap();
-        param.tensor().set_grad(Some(grad));
+        param.tensor().set_grad(Some(grad)).unwrap();
 
         let mut opt = SparseAdam::new(vec![param], SparseAdamConfig::default());
         opt.zero_grad().unwrap();

@@ -11,9 +11,10 @@
 
 use std::collections::HashMap;
 
-use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, no_grad};
+use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, Tensor, no_grad};
 use ferrotorch_nn::Parameter;
 
+use crate::foreach_utils::f64_scalar_on;
 use crate::optimizer::{Optimizer, OptimizerState, ParamGroup};
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,8 @@ pub struct AsgdConfig {
     pub t0: f64,
     /// Weight decay coefficient (default: 0.0).
     pub weight_decay: f64,
+    /// When `true`, use the on-device tensor-op update path. CL-497
+    pub foreach: bool,
 }
 
 impl Default for AsgdConfig {
@@ -43,6 +46,7 @@ impl Default for AsgdConfig {
             alpha: 0.75,
             t0: 1e6,
             weight_decay: 0.0,
+            foreach: false,
         }
     }
 }
@@ -60,6 +64,16 @@ struct AsgdParamState {
     mu: f64,
     /// Running average of parameters.
     ax: Vec<f64>,
+}
+
+/// On-device foreach state for ASGD.
+#[derive(Debug)]
+struct AsgdForeachState<T: Float> {
+    step_count: u64,
+    eta: f64,
+    mu: f64,
+    /// Running average of parameters as a device-resident tensor.
+    ax: Tensor<T>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +99,8 @@ pub struct Asgd<T: Float> {
     param_groups: Vec<ParamGroup<T>>,
     config: AsgdConfig,
     state: HashMap<String, AsgdParamState>,
+    /// Foreach (on-device) state. Used when `config.foreach == true`.
+    foreach_state: HashMap<String, AsgdForeachState<T>>,
 }
 
 impl<T: Float> Asgd<T> {
@@ -96,6 +112,7 @@ impl<T: Float> Asgd<T> {
             param_groups: vec![group],
             config,
             state: HashMap::new(),
+            foreach_state: HashMap::new(),
         }
     }
 
@@ -111,10 +128,108 @@ impl<T: Float> Asgd<T> {
     fn param_key(group_idx: usize, param_idx: usize) -> String {
         format!("g{group_idx}_p{param_idx}")
     }
+
+    /// Foreach (on-device, tensor-op) update path. CL-497
+    fn step_foreach(&mut self) -> FerrotorchResult<()> {
+        use ferrotorch_core::grad_fns::arithmetic::{add, mul, sub};
+
+        let config = self.config;
+
+        for gi in 0..self.param_groups.len() {
+            let group_lr = self.param_groups[gi].lr;
+            let group_wd = self.param_groups[gi].weight_decay;
+
+            for pi in 0..self.param_groups[gi].params.len() {
+                let grad_opt = self.param_groups[gi].params[pi].grad()?;
+                let grad_tensor = match grad_opt {
+                    Some(g) => g,
+                    None => continue,
+                };
+
+                let param_t =
+                    self.param_groups[gi].params[pi].tensor().clone();
+                let device = param_t.device();
+                let key = Self::param_key(gi, pi);
+
+                // Lazy-init state. ax starts as a copy of the parameter.
+                if !self.foreach_state.contains_key(&key) {
+                    self.foreach_state.insert(
+                        key.clone(),
+                        AsgdForeachState {
+                            step_count: 0,
+                            eta: group_lr,
+                            mu: 1.0,
+                            ax: param_t.clone(),
+                        },
+                    );
+                }
+
+                no_grad(|| {
+                    // grad with L2 decay.
+                    let mut grad: Tensor<T> = grad_tensor.clone();
+                    if group_wd > 0.0 {
+                        let wd_t = f64_scalar_on::<T>(group_wd, device)?;
+                        let weighted = mul(&param_t, &wd_t)?;
+                        grad = add(&grad, &weighted)?;
+                    }
+
+                    let (eta, mu) = {
+                        let s = &self.foreach_state[&key];
+                        (s.eta, s.mu)
+                    };
+
+                    // p_new = p * (1 - lambd * eta) - eta * g
+                    let shrink_factor =
+                        f64_scalar_on::<T>(1.0 - config.lambd * eta, device)?;
+                    let eta_t = f64_scalar_on::<T>(eta, device)?;
+                    let shrunk = mul(&param_t, &shrink_factor)?;
+                    let scaled_grad = mul(&grad, &eta_t)?;
+                    let new_param = sub(&shrunk, &scaled_grad)?;
+
+                    // Update ax = ax + mu * (p_new - ax) if mu != 1, else ax = p_new.
+                    let ax_new = if mu != 1.0 {
+                        let ax_old = self.foreach_state[&key].ax.clone();
+                        let diff = sub(&new_param, &ax_old)?;
+                        let mu_t = f64_scalar_on::<T>(mu, device)?;
+                        let scaled_diff = mul(&diff, &mu_t)?;
+                        add(&ax_old, &scaled_diff)?
+                    } else {
+                        new_param.clone()
+                    };
+
+                    // Commit param.
+                    let (storage, _) = new_param.into_storage_and_shape()?;
+                    // SAFETY: optimizer step inside no_grad, exclusive access.
+                    unsafe { param_t.update_storage(storage)? };
+
+                    // Commit state + schedule updates.
+                    let next_step = self.foreach_state[&key].step_count + 1;
+                    let step = next_step as f64;
+                    let new_eta = group_lr
+                        / (1.0 + config.lambd * group_lr * step).powf(config.alpha);
+                    let new_mu = 1.0 / f64::max(1.0, step - config.t0);
+
+                    let state = self.foreach_state.get_mut(&key).unwrap();
+                    state.step_count = next_step;
+                    state.ax = ax_new;
+                    state.eta = new_eta;
+                    state.mu = new_mu;
+
+                    Ok::<(), ferrotorch_core::FerrotorchError>(())
+                })?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<T: Float> Optimizer<T> for Asgd<T> {
     fn step(&mut self) -> FerrotorchResult<()> {
+        if self.config.foreach {
+            return self.step_foreach();
+        }
+
         let config = self.config;
 
         for gi in 0..self.param_groups.len() {
@@ -397,6 +512,7 @@ mod tests {
                 lambd: 0.0,
                 alpha: 0.75,
                 weight_decay: 0.0,
+                foreach: false,
             },
         );
 
@@ -543,5 +659,99 @@ mod tests {
 
         let val = param_val(&opt, 0, 0);
         assert!(val.abs() < 5.0, "should have moved from 5.0, got {val}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Foreach mode parity tests. CL-497
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_asgd_foreach_basic_parity() {
+        let p_legacy = Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
+        let p_foreach = Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
+
+        let mut legacy = Asgd::new(vec![p_legacy.clone()], AsgdConfig::default());
+        let mut foreach = Asgd::new(
+            vec![p_foreach.clone()],
+            AsgdConfig {
+                foreach: true,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..5 {
+            let g = Tensor::from_storage(
+                TensorStorage::cpu(vec![0.1f32, 0.2, -0.3, 0.4]),
+                vec![4],
+                false,
+            )
+            .unwrap();
+            p_legacy.set_grad(Some(g.clone())).unwrap();
+            p_foreach.set_grad(Some(g)).unwrap();
+            legacy.step().unwrap();
+            foreach.step().unwrap();
+        }
+
+        let l = legacy.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        let f = foreach.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        for (a, b) in l.iter().zip(f.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "asgd foreach parity: legacy={a}, foreach={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_asgd_foreach_parity_with_weight_decay_and_averaging() {
+        // t0 = 0 so averaging kicks in immediately (mu < 1).
+        let p_legacy = Parameter::from_slice(&[2.0f32, -1.0, 0.5], &[3]).unwrap();
+        let p_foreach = Parameter::from_slice(&[2.0f32, -1.0, 0.5], &[3]).unwrap();
+
+        let cfg = AsgdConfig {
+            lr: 0.05,
+            weight_decay: 0.02,
+            t0: 0.0,
+            ..Default::default()
+        };
+        let mut legacy = Asgd::new(vec![p_legacy.clone()], cfg);
+        let mut foreach = Asgd::new(
+            vec![p_foreach.clone()],
+            AsgdConfig { foreach: true, ..cfg },
+        );
+
+        for _ in 0..6 {
+            let g = Tensor::from_storage(
+                TensorStorage::cpu(vec![0.3f32, -0.2, 0.1]),
+                vec![3],
+                false,
+            )
+            .unwrap();
+            p_legacy.set_grad(Some(g.clone())).unwrap();
+            p_foreach.set_grad(Some(g)).unwrap();
+            legacy.step().unwrap();
+            foreach.step().unwrap();
+        }
+
+        let l = legacy.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        let f = foreach.param_groups()[0].params[0]
+            .data()
+            .unwrap()
+            .to_vec();
+        for (a, b) in l.iter().zip(f.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "asgd wd+avg parity: legacy={a}, foreach={b}"
+            );
+        }
     }
 }
