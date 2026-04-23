@@ -1,0 +1,10 @@
+{
+  "uuid": "97dca0ba-9d3a-45ab-a2e4-077f832d77a6",
+  "issue_uuid": "cb5a79f2-07de-41c5-b58d-131c2e495603",
+  "author": "y4rr",
+  "content": "[action] Landed full Llama 3 8B inference stack: #505 GQA, #506 KVCache GQA, #507 sharded safetensors, #508 HF config parser, #510 tokenizers crate, #512 LlamaForCausalLM, #513 end-to-end smoke (loads real 8B weights, forwards 6 tokens in 41s producing a valid token). Plus supporting: #514 native bf16 Float, #515 RoPE NTK/YARN scaling, #517 clippy cleanup. Next: mixed-precision kernels for output coherence.",
+  "created_at": "2026-04-23T23:50:40.544162473Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtkOaTMaLmcwaA35DgYI4Obmf+4F5HnG6x1QO7+KwsDN2bUzgD1vquZywReCdzqvtJ5HNZ+O8ZM2UTrqHuJPuCw=="
+}
