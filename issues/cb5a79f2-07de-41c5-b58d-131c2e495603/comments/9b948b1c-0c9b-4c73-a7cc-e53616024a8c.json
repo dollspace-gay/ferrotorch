@@ -1,0 +1,10 @@
+{
+  "uuid": "9b948b1c-0c9b-4c73-a7cc-e53616024a8c",
+  "issue_uuid": "cb5a79f2-07de-41c5-b58d-131c2e495603",
+  "author": "y4rr",
+  "content": "Landed in b31366aa. Full pipeline verified: 291 tensors load from 4 shards in 24s, 6-token prefill through all 32 layers completes in 41s, argmax+decode produces a valid vocab-range token string. Output coherence limited by bf16 accumulator in generic kernels — mixed-precision follow-up needed for production generation.",
+  "created_at": "2026-04-23T23:50:18.787377688Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnRuh4kEeO7k6FOKxP2JYUBQA1BckrN9xf6aVW4blVOQFrwpGRdx1xxJZUx/10llwRUEXPQiEVPjzy6m0QDLZBQ=="
+}
