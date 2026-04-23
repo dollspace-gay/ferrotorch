@@ -17,3 +17,11 @@ ferrotorch-nn = { workspace = true }
 ferrotorch-serialize = { workspace = true }
 ferrotorch-hub = { workspace = true }
 num-traits = { workspace = true }
+
+[dev-dependencies]
+ferrotorch-tokenize = { workspace = true }
+half = { workspace = true }
+
+[[example]]
+name = "llama3_8b"
+path = "examples/llama3_8b.rs"
