@@ -1,0 +1,16 @@
+[package]
+name = "ferrotorch-tokenize"
+description = "Text tokenization wrapper around the HuggingFace tokenizers crate for ferrotorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+tokenizers = { workspace = true }
