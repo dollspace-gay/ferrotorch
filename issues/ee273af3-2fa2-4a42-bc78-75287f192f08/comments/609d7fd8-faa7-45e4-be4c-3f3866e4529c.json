@@ -1,0 +1,10 @@
+{
+  "uuid": "609d7fd8-faa7-45e4-be4c-3f3866e4529c",
+  "issue_uuid": "ee273af3-2fa2-4a42-bc78-75287f192f08",
+  "author": "y4rr",
+  "content": "Functionally complete via existing 'hf' CLI: user ran 'hf download meta-llama/Meta-Llama-3-8B' and all downstream crates (ferrotorch-serialize sharded loader #507, ferrotorch-llama example #513) consume the HF cache layout directly. A Rust wrapper for hf-token auth + programmatic download would still be nice-to-have for reproducible builds but is not on the critical path for Llama 3 8B inference. Leaving open for the wrapper work.",
+  "created_at": "2026-04-23T23:50:36.865821724Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASXRi3zXOq7roJ4xy36lS2RxR4huVAysod89E3B78Hwzp/dzDn+7UJ5aWEbdFocYy9JhGy5I3Bs9afc7ZDhdhBA=="
+}
