@@ -1,0 +1,10 @@
+{
+  "uuid": "d862db55-cf60-4dd5-9634-8c550ba9c959",
+  "issue_uuid": "cb5a79f2-07de-41c5-b58d-131c2e495603",
+  "author": "y4rr",
+  "content": "Landed full Llama 3 8B inference stack in 10 commits (d50ec9f1..b31366aa): #505 GQA, #506 KVCache GQA, #507 sharded safetensors, #508 HF config, #510 tokenizers, #512 LlamaForCausalLM, #513 end-to-end smoke, plus #514 native bf16, #515 RoPE NTK/YARN, #517 clippy. Real Meta-Llama-3-8B weights load (16GB, 291 tensors in 24s) and a 6-token prefill through all 32 layers runs in 41s producing a valid vocab-range token. Output coherence limited by bf16 accumulator in generic kernels — mixed-precision is the next follow-up. ferrotorch-paged CPU scaffold was deleted earlier in session per user feedback; real paging work awaits a fresh start once mixed-precision is in.",
+  "created_at": "2026-04-23T23:51:42.942226197Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAppRE4CXNIaDTsNuq9X2QzIedfQVY12iu7BEfLQeQMP/V3ZQj51ymaQa90fk/0rTSYf7MJ2M53Zs8y/lpFxRCCA=="
+}
