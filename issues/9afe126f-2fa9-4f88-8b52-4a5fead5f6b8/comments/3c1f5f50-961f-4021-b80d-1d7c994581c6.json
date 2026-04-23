@@ -1,0 +1,10 @@
+{
+  "uuid": "3c1f5f50-961f-4021-b80d-1d7c994581c6",
+  "issue_uuid": "9afe126f-2fa9-4f88-8b52-4a5fead5f6b8",
+  "author": "y4rr",
+  "content": "[action] Phase 1A of ferrotorch-paged done: crate scaffold + ActivationProfiler (11 tests green). Reverted unrelated 3.14->7.5 clippy fixes per user feedback.",
+  "created_at": "2026-04-23T22:30:35.135160700Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwfrwMcJ+Nf86Dtsmumr0sqTO7zzOoGois2bxGCJi4ksD71xMPFcPS/vxqQe1YVKxR507OaGOm78iK+i66SoEBQ=="
+}
