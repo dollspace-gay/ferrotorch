@@ -1,0 +1,10 @@
+{
+  "uuid": "2857068e-20e7-4469-9616-7645d9f9d41e",
+  "issue_uuid": "a0dbadc3-0f48-40e4-92e0-e6830287c40e",
+  "author": "y4rr",
+  "content": "Landed in 35d161a2. CacheDims pinning + 10 new tests; 17 KVCache tests total.",
+  "created_at": "2026-04-23T23:06:43.389678143Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9dYGg/fBQ8Bph1dl+nbc6gQ/ybN8XkYyzuAU+skl6M+gY44rhFkCsYN8yHLXDfi5Kss6ze1jvJBbaihdmNIQAA=="
+}
