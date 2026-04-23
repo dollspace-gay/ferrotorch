@@ -1,0 +1,10 @@
+{
+  "uuid": "b4166285-cb3e-4ae0-93aa-e6d38911852a",
+  "issue_uuid": "c6b76657-b560-4ca9-816f-98cd62ea6191",
+  "author": "y4rr",
+  "content": "Plan A landed in faa24c3e. half::bf16 is now a first-class Float; Tensor<bf16> constructs and runs add_t / num_traits::Float ops end-to-end. Numerical caveat (generic T accumulator for matmul/softmax/norms) documented in the dtype module; mixed-precision kernel specialization is a follow-up.",
+  "created_at": "2026-04-23T23:24:27.870078503Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAeK2yqIkxm2RB1IN0nlkeoQt6/3G3P2f3ii9uG2vC6ZQQxWkiuwzl9dh+zpdGaSo8vCwgPTItteBnm6w/NPo9DQ=="
+}
