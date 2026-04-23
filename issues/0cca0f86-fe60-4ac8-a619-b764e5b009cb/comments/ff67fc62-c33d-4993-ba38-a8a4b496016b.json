@@ -1,0 +1,10 @@
+{
+  "uuid": "ff67fc62-c33d-4993-ba38-a8a4b496016b",
+  "issue_uuid": "0cca0f86-fe60-4ac8-a619-b764e5b009cb",
+  "author": "y4rr",
+  "content": "Landed in 925e831b. ferrotorch-llama crate with LlamaConfig, LlamaAttention, LlamaMLP, LlamaDecoderLayer, LlamaModel, LlamaForCausalLM. HF weight names map 1:1 onto our parameter paths. 11 tests pass including full state_dict round-trip producing byte-identical logits. Scope is batch=1 inference; multi-batch needs 4-D reshape helpers (follow-up).",
+  "created_at": "2026-04-23T23:44:24.468248732Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABbqgB3YxOC0BoobqFZe96SdNu8AVdvwDJWk61Sp6ydnhSHoP6CkbRKy+Fws0hnyLZ9OGJUdKVcGVpC4KuAxSCg=="
+}
