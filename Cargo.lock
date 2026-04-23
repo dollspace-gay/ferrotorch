@@ -1688,6 +1688,9 @@ dependencies = [
  "ferrotorch-optim",
  "num-traits",
  "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
  "zip",
 ]
 

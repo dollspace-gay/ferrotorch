@@ -65,7 +65,7 @@ cubecl-hip = "0.10.0-pre.2"
 # Core dependencies
 thiserror = "2.0"
 rayon = "1.11"
-half = "2.4"
+half = { version = "2.4", features = ["num-traits", "bytemuck"] }
 num-traits = "0.2"
 cudarc = { version = "0.19", features = ["cuda-12080", "cublas", "cusolver"] }
 image = "0.25"
