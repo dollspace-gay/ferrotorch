@@ -4,6 +4,16 @@
 //! "Attention Is All You Need" paper (Vaswani et al., 2017). All operations
 //! use differentiable primitives from `ferrotorch_core`, so autograd handles
 //! the backward pass automatically.
+//!
+//! # Grouped-Query Attention (GQA)
+//!
+//! When `num_kv_heads < num_heads`, keys and values share a smaller head
+//! count than queries (Llama 3 uses 32 Q heads : 8 KV heads). The K and V
+//! projections are sized `[num_kv_heads * head_dim, embed_dim]` and each
+//! KV head serves `group_size = num_heads / num_kv_heads` consecutive
+//! Q heads via `repeat_kv` before the attention matmul. Construct a GQA
+//! attention with [`MultiheadAttention::with_gqa`]; the default [`MultiheadAttention::new`]
+//! preserves classical MHA (`num_kv_heads = num_heads`).
 
 use ferrotorch_core::grad_fns::activation::softmax;
 use ferrotorch_core::grad_fns::arithmetic::{add, mul};
@@ -37,18 +47,22 @@ use crate::parameter::Parameter;
 pub struct MultiheadAttention<T: Float> {
     pub embed_dim: usize,
     pub num_heads: usize,
+    /// Number of key/value heads. Equals `num_heads` for classical MHA;
+    /// less than `num_heads` (and a divisor thereof) for grouped-query
+    /// attention.
+    pub num_kv_heads: usize,
     pub head_dim: usize,
 
-    /// Query projection weight: [embed_dim, embed_dim].
+    /// Query projection weight: `[embed_dim, embed_dim]`.
     pub q_proj: Parameter<T>,
-    /// Key projection weight: [embed_dim, embed_dim].
+    /// Key projection weight: `[num_kv_heads * head_dim, embed_dim]`.
     pub k_proj: Parameter<T>,
-    /// Value projection weight: [embed_dim, embed_dim].
+    /// Value projection weight: `[num_kv_heads * head_dim, embed_dim]`.
     pub v_proj: Parameter<T>,
-    /// Output projection weight: [embed_dim, embed_dim].
+    /// Output projection weight: `[embed_dim, embed_dim]`.
     pub out_proj: Parameter<T>,
 
-    /// Optional biases: [embed_dim].
+    /// Optional Q/O biases: `[embed_dim]`. K/V biases: `[num_kv_heads * head_dim]`.
     pub q_bias: Option<Parameter<T>>,
     pub k_bias: Option<Parameter<T>>,
     pub v_bias: Option<Parameter<T>>,
@@ -58,7 +72,8 @@ pub struct MultiheadAttention<T: Float> {
 }
 
 impl<T: Float> MultiheadAttention<T> {
-    /// Create a new multi-head attention layer.
+    /// Create a new classical multi-head attention layer
+    /// (`num_kv_heads == num_heads`).
     ///
     /// # Arguments
     ///
@@ -70,9 +85,36 @@ impl<T: Float> MultiheadAttention<T> {
     ///
     /// Returns `FerrotorchError::InvalidArgument` if `embed_dim % num_heads != 0`.
     pub fn new(embed_dim: usize, num_heads: usize, bias: bool) -> FerrotorchResult<Self> {
-        if embed_dim == 0 || num_heads == 0 {
+        Self::with_gqa(embed_dim, num_heads, num_heads, bias)
+    }
+
+    /// Create a grouped-query (or classical) attention layer.
+    ///
+    /// When `num_kv_heads < num_heads`, each KV head serves
+    /// `group_size = num_heads / num_kv_heads` consecutive query heads.
+    /// `num_kv_heads == num_heads` reproduces classical MHA.
+    ///
+    /// # Arguments
+    ///
+    /// - `embed_dim` - Total embedding dimension (must be divisible by `num_heads`).
+    /// - `num_heads` - Number of parallel query heads.
+    /// - `num_kv_heads` - Number of key/value heads. Must divide `num_heads` evenly.
+    /// - `bias` - Whether to include additive bias in projections.
+    ///
+    /// # Errors
+    ///
+    /// - `embed_dim == 0` or either head count is zero.
+    /// - `embed_dim % num_heads != 0`.
+    /// - `num_heads % num_kv_heads != 0`.
+    pub fn with_gqa(
+        embed_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        bias: bool,
+    ) -> FerrotorchResult<Self> {
+        if embed_dim == 0 || num_heads == 0 || num_kv_heads == 0 {
             return Err(FerrotorchError::InvalidArgument {
-                message: "embed_dim and num_heads must be positive".into(),
+                message: "embed_dim, num_heads, num_kv_heads must be positive".into(),
             });
         }
         if embed_dim % num_heads != 0 {
@@ -82,12 +124,20 @@ impl<T: Float> MultiheadAttention<T> {
                 ),
             });
         }
+        if num_heads % num_kv_heads != 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+                ),
+            });
+        }
 
         let head_dim = embed_dim / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
 
         let mut q_proj = Parameter::zeros(&[embed_dim, embed_dim])?;
-        let mut k_proj = Parameter::zeros(&[embed_dim, embed_dim])?;
-        let mut v_proj = Parameter::zeros(&[embed_dim, embed_dim])?;
+        let mut k_proj = Parameter::zeros(&[kv_dim, embed_dim])?;
+        let mut v_proj = Parameter::zeros(&[kv_dim, embed_dim])?;
         let mut out_proj = Parameter::zeros(&[embed_dim, embed_dim])?;
 
         xavier_uniform(&mut q_proj)?;
@@ -97,8 +147,8 @@ impl<T: Float> MultiheadAttention<T> {
 
         let (q_bias, k_bias, v_bias, out_bias) = if bias {
             let mut qb = Parameter::zeros(&[embed_dim])?;
-            let mut kb = Parameter::zeros(&[embed_dim])?;
-            let mut vb = Parameter::zeros(&[embed_dim])?;
+            let mut kb = Parameter::zeros(&[kv_dim])?;
+            let mut vb = Parameter::zeros(&[kv_dim])?;
             let mut ob = Parameter::zeros(&[embed_dim])?;
             zeros(&mut qb)?;
             zeros(&mut kb)?;
@@ -112,6 +162,7 @@ impl<T: Float> MultiheadAttention<T> {
         Ok(Self {
             embed_dim,
             num_heads,
+            num_kv_heads,
             head_dim,
             q_proj,
             k_proj,
@@ -214,10 +265,10 @@ impl<T: Float> MultiheadAttention<T> {
         // We skip Q/K projections (saves 2 matmuls) and the per-head
         // attention loop (saves reshape, transpose, softmax per head).
         //
-        // We also batch across the batch dimension: instead of looping
-        // over batch elements doing [1,D]@[D,D], we squeeze to [B,D]
-        // and do a single [B,D]@[D,D] matmul.
-        if seq_q == 1 && seq_k == 1 && !causal_mask {
+        // Gated on `num_kv_heads == num_heads` — the GQA case needs a
+        // repeat_kv step between V_proj and O_proj (V_proj outputs kv_dim,
+        // O_proj expects embed_dim), so we fall through to the general path.
+        if seq_q == 1 && seq_k == 1 && !causal_mask && self.num_kv_heads == self.num_heads {
             use ferrotorch_core::grad_fns::linalg::linear_fused;
 
             // Squeeze [batch, 1, embed_dim] -> [batch, embed_dim]
@@ -282,11 +333,17 @@ impl<T: Float> MultiheadAttention<T> {
                 v_proj = add(&v_proj, &bias_expanded)?;
             }
 
-            // Reshape to [num_heads, seq, head_dim].
-            // q_proj is [seq_q, embed_dim] -> [seq_q, num_heads, head_dim] -> [num_heads, seq_q, head_dim]
+            // Reshape Q to [num_heads, seq_q, head_dim].
+            // Reshape K/V to [num_kv_heads, seq_k, head_dim], then broadcast
+            // (repeat_kv) up to [num_heads, seq_k, head_dim] so Q and K/V
+            // match on the head axis. `group_size == 1` is a no-op branch
+            // inside `repeat_kv`, so MHA pays nothing here.
             let q_heads = reshape_to_heads(&q_proj, self.num_heads, seq_q, self.head_dim)?;
-            let k_heads = reshape_to_heads(&k_proj, self.num_heads, seq_k, self.head_dim)?;
-            let v_heads = reshape_to_heads(&v_proj, self.num_heads, seq_k, self.head_dim)?;
+            let k_heads_kv = reshape_to_heads(&k_proj, self.num_kv_heads, seq_k, self.head_dim)?;
+            let v_heads_kv = reshape_to_heads(&v_proj, self.num_kv_heads, seq_k, self.head_dim)?;
+            let group_size = self.num_heads / self.num_kv_heads;
+            let k_heads = repeat_kv(&k_heads_kv, group_size)?;
+            let v_heads = repeat_kv(&v_heads_kv, group_size)?;
 
             // Batched attention: all heads in parallel via bmm.
             // q_heads, k_heads, v_heads are [num_heads, seq, head_dim].
@@ -352,10 +409,17 @@ impl<T: Float> MultiheadAttention<T> {
         self.embed_dim
     }
 
-    /// The number of attention heads.
+    /// The number of query attention heads.
     #[inline]
     pub fn num_heads(&self) -> usize {
         self.num_heads
+    }
+
+    /// The number of key/value heads (equal to `num_heads` for classical MHA,
+    /// less for grouped-query attention).
+    #[inline]
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
     }
 
     /// The dimension of each attention head.
@@ -364,11 +428,32 @@ impl<T: Float> MultiheadAttention<T> {
         self.head_dim
     }
 
+    /// Whether this layer is configured for grouped-query attention
+    /// (`num_kv_heads < num_heads`).
+    #[inline]
+    pub fn is_gqa(&self) -> bool {
+        self.num_kv_heads != self.num_heads
+    }
+
     /// Fast 2D self-attention for seq_len=1: [batch, embed_dim] -> [batch, embed_dim].
     /// Avoids unsqueeze/squeeze overhead. For seq_len=1, attention is identity on V,
     /// so this is just V_proj + O_proj (two fused linear ops).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` when called on a GQA layer
+    /// (`num_kv_heads != num_heads`): the V/O shapes no longer match and a
+    /// `repeat_kv` step is required. Use [`forward_qkv`] for GQA.
     pub fn forward_2d(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         use ferrotorch_core::grad_fns::linalg::linear_fused;
+
+        if self.is_gqa() {
+            return Err(FerrotorchError::InvalidArgument {
+                message:
+                    "forward_2d is MHA-only; use forward_qkv for GQA (num_kv_heads != num_heads)"
+                        .into(),
+            });
+        }
 
         let v_proj = linear_fused(
             input,
@@ -562,6 +647,58 @@ fn transpose_heads_to_2d<T: Float>(
     )
 }
 
+/// Repeat each KV head `group_size` times along the head axis to match
+/// the query-head count for grouped-query attention.
+///
+/// Input:  `[num_kv_heads, seq, head_dim]`
+/// Output: `[num_kv_heads * group_size, seq, head_dim]`
+///
+/// For output head `h`, the slice is copied from input head `h / group_size`.
+/// This matches the standard GQA convention where each KV head serves
+/// `group_size` consecutive query heads.
+///
+/// `group_size == 1` is a fast no-op clone (classical MHA path pays
+/// nothing).
+///
+/// Note: like the other reshape helpers in this module, this breaks the
+/// autograd graph — it is correct for inference but training-broken. A
+/// fully-differentiable variant would require a `RepeatKvBackward` op
+/// that sums gradients across replicated groups.
+fn repeat_kv<T: Float>(kv: &Tensor<T>, group_size: usize) -> FerrotorchResult<Tensor<T>> {
+    if group_size == 1 {
+        return Ok(kv.clone());
+    }
+    let shape = kv.shape();
+    if shape.len() != 3 {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "repeat_kv expects 3-D [num_kv_heads, seq, head_dim], got {:?}",
+                shape
+            ),
+        });
+    }
+    let num_kv_heads = shape[0];
+    let seq = shape[1];
+    let head_dim = shape[2];
+    let num_q_heads = num_kv_heads * group_size;
+    let data = kv.data_vec()?;
+    let head_stride = seq * head_dim;
+    let mut out = vec![<T as num_traits::Zero>::zero(); num_q_heads * head_stride];
+    for h in 0..num_q_heads {
+        let kv_h = h / group_size;
+        let src_start = kv_h * head_stride;
+        let dst_start = h * head_stride;
+        out[dst_start..dst_start + head_stride]
+            .copy_from_slice(&data[src_start..src_start + head_stride]);
+    }
+    let device = kv.device();
+    Tensor::from_storage(
+        TensorStorage::on_device(out, device)?,
+        vec![num_q_heads, seq, head_dim],
+        kv.requires_grad(),
+    )
+}
+
 /// Apply causal mask to 3D scores [num_heads, seq_q, seq_k].
 fn apply_causal_mask_3d<T: Float>(
     scores: &Tensor<T>,
@@ -742,5 +879,154 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MultiheadAttention<f32>>();
         assert_send_sync::<MultiheadAttention<f64>>();
+    }
+
+    // -- Grouped-Query Attention tests (#505) ---------------------------
+
+    #[test]
+    fn test_with_gqa_valid_construction() {
+        // Llama 3 8B layout: 32 query heads, 8 KV heads, head_dim=128.
+        let mha = MultiheadAttention::<f32>::with_gqa(4096, 32, 8, false).unwrap();
+        assert_eq!(mha.embed_dim(), 4096);
+        assert_eq!(mha.num_heads(), 32);
+        assert_eq!(mha.num_kv_heads(), 8);
+        assert_eq!(mha.head_dim(), 128);
+        assert!(mha.is_gqa());
+    }
+
+    #[test]
+    fn test_with_gqa_kv_proj_shapes() {
+        // K/V projections must output `num_kv_heads * head_dim`, not `embed_dim`.
+        let mha = MultiheadAttention::<f32>::with_gqa(64, 8, 2, true).unwrap();
+        let kv_dim = 2 * (64 / 8); // num_kv_heads * head_dim = 16
+        assert_eq!(mha.q_proj.shape(), &[64, 64]);
+        assert_eq!(mha.k_proj.shape(), &[kv_dim, 64]);
+        assert_eq!(mha.v_proj.shape(), &[kv_dim, 64]);
+        assert_eq!(mha.out_proj.shape(), &[64, 64]);
+        // Biases follow the same split.
+        assert_eq!(mha.q_bias.as_ref().unwrap().shape(), &[64]);
+        assert_eq!(mha.k_bias.as_ref().unwrap().shape(), &[kv_dim]);
+        assert_eq!(mha.v_bias.as_ref().unwrap().shape(), &[kv_dim]);
+        assert_eq!(mha.out_bias.as_ref().unwrap().shape(), &[64]);
+    }
+
+    #[test]
+    fn test_with_gqa_rejects_non_divisible_kv_heads() {
+        // num_heads=8, num_kv_heads=3 → 8 % 3 != 0.
+        let result = MultiheadAttention::<f32>::with_gqa(64, 8, 3, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_with_gqa_rejects_zero_kv_heads() {
+        let result = MultiheadAttention::<f32>::with_gqa(64, 8, 0, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_with_gqa_equivalent_to_new_when_kv_equals_q() {
+        // Passing num_kv_heads == num_heads must reproduce classical MHA shapes.
+        let gqa = MultiheadAttention::<f32>::with_gqa(32, 4, 4, true).unwrap();
+        let mha = MultiheadAttention::<f32>::new(32, 4, true).unwrap();
+        assert_eq!(gqa.num_kv_heads(), mha.num_kv_heads());
+        assert_eq!(gqa.k_proj.shape(), mha.k_proj.shape());
+        assert_eq!(gqa.v_proj.shape(), mha.v_proj.shape());
+        assert!(!gqa.is_gqa());
+    }
+
+    #[test]
+    fn test_repeat_kv_noop_on_group_size_1() {
+        // group_size=1 must be a cheap clone (the MHA hot path).
+        let kv = ferrotorch_core::from_slice::<f32>(
+            &(0..24).map(|i| i as f32).collect::<Vec<_>>(),
+            &[2, 3, 4], // [num_kv_heads=2, seq=3, head_dim=4]
+        )
+        .unwrap();
+        let out = repeat_kv(&kv, 1).unwrap();
+        assert_eq!(out.shape(), kv.shape());
+        assert_eq!(out.data_vec().unwrap(), kv.data_vec().unwrap());
+    }
+
+    #[test]
+    fn test_repeat_kv_copies_correct_heads() {
+        // Input: 2 KV heads, each a 1x3 row with distinct values per head.
+        // group_size=3 → 6 output heads. Heads 0,1,2 should equal input head 0;
+        // heads 3,4,5 should equal input head 1.
+        let data: Vec<f32> = vec![
+            10.0, 11.0, 12.0, // head 0, seq 0
+            13.0, 14.0, 15.0, // head 0, seq 1
+            20.0, 21.0, 22.0, // head 1, seq 0
+            23.0, 24.0, 25.0, // head 1, seq 1
+        ];
+        let kv = ferrotorch_core::from_slice::<f32>(&data, &[2, 2, 3]).unwrap();
+        let out = repeat_kv(&kv, 3).unwrap();
+        assert_eq!(out.shape(), &[6, 2, 3]);
+        let out_data = out.data_vec().unwrap();
+        let head_stride = 2 * 3; // seq * head_dim
+        // Heads 0, 1, 2 come from input head 0.
+        for h in 0..3 {
+            let start = h * head_stride;
+            assert_eq!(&out_data[start..start + head_stride], &data[0..head_stride]);
+        }
+        // Heads 3, 4, 5 come from input head 1.
+        for h in 3..6 {
+            let start = h * head_stride;
+            assert_eq!(
+                &out_data[start..start + head_stride],
+                &data[head_stride..2 * head_stride]
+            );
+        }
+    }
+
+    #[test]
+    fn test_repeat_kv_rejects_wrong_rank() {
+        let kv = ferrotorch_core::zeros::<f32>(&[4, 8]).unwrap(); // 2-D
+        assert!(repeat_kv(&kv, 2).is_err());
+    }
+
+    #[test]
+    fn test_gqa_forward_output_shape_preserved() {
+        // GQA must return the same [batch, seq, embed_dim] shape as MHA.
+        let mha = MultiheadAttention::<f32>::with_gqa(16, 4, 2, true).unwrap();
+        let input = ferrotorch_core::zeros::<f32>(&[2, 5, 16]).unwrap();
+        let out = mha.forward(&input).unwrap();
+        assert_eq!(out.shape(), &[2, 5, 16]);
+    }
+
+    #[test]
+    fn test_gqa_forward_produces_finite_values() {
+        let mha = MultiheadAttention::<f64>::with_gqa(8, 4, 2, true).unwrap();
+        let input = ferrotorch_core::ones::<f64>(&[1, 3, 8]).unwrap();
+        let out = mha.forward(&input).unwrap();
+        let data = out.data().unwrap();
+        for &v in data {
+            assert!(v.is_finite(), "GQA output non-finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_gqa_forward_decoder_style_single_token() {
+        // Single-token forward (seq_q == seq_k == 1) must stay numerically
+        // stable on the GQA path — this is the autoregressive generation
+        // hot case for Llama inference.
+        let mha = MultiheadAttention::<f32>::with_gqa(32, 8, 2, false).unwrap();
+        let input = ferrotorch_core::ones::<f32>(&[1, 1, 32]).unwrap();
+        let out = mha.forward(&input).unwrap();
+        assert_eq!(out.shape(), &[1, 1, 32]);
+        for &v in out.data().unwrap() {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_gqa_forward_with_causal_mask() {
+        // Causal masking must still work when K/V have fewer heads than Q.
+        let mha = MultiheadAttention::<f32>::with_gqa(16, 4, 2, false).unwrap();
+        let x = ferrotorch_core::ones::<f32>(&[1, 4, 16]).unwrap();
+        let out = mha.forward_qkv(&x, &x, &x, true).unwrap();
+        assert_eq!(out.shape(), &[1, 4, 16]);
+        for &v in out.data().unwrap() {
+            assert!(v.is_finite());
+        }
     }
 }
