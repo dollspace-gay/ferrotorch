@@ -645,6 +645,14 @@ pub fn standard_attention<T: Float>(
     let n_k = key.shape()[1];
     let d_v = value.shape()[2];
 
+    // bf16 has a 7-bit mantissa; summing d=128 values of products in bf16
+    // is catastrophic for attention scores. Promote the accumulator to
+    // f32 for bf16 inputs. All other T carry their native precision.
+    let is_bf16 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<half::bf16>();
+    if is_bf16 {
+        return standard_attention_bf16(query, key, value, causal);
+    }
+
     let scale = T::from(1.0 / (d as f64).sqrt()).unwrap();
     let neg_inf = T::from(-1e30).unwrap();
     let zero = <T as num_traits::Zero>::zero();
@@ -726,6 +734,109 @@ pub fn standard_attention<T: Float>(
         vec![batch, n_q, d_v],
         false,
     )
+}
+
+/// Mixed-precision (bf16 storage, f32 accumulator) variant of
+/// [`standard_attention`]. Called by `standard_attention` when `T =
+/// half::bf16`; identical math end-to-end but all accumulators,
+/// softmax intermediates, and output dot products run in f32 before
+/// being cast back to bf16 for the return tensor.
+fn standard_attention_bf16<T: Float>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    causal: bool,
+) -> FerrotorchResult<Tensor<T>> {
+    let batch = query.shape()[0];
+    let n_q = query.shape()[1];
+    let d = query.shape()[2];
+    let n_k = key.shape()[1];
+    let d_v = value.shape()[2];
+
+    // Convert inputs to f32 up-front (bf16 → f32 is a zero-cost byte
+    // shift: bf16 bits occupy the top 16 of an f32, padded with zeros).
+    let q_data = query.data()?;
+    let k_data = key.data()?;
+    let v_data = value.data()?;
+    let q_f32: Vec<f32> = q_data.iter().map(|v| v.to_f32().unwrap()).collect();
+    let k_f32: Vec<f32> = k_data.iter().map(|v| v.to_f32().unwrap()).collect();
+    let v_f32: Vec<f32> = v_data.iter().map(|v| v.to_f32().unwrap()).collect();
+
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let neg_inf = f32::NEG_INFINITY;
+
+    let mut output_f32 = vec![0.0f32; batch * n_q * d_v];
+
+    for b in 0..batch {
+        let q_base = b * n_q * d;
+        let k_base = b * n_k * d;
+        let v_base = b * n_k * d_v;
+        let o_base = b * n_q * d_v;
+
+        let q = &q_f32[q_base..q_base + n_q * d];
+        let k = &k_f32[k_base..k_base + n_k * d];
+        let v = &v_f32[v_base..v_base + n_k * d_v];
+
+        let mut scores = vec![0.0f32; n_q * n_k];
+        for i in 0..n_q {
+            for j in 0..n_k {
+                let mut dot = 0.0f32;
+                for dd in 0..d {
+                    dot += q[i * d + dd] * k[j * d + dd];
+                }
+                scores[i * n_k + j] = dot * scale;
+            }
+        }
+
+        if causal {
+            for i in 0..n_q {
+                for j in (i + 1)..n_k {
+                    scores[i * n_k + j] = neg_inf;
+                }
+            }
+        }
+
+        let mut attn = vec![0.0f32; n_q * n_k];
+        for i in 0..n_q {
+            let row_start = i * n_k;
+            let mut row_max = neg_inf;
+            for j in 0..n_k {
+                if scores[row_start + j] > row_max {
+                    row_max = scores[row_start + j];
+                }
+            }
+            let mut sum_exp = 0.0f32;
+            for j in 0..n_k {
+                let e = (scores[row_start + j] - row_max).exp();
+                attn[row_start + j] = e;
+                sum_exp += e;
+            }
+            if sum_exp > 0.0 {
+                let inv = 1.0 / sum_exp;
+                for j in 0..n_k {
+                    attn[row_start + j] *= inv;
+                }
+            }
+        }
+
+        for i in 0..n_q {
+            for dv in 0..d_v {
+                let mut acc = 0.0f32;
+                for j in 0..n_k {
+                    acc += attn[i * n_k + j] * v[j * d_v + dv];
+                }
+                output_f32[o_base + i * d_v + dv] = acc;
+            }
+        }
+    }
+
+    // Cast back to T (= bf16) for the return.
+    let output_t: Vec<T> = output_f32
+        .iter()
+        .map(|&v| T::from(v).unwrap())
+        .collect();
+
+    Tensor::from_storage(TensorStorage::cpu(output_t), vec![batch, n_q, d_v], false)
 }
 
 // ===========================================================================

@@ -257,6 +257,32 @@ pub fn dot<T: Float>(a: &Tensor<T>, b: &Tensor<T>) -> FerrotorchResult<Tensor<T>
 /// For matrices at or below this size, the naive loop avoids faer overhead.
 const DIRECT_MM_THRESHOLD: usize = 128;
 
+/// Whether `T` is `half::bf16`. Used to route bf16 kernels through an
+/// f32 accumulator to avoid the catastrophic precision loss of summing
+/// hundreds of 7-bit-mantissa values in bf16.
+#[inline(always)]
+fn is_bf16<T: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<half::bf16>()
+}
+
+/// Reinterpret a bf16 slice as `&[half::bf16]`. Only call when
+/// `is_bf16::<T>()` is true.
+#[inline(always)]
+unsafe fn as_bf16_slice<T>(data: &[T]) -> &[half::bf16] {
+    // SAFETY: caller guarantees T is half::bf16 (same size, same repr).
+    unsafe { &*(data as *const [T] as *const [half::bf16]) }
+}
+
+/// Write f32 results into a freshly-zeroed T slice (only valid when T=bf16).
+#[inline(always)]
+unsafe fn write_f32_as_bf16<T>(dst: &mut [T], src: &[f32]) {
+    // SAFETY: caller guarantees T is half::bf16.
+    let dst_bf16 = unsafe { &mut *(dst as *mut [T] as *mut [half::bf16]) };
+    for (d, &s) in dst_bf16.iter_mut().zip(src.iter()) {
+        *d = half::bf16::from_f32(s);
+    }
+}
+
 /// Choose parallelism for faer matmul.  For medium matrices use sequential
 /// to avoid thread-pool overhead; for large matrices use rayon.
 #[inline]
@@ -280,16 +306,40 @@ pub fn mm_raw<T: Float>(a_data: &[T], b_data: &[T], m: usize, k: usize, n: usize
         // Direct ikj loop — cache-friendly, zero intermediate allocations.
         // Uses unsafe get_unchecked to eliminate bounds checks in the hot loop.
         let mut result = vec![zero; m * n];
-        unsafe {
-            for i in 0..m {
-                let a_row = i * k;
-                let r_row = i * n;
-                for p in 0..k {
-                    let a_ip = *a_data.get_unchecked(a_row + p);
-                    let b_row = p * n;
-                    for j in 0..n {
-                        let r = result.get_unchecked_mut(r_row + j);
-                        *r += a_ip * *b_data.get_unchecked(b_row + j);
+        if is_bf16::<T>() {
+            // bf16 fast path with f32 accumulator. Summing up to
+            // DIRECT_MM_THRESHOLD bf16 values in bf16 loses ~7 bits of
+            // precision per dot; accumulating in f32 preserves them.
+            unsafe {
+                let a_bf16 = as_bf16_slice(a_data);
+                let b_bf16 = as_bf16_slice(b_data);
+                let mut acc = vec![0.0f32; m * n];
+                for i in 0..m {
+                    let a_row = i * k;
+                    let r_row = i * n;
+                    for p in 0..k {
+                        let a_ip = a_bf16.get_unchecked(a_row + p).to_f32();
+                        let b_row = p * n;
+                        for j in 0..n {
+                            *acc.get_unchecked_mut(r_row + j) +=
+                                a_ip * b_bf16.get_unchecked(b_row + j).to_f32();
+                        }
+                    }
+                }
+                write_f32_as_bf16(&mut result, &acc);
+            }
+        } else {
+            unsafe {
+                for i in 0..m {
+                    let a_row = i * k;
+                    let r_row = i * n;
+                    for p in 0..k {
+                        let a_ip = *a_data.get_unchecked(a_row + p);
+                        let b_row = p * n;
+                        for j in 0..n {
+                            let r = result.get_unchecked_mut(r_row + j);
+                            *r += a_ip * *b_data.get_unchecked(b_row + j);
+                        }
                     }
                 }
             }
@@ -369,17 +419,41 @@ pub fn mm_raw_bt<T: Float>(a_data: &[T], b_data: &[T], m: usize, k: usize, n: us
         // B is (N,K) row-major, so B[j][p] = b_data[j*k + p].
         // C[i][j] = sum_p A[i][p] * B[j][p]
         let mut result = vec![zero; m * n];
-        unsafe {
-            for i in 0..m {
-                let a_row = i * k;
-                let r_row = i * n;
-                for j in 0..n {
-                    let b_row = j * k;
-                    let mut acc = zero;
-                    for p in 0..k {
-                        acc += *a_data.get_unchecked(a_row + p) * *b_data.get_unchecked(b_row + p);
+        if is_bf16::<T>() {
+            // bf16 fast path with f32 accumulator (see note in `mm_raw`).
+            unsafe {
+                let a_bf16 = as_bf16_slice(a_data);
+                let b_bf16 = as_bf16_slice(b_data);
+                let mut acc_buf = vec![0.0f32; m * n];
+                for i in 0..m {
+                    let a_row = i * k;
+                    let r_row = i * n;
+                    for j in 0..n {
+                        let b_row = j * k;
+                        let mut acc = 0.0f32;
+                        for p in 0..k {
+                            acc += a_bf16.get_unchecked(a_row + p).to_f32()
+                                * b_bf16.get_unchecked(b_row + p).to_f32();
+                        }
+                        *acc_buf.get_unchecked_mut(r_row + j) = acc;
                     }
-                    *result.get_unchecked_mut(r_row + j) = acc;
+                }
+                write_f32_as_bf16(&mut result, &acc_buf);
+            }
+        } else {
+            unsafe {
+                for i in 0..m {
+                    let a_row = i * k;
+                    let r_row = i * n;
+                    for j in 0..n {
+                        let b_row = j * k;
+                        let mut acc = zero;
+                        for p in 0..k {
+                            acc += *a_data.get_unchecked(a_row + p)
+                                * *b_data.get_unchecked(b_row + p);
+                        }
+                        *result.get_unchecked_mut(r_row + j) = acc;
+                    }
                 }
             }
         }
@@ -456,16 +530,38 @@ pub fn mm_raw_at<T: Float>(a_data: &[T], b_data: &[T], m: usize, k: usize, n: us
         // Direct loop: A is (K,M) row-major, B is (K,N) row-major.
         // C[i,j] = sum_p A[p,i] * B[p,j]
         let mut result = vec![zero; m * n];
-        unsafe {
-            for p in 0..k {
-                let a_row = p * m;
-                let b_row = p * n;
-                for i in 0..m {
-                    let a_val = *a_data.get_unchecked(a_row + i);
-                    let r_row = i * n;
-                    for j in 0..n {
-                        let r = result.get_unchecked_mut(r_row + j);
-                        *r += a_val * *b_data.get_unchecked(b_row + j);
+        if is_bf16::<T>() {
+            // bf16 fast path with f32 accumulator (see note in `mm_raw`).
+            unsafe {
+                let a_bf16 = as_bf16_slice(a_data);
+                let b_bf16 = as_bf16_slice(b_data);
+                let mut acc_buf = vec![0.0f32; m * n];
+                for p in 0..k {
+                    let a_row = p * m;
+                    let b_row = p * n;
+                    for i in 0..m {
+                        let a_val = a_bf16.get_unchecked(a_row + i).to_f32();
+                        let r_row = i * n;
+                        for j in 0..n {
+                            *acc_buf.get_unchecked_mut(r_row + j) +=
+                                a_val * b_bf16.get_unchecked(b_row + j).to_f32();
+                        }
+                    }
+                }
+                write_f32_as_bf16(&mut result, &acc_buf);
+            }
+        } else {
+            unsafe {
+                for p in 0..k {
+                    let a_row = p * m;
+                    let b_row = p * n;
+                    for i in 0..m {
+                        let a_val = *a_data.get_unchecked(a_row + i);
+                        let r_row = i * n;
+                        for j in 0..n {
+                            let r = result.get_unchecked_mut(r_row + j);
+                            *r += a_val * *b_data.get_unchecked(b_row + j);
+                        }
                     }
                 }
             }

@@ -946,6 +946,11 @@ impl<T: Float> Module<T> for RMSNorm<T> {
         let eps_t = T::from(self.eps).unwrap();
         let n_t = T::from(norm_size).unwrap();
 
+        // bf16 has a 7-bit mantissa; a mean-of-squares over hundreds of
+        // elements saturates the accumulator and collapses into near-
+        // constant outputs. Detect bf16 and promote the accumulator
+        // (and the eps / normalization) to f32.
+        let is_bf16 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<half::bf16>();
         let mut output = Vec::with_capacity(input.numel());
 
         for b in 0..batch_size {
@@ -953,13 +958,30 @@ impl<T: Float> Module<T> for RMSNorm<T> {
             let end = start + norm_size;
             let slice = &input_data[start..end];
 
-            // rms = sqrt(mean(x^2) + eps)
-            let mean_sq = slice.iter().copied().fold(zero::<T>(), |a, x| a + x * x) / n_t;
-            let rms = (mean_sq + eps_t).sqrt();
-            let inv_rms = rms.recip();
+            if is_bf16 {
+                // f32 accumulator path for bf16.
+                let eps_f32 = self.eps as f32;
+                let n_f32 = norm_size as f32;
+                let mut sum_sq = 0.0f32;
+                for &x in slice {
+                    let xf = x.to_f32().unwrap();
+                    sum_sq += xf * xf;
+                }
+                let inv_rms_f32 = 1.0f32 / ((sum_sq / n_f32) + eps_f32).sqrt();
+                let inv_rms = T::from(inv_rms_f32).unwrap();
+                for (i, &x) in slice.iter().enumerate() {
+                    output.push(x * inv_rms * weight_data[i]);
+                }
+            } else {
+                // rms = sqrt(mean(x^2) + eps)
+                let mean_sq =
+                    slice.iter().copied().fold(zero::<T>(), |a, x| a + x * x) / n_t;
+                let rms = (mean_sq + eps_t).sqrt();
+                let inv_rms = rms.recip();
 
-            for (i, &x) in slice.iter().enumerate() {
-                output.push(x * inv_rms * weight_data[i]);
+                for (i, &x) in slice.iter().enumerate() {
+                    output.push(x * inv_rms * weight_data[i]);
+                }
             }
         }
 
@@ -2667,6 +2689,10 @@ pub struct LocalResponseNorm {
     pub alpha: f64,
     pub beta: f64,
     pub k: f64,
+    /// Training-mode flag. Carried for Module-trait consistency; the
+    /// layer itself is stateless and produces the same output in both
+    /// modes (matches PyTorch's `LocalResponseNorm` behaviour).
+    training: bool,
 }
 
 impl LocalResponseNorm {
@@ -2689,6 +2715,7 @@ impl LocalResponseNorm {
             alpha,
             beta,
             k,
+            training: true,
         })
     }
 
@@ -2783,11 +2810,16 @@ impl<T: Float> Module<T> for LocalResponseNorm {
         vec![]
     }
 
-    fn train(&mut self) {}
-    fn eval(&mut self) {}
+    fn train(&mut self) {
+        self.training = true;
+    }
+
+    fn eval(&mut self) {
+        self.training = false;
+    }
 
     fn is_training(&self) -> bool {
-        false
+        self.training
     }
 }
 

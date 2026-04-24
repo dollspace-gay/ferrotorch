@@ -1000,6 +1000,11 @@ fn softmax_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     // CPU path.
     let data = input.data()?;
 
+    // bf16 softmax: promote accumulator (sum_exp + division) to f32 so
+    // small differences between exp() values don't collapse into the
+    // same bf16 quantum.
+    let is_bf16 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<half::bf16>();
+
     let result = if shape.is_empty() {
         vec![<T as num_traits::One>::one()]
     } else {
@@ -1007,23 +1012,54 @@ fn softmax_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let outer = data.len() / last_dim.max(1);
         let mut out = vec![<T as num_traits::Zero>::zero(); data.len()];
 
-        for i in 0..outer {
-            let base = i * last_dim;
-            let mut max_val = data[base];
-            for j in 1..last_dim {
-                if data[base + j] > max_val {
-                    max_val = data[base + j];
+        if is_bf16 {
+            let mut scratch = vec![0.0f32; last_dim];
+            for i in 0..outer {
+                let base = i * last_dim;
+                let mut row_max = f32::NEG_INFINITY;
+                for j in 0..last_dim {
+                    let v = data[base + j].to_f32().unwrap();
+                    scratch[j] = v;
+                    if v > row_max {
+                        row_max = v;
+                    }
+                }
+                let mut sum_exp = 0.0f32;
+                for j in 0..last_dim {
+                    let e = (scratch[j] - row_max).exp();
+                    scratch[j] = e;
+                    sum_exp += e;
+                }
+                if sum_exp > 0.0 {
+                    let inv = 1.0f32 / sum_exp;
+                    for j in 0..last_dim {
+                        out[base + j] = T::from(scratch[j] * inv).unwrap();
+                    }
+                } else {
+                    for j in 0..last_dim {
+                        out[base + j] = <T as num_traits::Zero>::zero();
+                    }
                 }
             }
-            let mut sum_exp = <T as num_traits::Zero>::zero();
-            for j in 0..last_dim {
-                let e = (data[base + j] - max_val).exp();
-                out[base + j] = e;
-                sum_exp += e;
-            }
-            #[allow(clippy::assign_op_pattern)]
-            for j in 0..last_dim {
-                out[base + j] = out[base + j] / sum_exp;
+        } else {
+            for i in 0..outer {
+                let base = i * last_dim;
+                let mut max_val = data[base];
+                for j in 1..last_dim {
+                    if data[base + j] > max_val {
+                        max_val = data[base + j];
+                    }
+                }
+                let mut sum_exp = <T as num_traits::Zero>::zero();
+                for j in 0..last_dim {
+                    let e = (data[base + j] - max_val).exp();
+                    out[base + j] = e;
+                    sum_exp += e;
+                }
+                #[allow(clippy::assign_op_pattern)]
+                for j in 0..last_dim {
+                    out[base + j] = out[base + j] / sum_exp;
+                }
             }
         }
         out

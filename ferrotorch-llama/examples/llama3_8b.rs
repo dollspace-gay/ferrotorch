@@ -116,40 +116,64 @@ fn main() {
         .expect("failed to load HF state dict");
     drop(state); // free the staging StateDict — model owns its copies now.
 
-    // -- Step 5: prefill and greedy-sample one token ---------------------
-    println!("[llama3_8b] running prefill on {} tokens…", prompt_ids.len());
-    let t_prefill = Instant::now();
-    let logits = model
-        .forward_from_ids(&prompt_ids)
-        .expect("forward_from_ids failed");
-    let t_prefill_s = t_prefill.elapsed().as_secs_f64();
+    // -- Step 5: prefill + greedy decode --------------------------------
+    // Number of new tokens to generate. Each token runs a full forward
+    // pass over the growing context so this scales O(N²) without a KV
+    // cache. Keep it small for a CPU smoke; bump once the paged / GPU
+    // path is wired up.
+    let max_new_tokens: usize = std::env::var("LLAMA_MAX_NEW_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
-    // logits shape: [1, seq_len, vocab_size]. Argmax over the last
-    // position's vocab axis to pick the next token.
-    let shape = logits.shape();
-    assert_eq!(shape[0], 1, "batch should be 1");
-    let seq_len = shape[1];
-    let vocab = shape[2];
-    let data = logits.data().expect("logits.data()");
-    let offset = (seq_len - 1) * vocab;
-    let mut best_id = 0u32;
-    let mut best_val = bf16::from_f32(f32::NEG_INFINITY);
-    for (i, &v) in data[offset..offset + vocab].iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_id = i as u32;
+    let mut tokens: Vec<u32> = prompt_ids.clone();
+    let mut generation_secs = 0.0f64;
+
+    for step in 0..max_new_tokens {
+        let t_step = Instant::now();
+        let logits = model
+            .forward_from_ids(&tokens)
+            .expect("forward_from_ids failed");
+        let step_s = t_step.elapsed().as_secs_f64();
+        generation_secs += step_s;
+
+        let shape = logits.shape();
+        assert_eq!(shape[0], 1);
+        let seq_len = shape[1];
+        let vocab = shape[2];
+        let data = logits.data().expect("logits.data()");
+        let offset = (seq_len - 1) * vocab;
+        let mut best_id = 0u32;
+        let mut best_val = bf16::from_f32(f32::NEG_INFINITY);
+        for (i, &v) in data[offset..offset + vocab].iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_id = i as u32;
+            }
         }
+        let piece = decode(&tok, &[best_id], /* skip_special_tokens = */ false)
+            .expect("failed to decode token");
+        println!(
+            "[llama3_8b] step {}/{}: id={} text={:?} ({:.2}s, ctx={})",
+            step + 1,
+            max_new_tokens,
+            best_id,
+            piece,
+            step_s,
+            tokens.len()
+        );
+        tokens.push(best_id);
     }
-    let decoded = decode(&tok, &[best_id], /* skip_special_tokens = */ false)
-        .expect("failed to decode next token");
 
+    let full = decode(&tok, &tokens, /* skip_special_tokens = */ true)
+        .expect("failed to decode full sequence");
+    let avg_step_s = generation_secs / max_new_tokens as f64;
     println!(
-        "[llama3_8b] prefill done in {:.2}s ({:.3} tokens/sec)",
-        t_prefill_s,
-        prompt_ids.len() as f64 / t_prefill_s
+        "[llama3_8b] generated {} tokens in {:.2}s (avg {:.2}s/token, {:.3} tok/s)",
+        max_new_tokens,
+        generation_secs,
+        avg_step_s,
+        1.0 / avg_step_s,
     );
-    println!(
-        "[llama3_8b] next token: id={best_id} text={decoded:?}"
-    );
-    println!("[llama3_8b] full continuation: {}{}", prompt, decoded);
+    println!("[llama3_8b] full continuation: {}", full);
 }
