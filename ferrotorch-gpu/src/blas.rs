@@ -1128,6 +1128,127 @@ pub fn gpu_matmul_bf16_bf16(
     Err(GpuError::NoCudaFeature)
 }
 
+/// `C = A @ B^T` on bf16-stored operands, f32 compute.
+///
+/// `A` is row-major `[M, K]`; `B` is row-major `[N, K]` (so `B^T` is
+/// `[K, N]`). The result `C` is row-major `[M, N]`. This variant exists
+/// because attention's `Q @ K^T` (where `Q: [seq_q, head_dim]` and
+/// `K: [seq_k, head_dim]`) is the natural layout — the transpose is
+/// free once you flip the `transb` flag on `cublasGemmEx`.
+///
+/// HuggingFace Llama weights also live in `[out_features, in_features]`
+/// row-major (PyTorch's `nn.Linear` convention), so any `x @ W^T` Linear
+/// forward routes through this function.
+#[cfg(feature = "cuda")]
+pub fn gpu_matmul_bf16_bf16_nt(
+    a: &cudarc::driver::CudaSlice<u16>,
+    b: &cudarc::driver::CudaSlice<u16>,
+    m: usize,
+    k: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    use core::ffi::c_void;
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if a.len() < m * k {
+        return Err(GpuError::ShapeMismatch {
+            op: "matmul_bf16_bf16_nt",
+            expected: vec![m, k],
+            got: vec![a.len()],
+        });
+    }
+    if b.len() < n * k {
+        return Err(GpuError::ShapeMismatch {
+            op: "matmul_bf16_bf16_nt",
+            expected: vec![n, k],
+            got: vec![b.len()],
+        });
+    }
+    if m == 0 || k == 0 || n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(m * n)?);
+    }
+
+    let m_i32 = i32::try_from(m).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16_bf16_nt",
+        expected: vec![i32::MAX as usize],
+        got: vec![m],
+    })?;
+    let k_i32 = i32::try_from(k).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16_bf16_nt",
+        expected: vec![i32::MAX as usize],
+        got: vec![k],
+    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16_bf16_nt",
+        expected: vec![i32::MAX as usize],
+        got: vec![n],
+    })?;
+
+    let mut c = device.stream().alloc_zeros::<u16>(m * n)?;
+
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let blas = device.blas();
+    let stream = device.stream();
+
+    {
+        let (a_ptr, _ra) = a.device_ptr(&stream);
+        let (b_ptr, _rb) = b.device_ptr(&stream);
+        let (c_ptr, _rc) = c.device_ptr_mut(&stream);
+
+        // Row-major C = A @ B^T (A:[M,K], B:[N,K]).
+        // cuBLAS sees columns. Compute C^T = B @ A^T in column-major:
+        //   - left operand in cuBLAS: B^T-transposed-column-major = B
+        //     stored row-major → cuBLAS sees as [K,N] col-major with
+        //     op=T.  But we want B (not B^T), so set transb = N and
+        //     dims accordingly.
+        // Concretely, the working pattern is:
+        //   cublasGemmEx(transa=N, transb=T, M=n_i32, N=m_i32, K=k_i32,
+        //     A=B (row-major [N,K], leading=K), B=A (row-major [M,K],
+        //     leading=K), C=C (row-major [M,N], leading=N))
+        unsafe {
+            cublas_result::gemm_ex(
+                *blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                m_i32,
+                k_i32,
+                (&alpha) as *const f32 as *const c_void,
+                b_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                a_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                (&beta) as *const f32 as *const c_void,
+                c_ptr as *mut c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )?;
+        }
+    }
+
+    Ok(c)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_matmul_bf16_bf16_nt(
+    _a: &(),
+    _b: &(),
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<()> {
+    Err(GpuError::NoCudaFeature)
+}
+
 // ---------------------------------------------------------------------------
 // CPU fallback implementations
 // ---------------------------------------------------------------------------
@@ -1664,6 +1785,66 @@ mod tests {
 
     // bf16 elementwise / embedding / rmsnorm / softmax / rope tests now
     // live in `ferrotorch-gpu/src/bf16.rs` (nvrtc-compiled CUDA C++).
+
+    #[test]
+    fn matmul_bf16_bf16_nt_basic_2x3_2x3() {
+        // A = [[1,2,3], [4,5,6]]    (2x3, row-major)
+        // B = [[7,8,9], [10,11,12]] (2x3, row-major)
+        // B^T = [[7,10],[8,11],[9,12]]
+        // C = A @ B^T = [[1*7+2*8+3*9, 1*10+2*11+3*12],
+        //                [4*7+5*8+6*9, 4*10+5*11+6*12]]
+        //             = [[50, 68], [122, 167]]
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let expected: Vec<f32> = vec![50.0, 68.0, 122.0, 167.0];
+
+        let dev = GpuDevice::new(0).expect("CUDA device 0");
+        let a = upload_as_bf16(&dev, &a_data);
+        let b = upload_as_bf16(&dev, &b_data);
+        let c = gpu_matmul_bf16_bf16_nt(&a, &b, 2, 3, 2, &dev).expect("matmul_nt");
+        let got = download_bf16_as_f32(&dev, &c);
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() <= e.abs() * 0.02 + 1.0,
+                "nt[{i}]: got {g}, expected {e}",
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_bf16_bf16_nt_equivalent_to_explicit_transpose() {
+        // Correctness anchor: `gpu_matmul_bf16_bf16_nt(a, b, m, k, n)`
+        // must equal `gpu_matmul_bf16_bf16(a, b_t, m, k, n)` where `b_t`
+        // is `b` with its [N, K] layout transposed to [K, N] explicitly.
+        let m = 4;
+        let k = 3;
+        let n = 5;
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 2.0).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.25 + 1.0).collect();
+        // Transpose b from [n, k] to [k, n] on CPU.
+        let mut b_t: Vec<f32> = vec![0.0; k * n];
+        for i in 0..n {
+            for j in 0..k {
+                b_t[j * n + i] = b_data[i * k + j];
+            }
+        }
+
+        let dev = GpuDevice::new(0).expect("CUDA device 0");
+        let a = upload_as_bf16(&dev, &a_data);
+        let b = upload_as_bf16(&dev, &b_data);
+        let bt = upload_as_bf16(&dev, &b_t);
+
+        let c_nt = gpu_matmul_bf16_bf16_nt(&a, &b, m, k, n, &dev).unwrap();
+        let c_ref = gpu_matmul_bf16_bf16(&a, &bt, m, k, n, &dev).unwrap();
+        let nt = download_bf16_as_f32(&dev, &c_nt);
+        let rf = download_bf16_as_f32(&dev, &c_ref);
+        for (i, (&a, &b)) in nt.iter().zip(rf.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.01,
+                "nt[{i}]={a} vs ref[{i}]={b}",
+            );
+        }
+    }
 
     #[test]
     fn matmul_bf16_bf16_large_dims_finite() {

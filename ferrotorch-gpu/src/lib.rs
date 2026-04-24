@@ -50,7 +50,7 @@ pub use blas::gpu_bmm_f32;
 pub use blas::{gpu_bmm_f32_into, gpu_matmul_f32_into};
 pub use blas::{gpu_matmul_f32, gpu_matmul_f64};
 #[cfg(feature = "cuda")]
-pub use blas::gpu_matmul_bf16_bf16;
+pub use blas::{gpu_matmul_bf16_bf16, gpu_matmul_bf16_bf16_nt};
 #[cfg(feature = "cuda")]
 pub use bf16::{
     gpu_add_bf16, gpu_embedding_gather_bf16, gpu_mul_bf16, gpu_rmsnorm_bf16,
