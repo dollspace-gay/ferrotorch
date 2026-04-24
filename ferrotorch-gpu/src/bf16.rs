@@ -37,7 +37,7 @@ use crate::module_cache::get_or_compile;
 const BLOCK_SIZE: u32 = 256;
 
 // ===========================================================================
-// Elementwise kernels (mul, add, silu)
+// Elementwise kernels (mul, add, silu, relu, fatrelu)
 // ===========================================================================
 
 const MUL_BF16_PTX: &str = "\
@@ -223,6 +223,121 @@ DONE:
 }
 ";
 
+// ReLU: max(0, x)
+const RELU_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry relu_bf16_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .b16 %a_b16, %zero16;
+    .reg .b32 %a_u32, %bits, %round, %lsb;
+    .reg .f32 %va, %zero, %vr;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 1;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.b16 %a_b16, [%a];
+    mov.b16 %zero16, 0;
+    mov.b32 %a_u32, {%zero16, %a_b16};
+    mov.b32 %va, %a_u32;
+
+    mov.f32 %zero, 0f00000000;
+    max.f32 %vr, %va, %zero;
+
+    mov.b32 %bits, %vr;
+    shr.u32 %lsb, %bits, 16;
+    and.b32 %lsb, %lsb, 1;
+    add.u32 %round, %bits, 0x7FFF;
+    add.u32 %round, %round, %lsb;
+    shr.u32 %bits, %round, 16;
+    st.global.u16 [%out], %bits;
+
+DONE:
+    ret;
+}
+";
+
+// FATReLU: x if x >= threshold else 0 (ProSparse activation)
+const FATRELU_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry fatrelu_bf16_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .f32 threshold
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .b16 %a_b16, %zero16;
+    .reg .b32 %a_u32, %bits, %round, %lsb;
+    .reg .f32 %va, %thresh, %zero, %vr;
+    .reg .pred %p, %p_ge;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+    ld.param.f32 %thresh, [threshold];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 1;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.b16 %a_b16, [%a];
+    mov.b16 %zero16, 0;
+    mov.b32 %a_u32, {%zero16, %a_b16};
+    mov.b32 %va, %a_u32;
+
+    mov.f32 %zero, 0f00000000;
+    setp.ge.f32 %p_ge, %va, %thresh;
+    selp.f32 %vr, %va, %zero, %p_ge;
+
+    mov.b32 %bits, %vr;
+    shr.u32 %lsb, %bits, 16;
+    and.b32 %lsb, %lsb, 1;
+    add.u32 %round, %bits, 0x7FFF;
+    add.u32 %round, %round, %lsb;
+    shr.u32 %bits, %round, 16;
+    st.global.u16 [%out], %bits;
+
+DONE:
+    ret;
+}
+";
+
 fn launch_1d(n: usize) -> LaunchConfig {
     let grid = ((n as u32).saturating_add(BLOCK_SIZE - 1)) / BLOCK_SIZE;
     LaunchConfig {
@@ -316,6 +431,80 @@ pub fn gpu_silu_bf16(
             .arg(a)
             .arg(&mut out)
             .arg(&n_u32)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+/// Elementwise `out = max(0, a)` on bf16 GPU buffers.
+pub fn gpu_relu_bf16(
+    a: &cudarc::driver::CudaSlice<u16>,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    let n = a.len();
+    if n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(0)?);
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(ctx, RELU_BF16_PTX, "relu_bf16_kernel", device.ordinal() as u32)
+        .map_err(|e| {
+            eprintln!("relu_bf16_kernel: {e}");
+            GpuError::PtxCompileFailed { kernel: "relu_bf16_kernel" }
+        })?;
+
+    let mut out = stream.alloc_zeros::<u16>(n)?;
+    let cfg = launch_1d(n);
+    let n_u32 = n as u32;
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a)
+            .arg(&mut out)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+/// Elementwise `out = a >= threshold ? a : 0` on bf16 GPU buffers.
+///
+/// ProSparse FATReLU activation: a hard-thresholded ReLU that produces
+/// ~89% sparsity on trained models.
+pub fn gpu_fatrelu_bf16(
+    a: &cudarc::driver::CudaSlice<u16>,
+    threshold: f32,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    let n = a.len();
+    if n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(0)?);
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(
+        ctx,
+        FATRELU_BF16_PTX,
+        "fatrelu_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|e| {
+        eprintln!("fatrelu_bf16_kernel: {e}");
+        GpuError::PtxCompileFailed {
+            kernel: "fatrelu_bf16_kernel",
+        }
+    })?;
+
+    let mut out = stream.alloc_zeros::<u16>(n)?;
+    let cfg = launch_1d(n);
+    let n_u32 = n as u32;
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a)
+            .arg(&mut out)
+            .arg(&n_u32)
+            .arg(&threshold)
             .launch(cfg)?;
     }
     Ok(out)

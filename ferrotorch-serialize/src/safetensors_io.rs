@@ -199,7 +199,26 @@ fn decode_view<T: Float>(name: &str, view: &TensorView<'_>) -> FerrotorchResult<
         return Tensor::from_storage(TensorStorage::cpu(float_data), shape, false);
     }
 
-    // Validate dtype for non-half types.
+    // Auto-downcast F32 file to a smaller target (e.g. bf16).
+    if view.dtype() == Dtype::F32 && std::mem::size_of::<T>() < 4 {
+        if byte_data.len() != numel * 4 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "tensor '{name}': expected {} bytes for F32 with {numel} elements, got {}",
+                    numel * 4,
+                    byte_data.len()
+                ),
+            });
+        }
+        let mut data: Vec<T> = Vec::with_capacity(numel);
+        for chunk in byte_data.chunks_exact(4) {
+            let f32_val = f32::from_le_bytes(chunk.try_into().unwrap());
+            data.push(T::from(f32_val).unwrap());
+        }
+        return Tensor::from_storage(TensorStorage::cpu(data), shape, false);
+    }
+
+    // Validate dtype for matching-size types.
     let expected = expected_dtype::<T>()?;
     let elem_size = std::mem::size_of::<T>();
     if view.dtype() != expected {

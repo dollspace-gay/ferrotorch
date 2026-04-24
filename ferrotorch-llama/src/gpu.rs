@@ -17,15 +17,15 @@ use cudarc::driver::CudaSlice;
 use ferrotorch_core::{FerrotorchError, FerrotorchResult, Tensor};
 use ferrotorch_gpu::{
     GpuDevice, gpu_add_bf16, gpu_block_reduce_max_abs_bf16, gpu_causal_mask_bf16,
-    gpu_embedding_gather_bf16, gpu_matmul_bf16_bf16_nt, gpu_matmul_bf16_bf16_strided_batched,
-    gpu_matmul_bf16_bf16_strided_batched_nt, gpu_mul_bf16, gpu_repeat_kv_bf16, gpu_rmsnorm_bf16,
-    gpu_rope_half_bf16, gpu_silu_bf16, gpu_softmax_bf16, gpu_transpose_from_heads_bf16,
-    gpu_transpose_to_heads_bf16,
+    gpu_embedding_gather_bf16, gpu_fatrelu_bf16, gpu_matmul_bf16_bf16_nt,
+    gpu_matmul_bf16_bf16_strided_batched, gpu_matmul_bf16_bf16_strided_batched_nt, gpu_mul_bf16,
+    gpu_relu_bf16, gpu_repeat_kv_bf16, gpu_rmsnorm_bf16, gpu_rope_half_bf16, gpu_silu_bf16,
+    gpu_softmax_bf16, gpu_transpose_from_heads_bf16, gpu_transpose_to_heads_bf16,
 };
 use ferrotorch_nn::StateDict;
 use half::bf16;
 
-use crate::config::LlamaConfig;
+use crate::config::{LlamaActivation, LlamaConfig};
 
 /// Per-layer activation taps collected during a profiled forward pass.
 ///
@@ -473,8 +473,14 @@ impl LlamaGpuInferencer {
                 gpu_matmul_bf16_bf16_nt(&h_norm2, &layer.up_proj, seq, hidden, ffn, dev)
                     .map_err(map_gpu_err)?;
 
-            let silu_gate = gpu_silu_bf16(&gate, dev).map_err(map_gpu_err)?;
-            let gated = gpu_mul_bf16(&silu_gate, &up, dev).map_err(map_gpu_err)?;
+            let activated_gate = match cfg.hidden_act {
+                LlamaActivation::Silu => gpu_silu_bf16(&gate, dev).map_err(map_gpu_err)?,
+                LlamaActivation::Relu => gpu_relu_bf16(&gate, dev).map_err(map_gpu_err)?,
+                LlamaActivation::FatRelu(threshold) => {
+                    gpu_fatrelu_bf16(&gate, threshold as f32, dev).map_err(map_gpu_err)?
+                }
+            };
+            let gated = gpu_mul_bf16(&activated_gate, &up, dev).map_err(map_gpu_err)?;
 
             // MLP tap — per-block L-inf magnitude of the gated activation
             // (what multiplies each row of down_proj).
