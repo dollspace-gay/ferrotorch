@@ -1008,6 +1008,127 @@ pub fn gpu_matmul_bf16(
 }
 
 // ---------------------------------------------------------------------------
+// BF16 storage matmul via cublasGemmEx
+// ---------------------------------------------------------------------------
+
+/// Matrix multiply on bf16-stored operands with f32 compute.
+///
+/// `A`, `B` are row-major `[M,K]` and `[K,N]` respectively, each
+/// element stored as bf16 (`u16` bit layout — bf16 is the top 16 bits
+/// of an f32). `C = A @ B` is written back as bf16. The `cublasGemmEx`
+/// call uses `CUBLAS_COMPUTE_32F`, so the dot products accumulate in
+/// f32 for numerical quality, then the final f32 output is cast back
+/// to bf16 for storage.
+///
+/// This is the foundational op for GPU-resident Llama inference:
+/// weights + activations both live in VRAM as bf16 (16 GB for an 8 B
+/// model vs. 32 GB at f32), and every `Linear::forward` routes through
+/// this function on an RTX 3090 / A100 / H100 tensor core.
+#[cfg(feature = "cuda")]
+pub fn gpu_matmul_bf16_bf16(
+    a: &cudarc::driver::CudaSlice<u16>,
+    b: &cudarc::driver::CudaSlice<u16>,
+    m: usize,
+    k: usize,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    use core::ffi::c_void;
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if a.len() < m * k {
+        return Err(GpuError::ShapeMismatch {
+            op: "matmul_bf16_bf16",
+            expected: vec![m, k],
+            got: vec![a.len()],
+        });
+    }
+    if b.len() < k * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "matmul_bf16_bf16",
+            expected: vec![k, n],
+            got: vec![b.len()],
+        });
+    }
+    if m == 0 || k == 0 || n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(m * n)?);
+    }
+
+    let m_i32 = i32::try_from(m).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16_bf16",
+        expected: vec![i32::MAX as usize],
+        got: vec![m],
+    })?;
+    let k_i32 = i32::try_from(k).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16_bf16",
+        expected: vec![i32::MAX as usize],
+        got: vec![k],
+    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::ShapeMismatch {
+        op: "matmul_bf16_bf16",
+        expected: vec![i32::MAX as usize],
+        got: vec![n],
+    })?;
+
+    let mut c = device.stream().alloc_zeros::<u16>(m * n)?;
+
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let blas = device.blas();
+    let stream = device.stream();
+
+    {
+        let (a_ptr, _ra) = a.device_ptr(&stream);
+        let (b_ptr, _rb) = b.device_ptr(&stream);
+        let (c_ptr, _rc) = c.device_ptr_mut(&stream);
+
+        // cuBLAS is column-major; to compute row-major C = A @ B with
+        // A:[M,K], B:[K,N], we ask cuBLAS for C^T = B^T @ A^T and let
+        // it write to the same memory (row-major C is column-major C^T).
+        // So: cublas_M = N, cublas_N = M, cublas_K = K.
+        unsafe {
+            cublas_result::gemm_ex(
+                *blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                m_i32,
+                k_i32,
+                (&alpha) as *const f32 as *const c_void,
+                b_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                a_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                (&beta) as *const f32 as *const c_void,
+                c_ptr as *mut c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )?;
+        }
+    }
+
+    Ok(c)
+}
+
+/// Stub -- always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_matmul_bf16_bf16(
+    _a: &(),
+    _b: &(),
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<()> {
+    Err(GpuError::NoCudaFeature)
+}
+
+// ---------------------------------------------------------------------------
 // CPU fallback implementations
 // ---------------------------------------------------------------------------
 
@@ -1465,4 +1586,107 @@ mod tests {
             f32_elapsed.as_secs_f64() / f16_elapsed.as_secs_f64(),
         );
     }
+
+    // -- BF16 storage matmul tensor-core path (#519) -----------------------
+
+    /// Upload a slice of f32 values to the GPU as bf16 (u16-stored).
+    fn upload_as_bf16(
+        dev: &GpuDevice,
+        data: &[f32],
+    ) -> cudarc::driver::CudaSlice<u16> {
+        let u16_data: Vec<u16> = data
+            .iter()
+            .map(|&x| half::bf16::from_f32(x).to_bits())
+            .collect();
+        dev.stream()
+            .memcpy_stod(&u16_data)
+            .expect("bf16 upload")
+    }
+
+    /// Download a bf16 buffer (u16-stored) and decode to f32.
+    fn download_bf16_as_f32(
+        dev: &GpuDevice,
+        buf: &cudarc::driver::CudaSlice<u16>,
+    ) -> Vec<f32> {
+        let bits: Vec<u16> = dev.stream().memcpy_dtov(buf).expect("bf16 download");
+        bits.into_iter()
+            .map(|b| half::bf16::from_bits(b).to_f32())
+            .collect()
+    }
+
+    #[test]
+    fn matmul_bf16_bf16_basic_2x3_3x2() {
+        // Same reference test case as matmul_f32_basic, now through the
+        // bf16 tensor-core path. Tolerance is loose because bf16 has
+        // ~7-bit mantissa.
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let expected: Vec<f32> = vec![58.0, 64.0, 139.0, 154.0];
+
+        let dev = GpuDevice::new(0).expect("CUDA device 0");
+        let a = upload_as_bf16(&dev, &a_data);
+        let b = upload_as_bf16(&dev, &b_data);
+
+        let c = gpu_matmul_bf16_bf16(&a, &b, 2, 3, 2, &dev).expect("gpu_matmul_bf16_bf16");
+        let got = download_bf16_as_f32(&dev, &c);
+        assert_eq!(got.len(), expected.len());
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1.0,
+                "element {i}: got {g}, expected {e}, diff {}",
+                (g - e).abs(),
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_bf16_bf16_identity_rows() {
+        // C = I(4x4) @ X(4x3) should equal X.
+        let i_data: Vec<f32> = {
+            let mut v = vec![0.0f32; 16];
+            for d in 0..4 {
+                v[d * 4 + d] = 1.0;
+            }
+            v
+        };
+        let x_data: Vec<f32> = (0..12).map(|i| (i as f32) - 6.0).collect();
+
+        let dev = GpuDevice::new(0).expect("CUDA device 0");
+        let i = upload_as_bf16(&dev, &i_data);
+        let x = upload_as_bf16(&dev, &x_data);
+        let c = gpu_matmul_bf16_bf16(&i, &x, 4, 4, 3, &dev).expect("matmul");
+        let got = download_bf16_as_f32(&dev, &c);
+        for (a, b) in got.iter().zip(x_data.iter()) {
+            // bf16 round-trip of integers in [-6, 5] is exact.
+            assert_eq!(a, b, "identity matmul must preserve X exactly");
+        }
+    }
+
+    // bf16 elementwise / embedding / rmsnorm / softmax / rope tests now
+    // live in `ferrotorch-gpu/src/bf16.rs` (nvrtc-compiled CUDA C++).
+
+    #[test]
+    fn matmul_bf16_bf16_large_dims_finite() {
+        // 512x512 matmul with realistic magnitudes. Validates that a
+        // sizeable tensor-core call doesn't crash and produces finite
+        // output across a full RTX 3090 wave.
+        let dim = 512;
+        let a_data: Vec<f32> = (0..dim * dim)
+            .map(|i| (((i * 7 + 13) % 1000) as f32 / 1000.0) - 0.5)
+            .collect();
+        let b_data: Vec<f32> = (0..dim * dim)
+            .map(|i| (((i * 11 + 3) % 1000) as f32 / 1000.0) - 0.5)
+            .collect();
+
+        let dev = GpuDevice::new(0).expect("CUDA device 0");
+        let a = upload_as_bf16(&dev, &a_data);
+        let b = upload_as_bf16(&dev, &b_data);
+        let c = gpu_matmul_bf16_bf16(&a, &b, dim, dim, dim, &dev).expect("matmul");
+        let got = download_bf16_as_f32(&dev, &c);
+        assert_eq!(got.len(), dim * dim);
+        for &v in &got {
+            assert!(v.is_finite(), "non-finite output in bf16 matmul");
+        }
+    }
+
 }

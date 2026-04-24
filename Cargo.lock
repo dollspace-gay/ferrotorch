@@ -1735,6 +1735,7 @@ version = "0.3.0"
 dependencies = [
  "cudarc",
  "ferrotorch-core",
+ "half",
  "num-traits",
 ]
 
@@ -1772,6 +1773,8 @@ dependencies = [
  "ferrotorch-hub",
  "ferrotorch-nn",
  "ferrotorch-serialize",
+ "ferrotorch-tokenize",
+ "half",
  "num-traits",
 ]
 
