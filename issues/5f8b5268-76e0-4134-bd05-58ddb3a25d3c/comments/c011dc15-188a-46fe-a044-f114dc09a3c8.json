@@ -1,0 +1,10 @@
+{
+  "uuid": "c011dc15-188a-46fe-a044-f114dc09a3c8",
+  "issue_uuid": "5f8b5268-76e0-4134-bd05-58ddb3a25d3c",
+  "author": "y4rr",
+  "content": "Phase 1 internal tooling 96.0% mlp at 0.125, per-layer active-rate ranges 1.6% to 99.5% -- structured and predictable. Ready for Phase 2 (sparsity analysis + predictor design).",
+  "created_at": "2026-04-24T02:44:08.170029166Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAErUPphVMG4Oy3fBm/opDHTIeZqJ1z/6z202vILQlLkm5Iy5c6u5ONgASWT7po/VzxS/XAOknFT75Wl7j95iDAg=="
+}
