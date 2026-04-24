@@ -11,11 +11,18 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+cuda = ["dep:ferrotorch-gpu", "dep:cudarc", "dep:half"]
+
 [dependencies]
 ferrotorch-core = { workspace = true }
 ferrotorch-nn = { workspace = true }
 ferrotorch-serialize = { workspace = true }
 ferrotorch-hub = { workspace = true }
+ferrotorch-gpu = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
 num-traits = { workspace = true }
 
 [dev-dependencies]
@@ -25,3 +32,8 @@ half = { workspace = true }
 [[example]]
 name = "llama3_8b"
 path = "examples/llama3_8b.rs"
+
+[[example]]
+name = "llama3_8b_gpu"
+path = "examples/llama3_8b_gpu.rs"
+required-features = ["cuda"]

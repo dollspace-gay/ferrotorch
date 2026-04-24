@@ -1249,6 +1249,188 @@ pub fn gpu_matmul_bf16_bf16_nt(
     Err(GpuError::NoCudaFeature)
 }
 
+/// Batched `C[b] = A[b] @ B[b]^T * alpha` on bf16-stored operands with
+/// f32 compute.
+///
+/// Each batch element is a row-major matmul of shapes
+/// `A: [M, K]`, `B: [N, K]` (so `B^T` is `[K, N]`), producing
+/// `C: [M, N]`. Batch elements are interleaved in memory by
+/// the fixed strides `stride_a_elems`, `stride_b_elems`,
+/// `stride_c_elems` (counted in elements, not bytes). The three
+/// buffers must together supply `batch_count` complete matmuls.
+///
+/// This is what every multi-head attention needs:
+/// `Q @ K^T * 1/sqrt(d)` across all heads in one cuBLAS call
+/// (`batch_count = num_heads`, `M = seq_q`, `N = seq_k`, `K = head_dim`,
+/// `stride_a = stride_b = seq * head_dim`, `stride_c = seq_q * seq_k`).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_matmul_bf16_bf16_strided_batched_nt(
+    a: &cudarc::driver::CudaSlice<u16>,
+    b: &cudarc::driver::CudaSlice<u16>,
+    m: usize,
+    k: usize,
+    n: usize,
+    batch_count: usize,
+    stride_a_elems: usize,
+    stride_b_elems: usize,
+    alpha: f32,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    use core::ffi::c_void;
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if batch_count == 0 || m == 0 || k == 0 || n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(batch_count * m * n)?);
+    }
+
+    let (m_i32, k_i32, n_i32, bc_i32) = (m as i32, k as i32, n as i32, batch_count as i32);
+    let mut c = device.stream().alloc_zeros::<u16>(batch_count * m * n)?;
+    let beta: f32 = 0.0;
+    let blas = device.blas();
+    let stream = device.stream();
+
+    {
+        let (a_ptr, _ra) = a.device_ptr(&stream);
+        let (b_ptr, _rb) = b.device_ptr(&stream);
+        let (c_ptr, _rc) = c.device_ptr_mut(&stream);
+
+        // Same row-major <-> column-major swap trick as gpu_matmul_bf16_bf16_nt.
+        unsafe {
+            cublas_result::gemm_strided_batched_ex(
+                *blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                m_i32,
+                k_i32,
+                (&alpha) as *const f32 as *const c_void,
+                b_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                stride_b_elems as i64,
+                a_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                stride_a_elems as i64,
+                (&beta) as *const f32 as *const c_void,
+                c_ptr as *mut c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                (m * n) as i64,
+                bc_i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )?;
+        }
+    }
+
+    Ok(c)
+}
+
+/// Batched `C[b] = A[b] @ B[b] * alpha`. Same as
+/// [`gpu_matmul_bf16_bf16_strided_batched_nt`] but without the transpose
+/// on `B`. Used for `attn_weights @ V` in multi-head attention.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_matmul_bf16_bf16_strided_batched(
+    a: &cudarc::driver::CudaSlice<u16>,
+    b: &cudarc::driver::CudaSlice<u16>,
+    m: usize,
+    k: usize,
+    n: usize,
+    batch_count: usize,
+    stride_a_elems: usize,
+    stride_b_elems: usize,
+    alpha: f32,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    use core::ffi::c_void;
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if batch_count == 0 || m == 0 || k == 0 || n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(batch_count * m * n)?);
+    }
+
+    let (m_i32, k_i32, n_i32, bc_i32) = (m as i32, k as i32, n as i32, batch_count as i32);
+    let mut c = device.stream().alloc_zeros::<u16>(batch_count * m * n)?;
+    let beta: f32 = 0.0;
+    let blas = device.blas();
+    let stream = device.stream();
+
+    {
+        let (a_ptr, _ra) = a.device_ptr(&stream);
+        let (b_ptr, _rb) = b.device_ptr(&stream);
+        let (c_ptr, _rc) = c.device_ptr_mut(&stream);
+
+        unsafe {
+            cublas_result::gemm_strided_batched_ex(
+                *blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                m_i32,
+                k_i32,
+                (&alpha) as *const f32 as *const c_void,
+                b_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                stride_b_elems as i64,
+                a_ptr as *const c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                k_i32,
+                stride_a_elems as i64,
+                (&beta) as *const f32 as *const c_void,
+                c_ptr as *mut c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                n_i32,
+                (m * n) as i64,
+                bc_i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )?;
+        }
+    }
+
+    Ok(c)
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_matmul_bf16_bf16_strided_batched_nt(
+    _a: &(),
+    _b: &(),
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _batch_count: usize,
+    _stride_a_elems: usize,
+    _stride_b_elems: usize,
+    _alpha: f32,
+    _device: &GpuDevice,
+) -> GpuResult<()> {
+    Err(GpuError::NoCudaFeature)
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_matmul_bf16_bf16_strided_batched(
+    _a: &(),
+    _b: &(),
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _batch_count: usize,
+    _stride_a_elems: usize,
+    _stride_b_elems: usize,
+    _alpha: f32,
+    _device: &GpuDevice,
+) -> GpuResult<()> {
+    Err(GpuError::NoCudaFeature)
+}
+
 // ---------------------------------------------------------------------------
 // CPU fallback implementations
 // ---------------------------------------------------------------------------
@@ -1842,6 +2024,64 @@ mod tests {
             assert!(
                 (a - b).abs() < 0.01,
                 "nt[{i}]={a} vs ref[{i}]={b}",
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_bf16_strided_batched_matches_per_batch_reference() {
+        // Two [2,3] @ [2,3]^T = [2,2] batched matmuls with alpha=0.5.
+        let dev = GpuDevice::new(0).expect("cuda");
+        let a0: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2,3]
+        let b0: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // [2,3]
+        let a1: Vec<f32> = vec![0.5, 0.5, 0.5, 1.0, 1.0, 1.0];
+        let b1: Vec<f32> = vec![2.0, 2.0, 2.0, -1.0, -1.0, -1.0];
+        let a: Vec<f32> = [&a0[..], &a1[..]].concat();
+        let b: Vec<f32> = [&b0[..], &b1[..]].concat();
+
+        let a_gpu = upload_as_bf16(&dev, &a);
+        let b_gpu = upload_as_bf16(&dev, &b);
+        let c = gpu_matmul_bf16_bf16_strided_batched_nt(
+            &a_gpu, &b_gpu, 2, 3, 2, 2, 6, 6, 0.5, &dev,
+        )
+        .expect("batched");
+        let got = download_bf16_as_f32(&dev, &c);
+
+        // Reference: per-batch matmul_bf16_bf16_nt.
+        let ref0 = gpu_matmul_bf16_bf16_nt(
+            &upload_as_bf16(&dev, &a0),
+            &upload_as_bf16(&dev, &b0),
+            2,
+            3,
+            2,
+            &dev,
+        )
+        .unwrap();
+        let ref1 = gpu_matmul_bf16_bf16_nt(
+            &upload_as_bf16(&dev, &a1),
+            &upload_as_bf16(&dev, &b1),
+            2,
+            3,
+            2,
+            &dev,
+        )
+        .unwrap();
+        let expected0 = download_bf16_as_f32(&dev, &ref0);
+        let expected1 = download_bf16_as_f32(&dev, &ref1);
+
+        // Batched result was scaled by 0.5, so compare scaled expected.
+        for (i, (&g, &e)) in got[..4].iter().zip(expected0.iter()).enumerate() {
+            let scaled = e * 0.5;
+            assert!(
+                (g - scaled).abs() < scaled.abs() * 0.05 + 0.1,
+                "b0[{i}]: got {g}, expected {scaled}",
+            );
+        }
+        for (i, (&g, &e)) in got[4..].iter().zip(expected1.iter()).enumerate() {
+            let scaled = e * 0.5;
+            assert!(
+                (g - scaled).abs() < scaled.abs() * 0.05 + 0.1,
+                "b1[{i}]: got {g}, expected {scaled}",
             );
         }
     }

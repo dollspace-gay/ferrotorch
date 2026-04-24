@@ -31,9 +31,14 @@ pub mod attention;
 pub mod mlp;
 pub mod layer;
 pub mod model;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 
 pub use attention::LlamaAttention;
 pub use config::LlamaConfig;
 pub use layer::LlamaDecoderLayer;
 pub use mlp::LlamaMLP;
 pub use model::{LlamaForCausalLM, LlamaModel};
+
+#[cfg(feature = "cuda")]
+pub use gpu::{LlamaGpuInferencer, LlamaGpuLayer};
