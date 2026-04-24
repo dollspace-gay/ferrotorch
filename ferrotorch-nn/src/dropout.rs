@@ -139,31 +139,23 @@ fn philox_dropout_mask<T: Float>(
 ///
 /// Reapplies the same binary mask scaled by `1/(1-p)` to the upstream
 /// gradient, routing gradients only through surviving elements.
+///
+/// The mask is stored as a [`Tensor<T>`] on the same device as the
+/// forward input so backward reduces to a single `mul` that stays
+/// GPU-native when the input is on CUDA.
 #[derive(Debug)]
 struct DropoutBackward<T: Float> {
     input: Tensor<T>,
-    /// The mask already includes the `1/(1-p)` scaling factor: each element
-    /// is either `0` or `1/(1-p)`.
-    scaled_mask: Vec<T>,
+    /// Mask tensor with elements in `{0, 1/(1-p)}`. Lives on the same
+    /// device as `input`, so `mul(grad_output, scaled_mask)` in the
+    /// backward routes entirely through GPU ops when training on CUDA.
+    scaled_mask: Tensor<T>,
 }
 
 impl<T: Float> GradFn<T> for DropoutBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
-        if grad_output.is_cuda() {
-            return Err(FerrotorchError::NotImplementedOnCuda { op: "dropout backward" });
-        }
         let da = if self.input.requires_grad() {
-            let go_data = grad_output.data_vec()?;
-            let grad_a: Vec<T> = go_data
-                .iter()
-                .zip(self.scaled_mask.iter())
-                .map(|(&g, &m)| g * m)
-                .collect();
-            let g = Tensor::from_storage(
-                TensorStorage::cpu(grad_a),
-                self.input.shape().to_vec(),
-                false,
-            )?;
+            let g = ferrotorch_core::grad_fns::arithmetic::mul(grad_output, &self.scaled_mask)?;
             Some(g)
         } else {
             None
@@ -293,7 +285,17 @@ impl<T: Float> Module<T> for Dropout<T> {
                 // GPU kernel uses. This is reproducible across checkpoint
                 // save/restore because the Philox state is deterministic.
                 if is_grad_enabled() && input.requires_grad() {
-                    let scaled_mask = philox_dropout_mask(numel, threshold, scale, &rng_state);
+                    let scaled_mask_vec =
+                        philox_dropout_mask(numel, threshold, scale, &rng_state);
+                    // Upload the mask to the input's device so the
+                    // backward `mul` runs on-device without a CPU
+                    // round-trip.
+                    let mask_cpu = Tensor::from_storage(
+                        TensorStorage::cpu(scaled_mask_vec),
+                        input.shape().to_vec(),
+                        false,
+                    )?;
+                    let scaled_mask = mask_cpu.to(input.device())?;
                     return Tensor::from_operation(
                         TensorStorage::gpu(handle),
                         input.shape().to_vec(),
@@ -314,7 +316,7 @@ impl<T: Float> Module<T> for Dropout<T> {
 
         // CPU path.
         let mut state = xorshift_seed();
-        let scaled_mask: Vec<T> = (0..numel)
+        let scaled_mask_vec: Vec<T> = (0..numel)
             .map(|_| {
                 if xorshift_next(&mut state) < self.p {
                     zero
@@ -327,11 +329,16 @@ impl<T: Float> Module<T> for Dropout<T> {
         let input_data = input.data()?;
         let output_data: Vec<T> = input_data
             .iter()
-            .zip(scaled_mask.iter())
+            .zip(scaled_mask_vec.iter())
             .map(|(&x, &m)| x * m)
             .collect();
 
         if is_grad_enabled() && input.requires_grad() {
+            let scaled_mask = Tensor::from_storage(
+                TensorStorage::cpu(scaled_mask_vec),
+                input.shape().to_vec(),
+                false,
+            )?;
             Tensor::from_operation(
                 TensorStorage::cpu(output_data),
                 input.shape().to_vec(),
