@@ -1101,6 +1101,580 @@ pub fn gpu_rope_half_bf16(
 }
 
 // ===========================================================================
+// transpose_to_heads: [seq, H*d] -> [H, seq, d]
+// ===========================================================================
+
+// Layout transform used before multi-head attention. Read position
+// (s, h, d) from the input packed row `[seq, H*d]` where the h-th
+// head starts at column h*d, write it to the heads-major output
+// `[H, seq, d]` where head h's block starts at h*seq*d.
+const TRANSPOSE_TO_HEADS_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry transpose_to_heads_bf16_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 num_heads,
+    .param .u32 seq_len,
+    .param .u32 head_dim
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %gid, %H, %S, %D, %total, %rem, %d, %s, %h, %src_idx, %dst_idx, %hd;
+    .reg .u64 %in, %out, %off;
+    .reg .b16 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %H, [num_heads];
+    ld.param.u32 %S, [seq_len];
+    ld.param.u32 %D, [head_dim];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %gid, %bid, %bdim, %r_tid;
+
+    // total = H * S * D
+    mul.lo.u32 %total, %H, %S;
+    mul.lo.u32 %total, %total, %D;
+    setp.ge.u32 %p, %gid, %total;
+    @%p bra DONE;
+
+    mul.lo.u32 %hd, %H, %D;     // per-seq stride in input
+
+    // gid = h*S*D + s*D + d
+    rem.u32 %d, %gid, %D;
+    div.u32 %rem, %gid, %D;
+    rem.u32 %s, %rem, %S;
+    div.u32 %h, %rem, %S;
+
+    // src: input[s*H*D + h*D + d]
+    mul.lo.u32 %src_idx, %s, %hd;
+    mad.lo.u32 %src_idx, %h, %D, %src_idx;
+    add.u32 %src_idx, %src_idx, %d;
+
+    // dst: output[gid]  (already heads-major)
+    mov.u32 %dst_idx, %gid;
+
+    cvt.u64.u32 %off, %src_idx;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %in, %off;
+    ld.global.b16 %v, [%off];
+
+    cvt.u64.u32 %off, %dst_idx;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %out, %off;
+    st.global.b16 [%off], %v;
+
+DONE:
+    ret;
+}
+";
+
+const TRANSPOSE_FROM_HEADS_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry transpose_from_heads_bf16_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 num_heads,
+    .param .u32 seq_len,
+    .param .u32 head_dim
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %gid, %H, %S, %D, %total, %rem, %d, %s, %h, %src_idx, %dst_idx, %hd;
+    .reg .u64 %in, %out, %off;
+    .reg .b16 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %H, [num_heads];
+    ld.param.u32 %S, [seq_len];
+    ld.param.u32 %D, [head_dim];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %gid, %bid, %bdim, %r_tid;
+
+    mul.lo.u32 %total, %H, %S;
+    mul.lo.u32 %total, %total, %D;
+    setp.ge.u32 %p, %gid, %total;
+    @%p bra DONE;
+
+    mul.lo.u32 %hd, %H, %D;
+
+    // Read in heads-major [H, S, D]: input[h*S*D + s*D + d] = gid directly.
+    // Decompose gid -> (h, s, d).
+    rem.u32 %d, %gid, %D;
+    div.u32 %rem, %gid, %D;
+    rem.u32 %s, %rem, %S;
+    div.u32 %h, %rem, %S;
+
+    // dst_idx = s*H*D + h*D + d
+    mul.lo.u32 %dst_idx, %s, %hd;
+    mad.lo.u32 %dst_idx, %h, %D, %dst_idx;
+    add.u32 %dst_idx, %dst_idx, %d;
+
+    cvt.u64.u32 %off, %gid;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %in, %off;
+    ld.global.b16 %v, [%off];
+
+    cvt.u64.u32 %off, %dst_idx;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %out, %off;
+    st.global.b16 [%off], %v;
+
+DONE:
+    ret;
+}
+";
+
+pub fn gpu_transpose_to_heads_bf16(
+    input: &cudarc::driver::CudaSlice<u16>,
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    let total = num_heads * seq_len * head_dim;
+    if total == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(0)?);
+    }
+    if input.len() < total {
+        return Err(GpuError::ShapeMismatch {
+            op: "transpose_to_heads_bf16",
+            expected: vec![seq_len, num_heads, head_dim],
+            got: vec![input.len()],
+        });
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(
+        ctx,
+        TRANSPOSE_TO_HEADS_BF16_PTX,
+        "transpose_to_heads_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|e| {
+        eprintln!("transpose_to_heads_bf16_kernel: {e}");
+        GpuError::PtxCompileFailed {
+            kernel: "transpose_to_heads_bf16_kernel",
+        }
+    })?;
+
+    let mut out = stream.alloc_zeros::<u16>(total)?;
+    let cfg = launch_1d(total);
+    let (nh, sl, hd) = (num_heads as u32, seq_len as u32, head_dim as u32);
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input)
+            .arg(&mut out)
+            .arg(&nh)
+            .arg(&sl)
+            .arg(&hd)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+pub fn gpu_transpose_from_heads_bf16(
+    input: &cudarc::driver::CudaSlice<u16>,
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    let total = num_heads * seq_len * head_dim;
+    if total == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(0)?);
+    }
+    if input.len() < total {
+        return Err(GpuError::ShapeMismatch {
+            op: "transpose_from_heads_bf16",
+            expected: vec![num_heads, seq_len, head_dim],
+            got: vec![input.len()],
+        });
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(
+        ctx,
+        TRANSPOSE_FROM_HEADS_BF16_PTX,
+        "transpose_from_heads_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|e| {
+        eprintln!("transpose_from_heads_bf16_kernel: {e}");
+        GpuError::PtxCompileFailed {
+            kernel: "transpose_from_heads_bf16_kernel",
+        }
+    })?;
+
+    let mut out = stream.alloc_zeros::<u16>(total)?;
+    let cfg = launch_1d(total);
+    let (nh, sl, hd) = (num_heads as u32, seq_len as u32, head_dim as u32);
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input)
+            .arg(&mut out)
+            .arg(&nh)
+            .arg(&sl)
+            .arg(&hd)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// repeat_kv: [Hkv, S, D] -> [Hkv * group_size, S, D]
+// ===========================================================================
+
+// For GQA: each KV head is replicated `group_size` times in the head
+// axis. Output head h comes from input head h / group_size.
+const REPEAT_KV_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry repeat_kv_bf16_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 num_kv_heads,
+    .param .u32 group_size,
+    .param .u32 seq_len,
+    .param .u32 head_dim
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %gid, %Hkv, %G, %Hq, %S, %D, %SD, %total;
+    .reg .u32 %rem, %d, %s, %h_out, %h_in, %src_idx;
+    .reg .u64 %in, %out, %off;
+    .reg .b16 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %Hkv, [num_kv_heads];
+    ld.param.u32 %G, [group_size];
+    ld.param.u32 %S, [seq_len];
+    ld.param.u32 %D, [head_dim];
+
+    mul.lo.u32 %Hq, %Hkv, %G;
+    mul.lo.u32 %SD, %S, %D;
+    mul.lo.u32 %total, %Hq, %SD;
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %gid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %gid, %total;
+    @%p bra DONE;
+
+    // gid = h_out * S*D + s*D + d
+    rem.u32 %d, %gid, %D;
+    div.u32 %rem, %gid, %D;
+    rem.u32 %s, %rem, %S;
+    div.u32 %h_out, %rem, %S;
+
+    // h_in = h_out / group_size
+    div.u32 %h_in, %h_out, %G;
+
+    // src_idx = h_in * S*D + s*D + d
+    mul.lo.u32 %src_idx, %h_in, %SD;
+    mad.lo.u32 %src_idx, %s, %D, %src_idx;
+    add.u32 %src_idx, %src_idx, %d;
+
+    cvt.u64.u32 %off, %src_idx;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %in, %off;
+    ld.global.b16 %v, [%off];
+
+    cvt.u64.u32 %off, %gid;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %out, %off;
+    st.global.b16 [%off], %v;
+
+DONE:
+    ret;
+}
+";
+
+pub fn gpu_repeat_kv_bf16(
+    input: &cudarc::driver::CudaSlice<u16>,
+    num_kv_heads: usize,
+    group_size: usize,
+    seq_len: usize,
+    head_dim: usize,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    let total_in = num_kv_heads * seq_len * head_dim;
+    let total_out = num_kv_heads * group_size * seq_len * head_dim;
+    if total_out == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(0)?);
+    }
+    if input.len() < total_in {
+        return Err(GpuError::ShapeMismatch {
+            op: "repeat_kv_bf16",
+            expected: vec![num_kv_heads, seq_len, head_dim],
+            got: vec![input.len()],
+        });
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(
+        ctx,
+        REPEAT_KV_BF16_PTX,
+        "repeat_kv_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|e| {
+        eprintln!("repeat_kv_bf16_kernel: {e}");
+        GpuError::PtxCompileFailed {
+            kernel: "repeat_kv_bf16_kernel",
+        }
+    })?;
+
+    let mut out = stream.alloc_zeros::<u16>(total_out)?;
+    let cfg = launch_1d(total_out);
+    let (hkv, g, sl, hd) = (
+        num_kv_heads as u32,
+        group_size as u32,
+        seq_len as u32,
+        head_dim as u32,
+    );
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input)
+            .arg(&mut out)
+            .arg(&hkv)
+            .arg(&g)
+            .arg(&sl)
+            .arg(&hd)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// Causal mask: set scores[b, i, j] = -inf (bf16) for j > i
+// ===========================================================================
+
+// In-place: rewrites the input buffer (which is a [batch, seq_q, seq_k]
+// row-major tensor) so attention scores at (i, j) with j > i are driven
+// to a large-negative bf16 value (0xFF80 = -Inf for bf16). One thread
+// per (batch, i, j) pair; predicate on j > i.
+const CAUSAL_MASK_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry causal_mask_bf16_kernel(
+    .param .u64 buf_ptr,
+    .param .u32 batch,
+    .param .u32 seq_q,
+    .param .u32 seq_k
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %gid, %B, %SQ, %SK, %total, %rem, %j, %i, %b;
+    .reg .u32 %neg_inf;
+    .reg .u64 %buf, %off;
+    .reg .b16 %neg_inf_b;
+    .reg .pred %p, %q;
+
+    ld.param.u64 %buf, [buf_ptr];
+    ld.param.u32 %B, [batch];
+    ld.param.u32 %SQ, [seq_q];
+    ld.param.u32 %SK, [seq_k];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %gid, %bid, %bdim, %r_tid;
+
+    mul.lo.u32 %total, %B, %SQ;
+    mul.lo.u32 %total, %total, %SK;
+    setp.ge.u32 %p, %gid, %total;
+    @%p bra DONE;
+
+    // gid = b*SQ*SK + i*SK + j
+    rem.u32 %j, %gid, %SK;
+    div.u32 %rem, %gid, %SK;
+    rem.u32 %i, %rem, %SQ;
+    div.u32 %b, %rem, %SQ;
+
+    setp.le.u32 %q, %j, %i;
+    @%q bra DONE;
+
+    // bf16 -Inf = 0xFF80
+    mov.u32 %neg_inf, 0xFF80;
+    cvt.u16.u32 %neg_inf_b, %neg_inf;
+
+    cvt.u64.u32 %off, %gid;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %buf, %off;
+    st.global.b16 [%off], %neg_inf_b;
+
+DONE:
+    ret;
+}
+";
+
+pub fn gpu_causal_mask_bf16(
+    buf: &mut cudarc::driver::CudaSlice<u16>,
+    batch: usize,
+    seq_q: usize,
+    seq_k: usize,
+    device: &GpuDevice,
+) -> GpuResult<()> {
+    let total = batch * seq_q * seq_k;
+    if total == 0 {
+        return Ok(());
+    }
+    if buf.len() < total {
+        return Err(GpuError::ShapeMismatch {
+            op: "causal_mask_bf16",
+            expected: vec![batch, seq_q, seq_k],
+            got: vec![buf.len()],
+        });
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(
+        ctx,
+        CAUSAL_MASK_BF16_PTX,
+        "causal_mask_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|e| {
+        eprintln!("causal_mask_bf16_kernel: {e}");
+        GpuError::PtxCompileFailed {
+            kernel: "causal_mask_bf16_kernel",
+        }
+    })?;
+
+    let cfg = launch_1d(total);
+    let (b, sq, sk) = (batch as u32, seq_q as u32, seq_k as u32);
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(buf)
+            .arg(&b)
+            .arg(&sq)
+            .arg(&sk)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Scalar multiply (scale by f32 constant, round-to-bf16)
+// ===========================================================================
+
+// Used to fold 1/sqrt(head_dim) into attention scores. Takes a `scale`
+// f32 parameter and multiplies the input element-wise.
+const SCALE_BF16_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry scale_bf16_kernel(
+    .param .u64 a_ptr,
+    .param .u64 out_ptr,
+    .param .f32 scale,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %a, %out, %off;
+    .reg .b16 %a_b16, %zero16;
+    .reg .b32 %a_u32, %bits, %round, %lsb;
+    .reg .f32 %va, %scale_r, %vr;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.f32 %scale_r, [scale];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 1;
+    add.u64 %a, %a, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.b16 %a_b16, [%a];
+    mov.b16 %zero16, 0;
+    mov.b32 %a_u32, {%zero16, %a_b16};
+    mov.b32 %va, %a_u32;
+
+    mul.f32 %vr, %va, %scale_r;
+
+    mov.b32 %bits, %vr;
+    shr.u32 %lsb, %bits, 16;
+    and.b32 %lsb, %lsb, 1;
+    add.u32 %round, %bits, 0x7FFF;
+    add.u32 %round, %round, %lsb;
+    shr.u32 %bits, %round, 16;
+    st.global.u16 [%out], %bits;
+
+DONE:
+    ret;
+}
+";
+
+pub fn gpu_scale_bf16(
+    input: &cudarc::driver::CudaSlice<u16>,
+    scale: f32,
+    device: &GpuDevice,
+) -> GpuResult<cudarc::driver::CudaSlice<u16>> {
+    let n = input.len();
+    if n == 0 {
+        return Ok(device.stream().alloc_zeros::<u16>(0)?);
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = get_or_compile(
+        ctx,
+        SCALE_BF16_PTX,
+        "scale_bf16_kernel",
+        device.ordinal() as u32,
+    )
+    .map_err(|e| {
+        eprintln!("scale_bf16_kernel: {e}");
+        GpuError::PtxCompileFailed {
+            kernel: "scale_bf16_kernel",
+        }
+    })?;
+
+    let mut out = stream.alloc_zeros::<u16>(n)?;
+    let cfg = launch_1d(n);
+    let n_u32 = n as u32;
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input)
+            .arg(&mut out)
+            .arg(&scale)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1253,6 +1827,90 @@ mod tests {
                     "softmax[{r},{i}]: got {g}, expected {e}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn transpose_to_heads_round_trips() {
+        let dev = GpuDevice::new(0).expect("cuda");
+        let (h, s, d) = (2usize, 3usize, 4usize);
+        let data: Vec<f32> = (0..s * h * d).map(|i| i as f32).collect();
+        let input = upload_bf16(&dev, &data);
+        let th = gpu_transpose_to_heads_bf16(&input, h, s, d, &dev).unwrap();
+        let back = gpu_transpose_from_heads_bf16(&th, h, s, d, &dev).unwrap();
+        let got = download_bf16(&dev, &back);
+        for (g, e) in got.iter().zip(data.iter()) {
+            assert!((g - e).abs() < 1e-3, "round-trip {g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn transpose_to_heads_picks_right_values() {
+        // Input [seq=2, H=2, D=3]: rows [a_h0, a_h1, b_h0, b_h1]
+        // Output [H=2, seq=2, D=3]: [h0_a, h0_b, h1_a, h1_b]
+        let dev = GpuDevice::new(0).expect("cuda");
+        let data: Vec<f32> = vec![
+            10.0, 11.0, 12.0, // s=0 h=0
+            20.0, 21.0, 22.0, // s=0 h=1
+            30.0, 31.0, 32.0, // s=1 h=0
+            40.0, 41.0, 42.0, // s=1 h=1
+        ];
+        let input = upload_bf16(&dev, &data);
+        let out = gpu_transpose_to_heads_bf16(&input, 2, 2, 3, &dev).unwrap();
+        let got = download_bf16(&dev, &out);
+        assert_eq!(
+            got,
+            vec![10.0, 11.0, 12.0, 30.0, 31.0, 32.0, 20.0, 21.0, 22.0, 40.0, 41.0, 42.0]
+        );
+    }
+
+    #[test]
+    fn repeat_kv_broadcasts_correctly() {
+        // Hkv=2, G=2, S=1, D=3
+        let dev = GpuDevice::new(0).expect("cuda");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
+        let input = upload_bf16(&dev, &data);
+        let out = gpu_repeat_kv_bf16(&input, 2, 2, 1, 3, &dev).unwrap();
+        let got = download_bf16(&dev, &out);
+        assert_eq!(
+            got,
+            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 10.0, 20.0, 30.0]
+        );
+    }
+
+    #[test]
+    fn causal_mask_zeros_upper_triangle() {
+        let dev = GpuDevice::new(0).expect("cuda");
+        // 4x4 scores, all 1.0. After causal mask, upper triangle is -Inf.
+        let scores: Vec<f32> = vec![1.0; 16];
+        let mut buf = upload_bf16(&dev, &scores);
+        gpu_causal_mask_bf16(&mut buf, 1, 4, 4, &dev).unwrap();
+        let got = download_bf16(&dev, &buf);
+        for i in 0..4usize {
+            for j in 0..4usize {
+                let v = got[i * 4 + j];
+                if j <= i {
+                    assert!((v - 1.0).abs() < 1e-3, "[{i},{j}] = {v}, expected 1.0");
+                } else {
+                    assert!(
+                        v.is_infinite() && v < 0.0,
+                        "[{i},{j}] = {v}, expected -Inf",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scale_bf16_multiplies_by_scalar() {
+        let dev = GpuDevice::new(0).expect("cuda");
+        let data: Vec<f32> = vec![1.0, 2.0, -3.0, 4.5];
+        let input = upload_bf16(&dev, &data);
+        let out = gpu_scale_bf16(&input, 0.5, &dev).unwrap();
+        let got = download_bf16(&dev, &out);
+        let expected: Vec<f32> = data.iter().map(|x| x * 0.5).collect();
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!((g - e).abs() < e.abs() * 0.02 + 5e-3, "{g} vs {e}");
         }
     }
 
