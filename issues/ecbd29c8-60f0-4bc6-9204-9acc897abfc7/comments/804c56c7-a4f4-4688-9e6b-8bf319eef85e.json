@@ -1,0 +1,10 @@
+{
+  "uuid": "804c56c7-a4f4-4688-9e6b-8bf319eef85e",
+  "issue_uuid": "ecbd29c8-60f0-4bc6-9204-9acc897abfc7",
+  "author": "y4rr",
+  "content": "Phase 5 V1 SwiGLU paging works: TEAL magnitude threshold replaces FATReLU > 0; SVD gate predictor (cuSOLVER full SVD, 127s for Llama 3 8B) implemented as training-free per-layer predictor; PagedLlamaInferencer dispatches on either ProSparse, SVD, or no predictor. Llama 3 8B end-to-end: cos_sim=1.0 at TEAL=0.05, cos_sim=0.99996 at TEAL=0.2 (36% neuron-level sparsity), cos_sim=0.91 at TEAL=1.0 (60% block savings ceiling). 67 tests pass. Page gate_proj remains future work — V1 keeps gate_proj resident as before. internal tooling",
+  "created_at": "2026-04-25T03:18:44.611093646Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtm3owB7twjpLdEr9XaqHioM/lHIpOwczy2KL/LMXSVuOp9SKGjNXJ0qZyqYKAftZjIIn6DTAB6lmAGSKZ+GzAg=="
+}
