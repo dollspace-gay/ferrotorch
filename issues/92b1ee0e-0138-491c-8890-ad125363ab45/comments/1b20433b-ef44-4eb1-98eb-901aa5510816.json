@@ -1,0 +1,10 @@
+{
+  "uuid": "1b20433b-ef44-4eb1-98eb-901aa5510816",
+  "issue_uuid": "92b1ee0e-0138-491c-8890-ad125363ab45",
+  "author": "y4rr",
+  "content": "Phase 5 V3 batch 1: NVMe L3 tier landed.\n\nAdded: paged/disk.rs (DiskBacking with POSIX pread/pwrite, single sparse-allocated file with global-block-index addressing). Tier::Disk variant. TieredBlockStore now three-tier (Vram → Host → Disk) with separate vram_lru and host_lru queues, host_bytes_in_use, disk_present set. TierBudget gains host_bytes: Option<usize> for host RAM limit. New constructor with_disk(shape, budget, Arc<DiskBacking>). ensure_resident walks Disk→Host→Vram chain, faulting from disk on demand. insert_host spills LRU host blocks to disk when host_budget exceeded. Metrics: disk_reads, disk_writes, bytes_read_from_disk, bytes_written_to_disk, disk_read_stalls, disk_write_stalls.\n\nTests: 74 pass. New disk-tier integration test (host_spill_to_disk_and_fault_back) verifies block survives the full round trip Vram → Host → Disk → Host → Vram with bit-exact data preservation.\n\nRemaining V3 work (deferred to follow-up issues): generic store over T (Pod), paged embed_tokens/lm_head, paged attention head-level, KV cache + KV cache paging, async DMA prefetch, internal tooling",
+  "created_at": "2026-04-25T04:36:53.632140108Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl+64GPJDzghHmXqTnaj8EN3VqULMFzGDbkp7LkDiYmlXWe674sf4UF7Cyh9i+kGh8PLyPzmqvNAhkyndMWQUBg=="
+}
