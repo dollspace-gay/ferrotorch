@@ -1,0 +1,10 @@
+{
+  "uuid": "3b657d9a-a322-47d2-b595-704644b16383",
+  "issue_uuid": "94a136f1-87a1-4d59-a603-bdf38d7a2c04",
+  "author": "y4rr",
+  "content": "Phase 5 V9: TieredBlockStore<T> generic over BlockElement (DeviceRepr + ValidAsZeroBits + bytemuck::Pod + Copy + Default + 'static). Default T = u16 keeps backward-compat. Disk serialisation via bytemuck::cast_slice (was bf16-specific bf16_bits_to_bytes). Internal block_bytes_t() computes size_of::<T>() * numel. New test: store_works_with_i8_element_for_quant_extensibility — verifies a TieredBlockStore<i8> end-to-end with insert_host + ensure_resident + clone_dtoh round trip.\n\nFull Llama 3 8B stack now ships:\n* Paged MLP (Gate + Up + DownT) via TieredBlockStore<u16>, V2 hybrid (hot/cold pinning + SVD predictor + TEAL refinement)\n* Paged embed_tokens (PagedEmbedding row-block paging)\n* Paged lm_head (PagedLmHead lazy-load)\n* KV cache + decode mode\n* NVMe L3 tier (Vram → Host → Disk)\n* internal tooling\n* always-resident floor reduced by ~5.7 GiB vs baseline\n\n81 tests pass, no warnings.\n\nRemaining V3 axes (deliberately deferred):\n* Async DMA prefetch — gated on internal toolingr ~400 lines of code) and a head-level sparsity predictor. Largest VRAM win on 70B+ models; on 8B saves only ~2.5 GiB, low ROI without 70B target hardware.\n* KV cache paging — full causal attention requires every cached position every step, so spilling is bandwidth-bound. Only useful with sliding-window or sparse attention variants (which are model-architecture changes, not paging changes).",
+  "created_at": "2026-04-25T14:02:50.054311100Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcNizSfMbIIchh9LfSfOnVHPOtr1Vm9PIueWYPdSCgT1CJOJ+1dmtNl85Rjnvy6dmvh4Y/L8nMMTsJ6YYJ/m4Cw=="
+}
