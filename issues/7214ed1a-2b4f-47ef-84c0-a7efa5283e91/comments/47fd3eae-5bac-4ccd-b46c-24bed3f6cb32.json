@@ -1,0 +1,10 @@
+{
+  "uuid": "47fd3eae-5bac-4ccd-b46c-24bed3f6cb32",
+  "issue_uuid": "7214ed1a-2b4f-47ef-84c0-a7efa5283e91",
+  "author": "y4rr",
+  "content": "Phase 3 v3 corpus + ShadowLlm integration shipped. 1.5M-token public-domain corpus (49 Gutenberg + 8 code), trace at K=4, ShadowLlm trained F1=0.6542 (vs HSP F1=0.461), pin_hot_blocks bug #543 fixed, end-to-end paged_llama3_8b+ShadowLlm verified bit-exact at threshold=-10 (proves the paging path is correct). Remaining: predictor recall tuning (asymmetric BCE / threshold sweep). 85 lib tests pass. Full notes: results/SESSION_NOTES.md",
+  "created_at": "2026-04-25T18:20:08.671354030Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVZD8KvCBgveKS73BG9yrgSYrRhdo3oyy/3KIu9gaaN/qtn7TKk5CC2rwR1qqDkkfarZ/UIO4sERMCdEKmukxCg=="
+}
