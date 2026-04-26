@@ -1,0 +1,10 @@
+{
+  "uuid": "d6540a8e-4d3a-40c8-bbf5-953c26736550",
+  "issue_uuid": "724932fb-9ef5-4b0a-ad08-bcc3d9f3f103",
+  "author": "y4rr",
+  "content": "Local plainact + ensemble shipped. Plainact: added plainact_local tap to GPU profiler (extra matmul per layer for y_full @ down_proj), captured 1.5M-token K=4 trace with plainact target, trained pw=3 BCE F1=0.548 (sparser positives 17% vs 32%). Best operating point: t=-5 → 73% density, cos 0.943, argmax ✓. NEW pareto data point but slightly worse than raw-act top_k=18 (69%, 0.948). Ensemble OR(pw3+pw5+mwbce) wired via add_shadow_llm_extra — at t=-2.5 gives 86%/0.976/✓ but no Pareto win at meaningful density. Final pareto unchanged: pw=3 BCE t=-2.5 still best at 57% MLP savings + argmax preserved (cos 0.882). The proper plainact needs a real LM-head CE backward pass through bf16 kernels — weeks of engineering. 85 lib tests pass.",
+  "created_at": "2026-04-26T04:48:25.814578800Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKl5dr4jerdR8TIwFqvO9CqBuP7gvStNTqgFhtKhU7LNAp2EzADAVnmNGb2Ckczvk/SG8nI7RxweN6bVS34j0AA=="
+}
