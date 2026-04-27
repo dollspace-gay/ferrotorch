@@ -13,6 +13,12 @@ pub mod json_schema;
 pub mod schema;
 pub mod state;
 
+#[cfg(feature = "cuda")]
+pub mod gpu_dispatch;
+
 pub use json_schema::{GrammarError, JsonSchemaProcessor, TokenMask};
 pub use schema::Schema;
-pub use state::JsonGrammar;
+pub use state::{BooleanEmissionStage, JsonGrammar};
+
+#[cfg(feature = "cuda")]
+pub use gpu_dispatch::{PackedVocab, compute_mask_gpu};

@@ -150,6 +150,69 @@ impl JsonGrammar {
         self.done
     }
 
+    /// If this grammar is a single-frame `Schema::Boolean`, report which
+    /// stage of literal emission we're at. Returns `None` for every other
+    /// schema or for nested / multi-frame states.
+    ///
+    /// Used by the GPU constrained-decoding bridge in
+    /// [`super::gpu_dispatch`] (`--features cuda`) to decide whether the
+    /// current grammar state is DFA-compilable. Stage-2 GPU support
+    /// covers exactly Boolean; everything else falls through to the
+    /// existing CPU `compute_mask` loop.
+    pub fn boolean_emission_stage(&self) -> Option<BooleanEmissionStage> {
+        if self.done {
+            return None;
+        }
+        if self.frames.len() != 1 {
+            return None;
+        }
+        let frame = &self.frames[0];
+        if !matches!(frame.schema, Schema::Boolean) {
+            return None;
+        }
+        match &frame.phase {
+            Phase::Start => Some(BooleanEmissionStage::Start),
+            Phase::Literal { remaining } => {
+                // Disambiguate which literal we're inside. The Phase carries
+                // only the remaining suffix; we look up which of "true" /
+                // "false" has it as a suffix. The boolean grammar uses
+                // `&'static str` slices into the literal source strings, so
+                // suffix matching is unambiguous.
+                if "true".ends_with(remaining) && remaining.len() < "true".len() {
+                    Some(BooleanEmissionStage::PartialTrue { remaining })
+                } else if "false".ends_with(remaining) && remaining.len() < "false".len() {
+                    Some(BooleanEmissionStage::PartialFalse { remaining })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Stage of `Schema::Boolean` emission. Surfaces just enough of the
+/// internal `Phase` enum for the GPU dispatcher to compile a DFA without
+/// exposing the rest of the grammar's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BooleanEmissionStage {
+    /// Nothing emitted yet. The DFA must accept any prefix of either
+    /// `"true"` or `"false"`.
+    Start,
+    /// We've already emitted some prefix of `"true"`. `remaining` is the
+    /// suffix still to emit (always non-empty; complete is unreachable
+    /// here since the grammar reports `done` for that case).
+    PartialTrue {
+        remaining: &'static str,
+    },
+    /// Same as `PartialTrue` but for `"false"`.
+    PartialFalse {
+        remaining: &'static str,
+    },
+}
+
+impl JsonGrammar {
+
     /// Set of single-byte characters that may legally come next.
     ///
     /// Emits an empty vector when the grammar is complete (no more input is

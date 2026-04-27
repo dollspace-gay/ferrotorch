@@ -1785,8 +1785,11 @@ dependencies = [
 name = "ferrotorch-llama"
 version = "0.4.1"
 dependencies = [
+ "cubecl",
+ "cubecl-cuda",
  "cudarc",
  "ferrotorch-core",
+ "ferrotorch-cubecl",
  "ferrotorch-gpu",
  "ferrotorch-hub",
  "ferrotorch-nn",
