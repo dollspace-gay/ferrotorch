@@ -1,0 +1,10 @@
+{
+  "uuid": "89ae8395-3358-48ca-85c8-e3b0b1d2465f",
+  "issue_uuid": "6abc7040-5b77-45c0-a28f-9b1004cdc991",
+  "author": "y4rr",
+  "content": "Moved /home/doll/ferrotorch/ferrotorch-paged/{Cargo.{toml,lock},src,examples,results,target} and ferrotorch-paged-design.md to /home/doll/ferrotorch-paged/. Updated path deps in Cargo.toml from ../ferrotorch-X to ../ferrotorch/ferrotorch-X. cargo check --offline green at new location; parent workspace also builds clean (ferrotorch-paged was already gitignored and not a workspace member).",
+  "created_at": "2026-04-27T20:49:58.358771602Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9FX/o1bgI99exkE51F6RUgMERdebl62TVos4c/pi3fUgLyr0P9b4luTKzYkw33B/U+9s9AibnqlNdIr4oQXCDw=="
+}
