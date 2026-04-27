@@ -260,7 +260,7 @@ mod tests {
         let data = s.data().unwrap();
         let mut interior = 0;
         for &v in data {
-            assert!(v >= 0.0 && v <= 1.0, "sample out of [0,1]: {v}");
+            assert!((0.0..=1.0).contains(&v), "sample out of [0,1]: {v}");
             if v > 0.0 && v < 1.0 {
                 interior += 1;
             }
@@ -280,7 +280,7 @@ mod tests {
         let s = d.sample(&[100]).unwrap();
         let data = s.data().unwrap();
         // Most samples should be < 0.05 or > 0.95.
-        let extreme = data.iter().filter(|&&v| v < 0.05 || v > 0.95).count();
+        let extreme = data.iter().filter(|&&v| !(0.05..=0.95).contains(&v)).count();
         assert!(
             extreme > 90,
             "low temp should give bimodal samples; got only {extreme}/100 extreme"

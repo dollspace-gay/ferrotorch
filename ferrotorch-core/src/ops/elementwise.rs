@@ -381,7 +381,7 @@ fn vexp_f32(x: f32) -> f32 {
     const LN2_LO: f32 = 1.428_606_8e-6;
 
     // Clamp to avoid overflow/underflow in the integer exponent.
-    let x = x.max(-87.33654).min(88.72284);
+    let x = x.clamp(-87.33654, 88.72284);
 
     // Range reduction: n = round(x * log2e), r = x - n * ln2.
     let n = (x * LOG2E).round();
@@ -425,7 +425,7 @@ fn vlog_f32(x: f32) -> f32 {
     let s = (m - 1.0) / (m + 1.0);
     let s2 = s * s;
     // Horner evaluation of 2*(s + s^3/3 + s^5/5 + s^7/7 + s^9/9)
-    let p = s * (2.0 + s2 * (0.666_666_67 + s2 * (0.4 + s2 * (0.285_714_29 + s2 * 0.222_222_22))));
+    let p = s * (2.0 + s2 * (0.666_666_7 + s2 * (0.4 + s2 * (0.285_714_3 + s2 * 0.222_222_22))));
 
     (e as f32) * LN2 + p
 }
@@ -952,7 +952,7 @@ pub fn nanmean<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     let mut count = 0usize;
     for &v in data.iter() {
         if !v.is_nan() {
-            total = total + v;
+            total += v;
             count += 1;
         }
     }
@@ -1053,7 +1053,7 @@ pub fn logsumexp_dim<T: Float>(
             let mut sum_exp = <T as num_traits::Zero>::zero();
             for d in 0..dim_size {
                 let idx = o * dim_size * inner + d * inner + i;
-                sum_exp = sum_exp + (data[idx] - max_val).exp();
+                sum_exp += (data[idx] - max_val).exp();
             }
 
             result.push(max_val + sum_exp.ln());

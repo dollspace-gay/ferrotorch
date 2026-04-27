@@ -778,19 +778,15 @@ pub fn reduce<T: Float>(
                     // cummax along dim 1, then narrow to the last index.
                     // The running max ends with the global max along that axis.
                     let cmax = crate::grad_fns::cumulative::cummax(&view, 1)?;
-                    let last = cmax
-                        .values
+                    cmax.values
                         .narrow(1, reduced_combined - 1, 1)?
-                        .squeeze_t(1)?;
-                    last
+                        .squeeze_t(1)?
                 }
                 EinopsReduction::Min => {
                     let cmin = crate::grad_fns::cumulative::cummin(&view, 1)?;
-                    let last = cmin
-                        .values
+                    cmin.values
                         .narrow(1, reduced_combined - 1, 1)?
-                        .squeeze_t(1)?;
-                    last
+                        .squeeze_t(1)?
                 }
             };
             // reduced_tensor has shape [outer, inner] (non-keepdim sum) or

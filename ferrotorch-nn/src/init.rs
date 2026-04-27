@@ -590,7 +590,7 @@ mod tests {
         let mut p = Parameter::<f32>::zeros(&[10000]).unwrap();
         uniform(&mut p, -1.0, 1.0).unwrap();
         let data = p.data().unwrap();
-        assert!(data.iter().all(|&x| x >= -1.0 && x <= 1.0));
+        assert!(data.iter().all(|&x| (-1.0..=1.0).contains(&x)));
         let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
         assert!(mean.abs() < 0.1);
     }
@@ -611,7 +611,7 @@ mod tests {
         let mut p = Parameter::<f32>::zeros(&[256, 128]).unwrap();
         xavier_uniform(&mut p).unwrap();
         let data = p.data().unwrap();
-        let limit = (6.0 / (128.0 + 256.0) as f64).sqrt() as f32;
+        let limit = (6.0_f32 / (128.0 + 256.0)).sqrt();
         assert!(data.iter().all(|&x| x.abs() <= limit + 0.01));
     }
 
@@ -620,7 +620,7 @@ mod tests {
         let mut p = Parameter::<f32>::zeros(&[256, 128]).unwrap();
         xavier_normal(&mut p).unwrap();
         let data = p.data().unwrap();
-        let expected_std = (2.0 / (128.0 + 256.0) as f64).sqrt() as f32;
+        let expected_std = (2.0_f32 / (128.0 + 256.0)).sqrt();
         let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
         let var: f32 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / data.len() as f32;
         assert!(mean.abs() < 0.05, "mean = {mean}");
@@ -694,7 +694,7 @@ mod tests {
         trunc_normal_(&mut p, 0.0, 1.0, -2.0, 2.0).unwrap();
         let data = p.data().unwrap();
         assert!(
-            data.iter().all(|&x| x >= -2.0 && x <= 2.0),
+            data.iter().all(|&x| (-2.0..=2.0).contains(&x)),
             "all values must be within [-2, 2]"
         );
     }
@@ -736,7 +736,7 @@ mod tests {
             for j in 0..n {
                 let mut dot = 0.0;
                 for k in 0..n {
-                    dot += data[k * n + i] as f64 * data[k * n + j] as f64;
+                    dot += data[k * n + i] * data[k * n + j];
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
@@ -758,7 +758,7 @@ mod tests {
         for i in 0..n {
             let mut col_norm_sq = 0.0;
             for k in 0..n {
-                let v = data[k * n + i] as f64;
+                let v = data[k * n + i];
                 col_norm_sq += v * v;
             }
             assert!(
@@ -780,7 +780,7 @@ mod tests {
             for j in 0..m {
                 let mut dot = 0.0;
                 for k in 0..n {
-                    dot += data[k * m + i] as f64 * data[k * m + j] as f64;
+                    dot += data[k * m + i] * data[k * m + j];
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
@@ -803,7 +803,7 @@ mod tests {
             for j in 0..n {
                 let mut dot = 0.0;
                 for k in 0..m {
-                    dot += data[i * m + k] as f64 * data[j * m + k] as f64;
+                    dot += data[i * m + k] * data[j * m + k];
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
@@ -893,7 +893,7 @@ mod tests {
         let mut p = Parameter::<f32>::zeros(&[2, 2, 3, 3]).unwrap();
         dirac_(&mut p, 1).unwrap();
         let data = p.data().unwrap();
-        let kernel_size = 9;
+        let _kernel_size = 9;
         let center = 4; // 9 / 2
 
         for out_ch in 0..2 {

@@ -2346,15 +2346,15 @@ impl<T: Float> GradFn<T> for CTCBackward<T> {
                     log_ab_per_class[c] = log_add_exp(log_ab_per_class[c], ab);
                 }
 
-                for c in 0..num_classes {
-                    let idx = t * batch * num_classes + b * num_classes + c;
-                    let threshold = T::from(-1e29).unwrap();
-                    let occupation = if log_ab_per_class[c] > threshold {
-                        (log_ab_per_class[c] - log_prob).exp()
+                let threshold = T::from(-1e29).unwrap();
+                let base_idx = t * batch * num_classes + b * num_classes;
+                for (c, &log_ab) in log_ab_per_class.iter().enumerate() {
+                    let occupation = if log_ab > threshold {
+                        (log_ab - log_prob).exp()
                     } else {
                         zero
                     };
-                    result[idx] = -occupation * go_scale;
+                    result[base_idx + c] = -occupation * go_scale;
                 }
             }
         }
@@ -3142,7 +3142,7 @@ impl GaussianNLLLoss {
                 let diff = inp - tgt;
                 let mut l = half * (v_clamped.ln() + diff * diff / v_clamped);
                 if self.full {
-                    l = l + half * log_2pi;
+                    l += half * log_2pi;
                 }
                 l
             })
@@ -3258,6 +3258,7 @@ impl<T: Float> GradFn<T> for GaussianNLLBackward<T> {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use ferrotorch_core::autograd::graph::backward;
@@ -4839,7 +4840,7 @@ mod tests {
         // T=3, B=1, C=3 (blank=0, labels 1,2)
         // Perfect alignment: [blank, 1, 2] for target [1, 2]
         // log_probs that heavily favor the correct alignment
-        let mut lp = vec![-10.0_f64; 3 * 1 * 3]; // [T=3, B=1, C=3]
+        let mut lp = vec![-10.0_f64; 3 * 3]; // [T=3, B=1, C=3]
         // Shape [T, B=1, C=3]; row-major stride = (3, 3, 1).
         let idx = |t: usize, c: usize| t * 3 + c;
         // t=0: blank (class 0) is likely
@@ -5538,7 +5539,7 @@ mod tests {
         assert!(
             g1[0].abs() < 1e-7 && g1[1].abs() < 1e-7,
             "CosEmb inactive neg: expected zero grad, got {:?}",
-            &g1[..]
+            g1
         );
     }
 
@@ -5551,7 +5552,7 @@ mod tests {
         // For a valid probability distribution, gradients w.r.t. log_probs
         // should approximately sum to zero over classes for each timestep
         // (since probabilities sum to 1).
-        let mut lp = vec![-10.0_f64; 3 * 1 * 3];
+        let mut lp = vec![-10.0_f64; 3 * 3];
         // t=0: blank likely
         lp[0] = -0.1;
         lp[1] = -5.0;
@@ -5629,7 +5630,7 @@ mod tests {
     fn test_ctc_backward_no_grad() {
         // Inside no_grad, CTC should not attach grad_fn.
         ferrotorch_core::no_grad(|| {
-            let lp = vec![-0.5_f64; 3 * 1 * 2];
+            let lp = vec![-0.5_f64; 3 * 2];
             let log_probs = Tensor::from_storage(
                 TensorStorage::cpu(lp),
                 vec![3, 1, 2],

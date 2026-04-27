@@ -706,7 +706,8 @@ mod tests {
         let compiled = TracedModule::<f32>::new(g);
 
         // Eager segment: multiply each element by 10
-        let eager_fn: Arc<dyn Fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>> + Send + Sync> =
+        type EagerFn = Arc<dyn Fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>> + Send + Sync>;
+        let eager_fn: EagerFn =
             Arc::new(|input: &Tensor<f32>| {
                 let ten =
                     ferrotorch_core::from_vec(vec![10.0f32; input.numel()], input.shape()).unwrap();
@@ -826,7 +827,8 @@ mod tests {
 
     #[test]
     fn test_segmented_module_eager_only() {
-        let eager_fn: Arc<dyn Fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>> + Send + Sync> =
+        type EagerFn = Arc<dyn Fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>> + Send + Sync>;
+        let eager_fn: EagerFn =
             Arc::new(|input: &Tensor<f32>| {
                 // Double each element.
                 ferrotorch_core::grad_fns::arithmetic::add(input, input)
@@ -854,7 +856,8 @@ mod tests {
         g1.set_outputs(vec![add_outs[0]]);
 
         // Segment 2 (eager): negate
-        let eager_fn: Arc<dyn Fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>> + Send + Sync> =
+        type EagerFn = Arc<dyn Fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>> + Send + Sync>;
+        let eager_fn: EagerFn =
             Arc::new(|input: &Tensor<f32>| ferrotorch_core::grad_fns::arithmetic::neg(input));
 
         // Segment 3 (compiled): y = relu(x)

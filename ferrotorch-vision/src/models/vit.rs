@@ -530,21 +530,6 @@ impl<T: Float> Module<T> for VisionTransformer<T> {
 }
 
 // ===========================================================================
-// Convenience constructors
-// ===========================================================================
-
-/// Construct a ViT-B/16 model.
-///
-/// Architecture:
-/// - Patch size: 16x16
-/// - Embedding dimension: 768
-/// - Depth: 12 transformer blocks
-/// - Heads: 12 attention heads
-/// - MLP ratio: 4 (MLP hidden dim = 3072)
-/// - Image size: 224x224
-///
-/// Total parameters: ~86M (for 1000 classes).
-// ===========================================================================
 // IntermediateFeatures — CL-499
 // ===========================================================================
 
@@ -644,6 +629,17 @@ impl<T: Float> crate::models::feature_extractor::IntermediateFeatures<T>
     }
 }
 
+/// Construct a ViT-B/16 model.
+///
+/// Architecture:
+/// - Patch size: 16x16
+/// - Embedding dimension: 768
+/// - Depth: 12 transformer blocks
+/// - Heads: 12 attention heads
+/// - MLP ratio: 4 (MLP hidden dim = 3072)
+/// - Image size: 224x224
+///
+/// Total parameters: ~86M (for 1000 classes).
 pub fn vit_b_16<T: Float>(num_classes: usize) -> FerrotorchResult<VisionTransformer<T>> {
     VisionTransformer::new(
         224, // image_size
@@ -683,7 +679,7 @@ mod tests {
     #[test]
     fn test_patch_embed_output_shape() {
         let pe = PatchEmbed::<f32>::new(3, 768, 16).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| pe.forward(&input).unwrap());
         // 224/16 = 14, 14*14 = 196 patches
         assert_eq!(output.shape(), &[1, 196, 768]);
@@ -714,7 +710,7 @@ mod tests {
     fn test_transformer_block_output_shape() {
         let block = TransformerBlock::<f32>::new(64, 4, 256).unwrap();
         let input = Tensor::from_storage(
-            TensorStorage::cpu(vec![0.01f32; 1 * 10 * 64]),
+            TensorStorage::cpu(vec![0.01f32; 10 * 64]),
             vec![1, 10, 64],
             false,
         )
@@ -751,7 +747,7 @@ mod tests {
     #[test]
     fn test_vit_b16_output_shape() {
         let model = vit_b_16::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -816,7 +812,7 @@ mod tests {
     #[test]
     fn test_vit_custom_classes() {
         let model = VisionTransformer::<f32>::new(224, 16, 3, 10, 768, 12, 12, 4).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 10]);
     }

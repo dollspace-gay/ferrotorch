@@ -30,18 +30,15 @@ use crate::sampler::{RandomSampler, Sampler, SequentialSampler};
 ///   has no GIL to work around). Batches are reordered to preserve
 ///   deterministic output ordering. CL-377.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum WorkerMode {
     /// Load samples within a single batch in parallel (rayon pool).
+    #[default]
     IntraBatch,
     /// Load different batches in parallel (N dedicated worker threads).
     CrossBatch,
 }
 
-impl Default for WorkerMode {
-    fn default() -> Self {
-        Self::IntraBatch
-    }
-}
 
 /// Trait for sample types that can be transferred to a target [`Device`].
 ///
@@ -592,6 +589,7 @@ impl<D: Dataset + 'static> PrefetchIter<D>
 where
     D::Sample: Send + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dataset: Arc<D>,
         indices: Vec<usize>,
@@ -633,6 +631,7 @@ where
     ///
     /// Stops when all batches are sent or when the receiver is dropped
     /// (channel disconnected).
+    #[allow(clippy::too_many_arguments)]
     fn producer_loop(
         dataset: Arc<D>,
         indices: Vec<usize>,
@@ -819,6 +818,7 @@ impl<D: Dataset + 'static> MultiWorkerIter<D>
 where
     D::Sample: Send + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dataset: Arc<D>,
         indices: Vec<usize>,
@@ -1696,7 +1696,7 @@ mod tests {
         }
 
         fn get(&self, index: usize) -> FerrotorchResult<Self::Sample> {
-            self.data.get(index).cloned().ok_or_else(|| {
+            self.data.get(index).cloned().ok_or({
                 ferrotorch_core::FerrotorchError::IndexOutOfBounds {
                     index,
                     axis: 0,
@@ -1805,7 +1805,7 @@ mod tests {
         // Device transfer happens before collation.
         assert_eq!(collated[0].device, Device::Cuda(0));
         assert_eq!(collated[1].device, Device::Cuda(0));
-        assert_eq!(collated[0].value, 0 + 1 + 2);
+        assert_eq!(collated[0].value, 1 + 2);
         assert_eq!(collated[1].value, 3 + 4 + 5);
     }
 

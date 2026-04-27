@@ -551,6 +551,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn sinc_integer() {
         // sinc(n) = 0 for nonzero integer n, since sin(n*pi) = 0.
         let input = t(&[1.0, 2.0, -1.0, -3.0], &[4]);
@@ -583,6 +584,7 @@ mod tests {
     // --- xlogy ---
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn xlogy_zero_x() {
         // xlogy(0, y) = 0 for any y.
         let x = t(&[0.0, 0.0, 0.0], &[3]);

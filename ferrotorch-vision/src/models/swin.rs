@@ -563,21 +563,6 @@ impl<T: Float> Module<T> for SwinTransformer<T> {
 }
 
 // ===========================================================================
-// Convenience constructors
-// ===========================================================================
-
-/// Construct a Swin Transformer Tiny model.
-///
-/// Architecture:
-/// - Patch size: 4x4
-/// - Embedding dimension: 96
-/// - Depths: `[2, 2, 6, 2]`
-/// - Heads: `[3, 6, 12, 24]`
-/// - MLP ratio: 4
-/// - Image size: 224x224
-///
-/// Total parameters: ~29M (for 1000 classes).
-// ===========================================================================
 // IntermediateFeatures — CL-499
 // ===========================================================================
 
@@ -676,6 +661,17 @@ impl<T: Float> crate::models::feature_extractor::IntermediateFeatures<T>
     }
 }
 
+/// Construct a Swin Transformer Tiny model.
+///
+/// Architecture:
+/// - Patch size: 4x4
+/// - Embedding dimension: 96
+/// - Depths: `[2, 2, 6, 2]`
+/// - Heads: `[3, 6, 12, 24]`
+/// - MLP ratio: 4
+/// - Image size: 224x224
+///
+/// Total parameters: ~29M (for 1000 classes).
 pub fn swin_tiny<T: Float>(num_classes: usize) -> FerrotorchResult<SwinTransformer<T>> {
     SwinTransformer::from_config(SwinConfig {
         patch_size: 4,
@@ -715,7 +711,7 @@ mod tests {
     fn test_swin_block_output_shape() {
         let block = SwinBlock::<f32>::new(96, 3, 384).unwrap();
         let input = Tensor::from_storage(
-            TensorStorage::cpu(vec![0.01f32; 1 * 16 * 96]),
+            TensorStorage::cpu(vec![0.01f32; 16 * 96]),
             vec![1, 16, 96],
             false,
         )
@@ -750,7 +746,7 @@ mod tests {
     #[test]
     fn test_swin_tiny_output_shape() {
         let model = swin_tiny::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -876,7 +872,7 @@ mod tests {
         })
         .unwrap();
 
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 10]);
     }

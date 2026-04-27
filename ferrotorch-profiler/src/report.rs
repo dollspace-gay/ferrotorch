@@ -115,7 +115,7 @@ impl ProfileReport {
         }
         let mut out: Vec<(crate::event::MemoryCategory, i64)> = totals.into_iter().collect();
         // Sort by absolute byte size descending so largest category first.
-        out.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
+        out.sort_by_key(|b| std::cmp::Reverse(b.1.abs()));
         out
     }
 
@@ -186,7 +186,7 @@ impl ProfileReport {
                 }
             })
             .collect();
-        summaries.sort_by(|a, b| b.total_us.cmp(&a.total_us));
+        summaries.sort_by_key(|b| std::cmp::Reverse(b.total_us));
         summaries.truncate(n);
         summaries
     }

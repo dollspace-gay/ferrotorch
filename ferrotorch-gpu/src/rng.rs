@@ -462,7 +462,7 @@ pub fn join_rng(devices: &[usize], states: Vec<PhiloxState>) {
         states.len()
     );
     let mut mgr = CUDA_RNG_MANAGER.lock().unwrap();
-    for (&device, state) in devices.iter().zip(states.into_iter()) {
+    for (&device, state) in devices.iter().zip(states) {
         mgr.set_rng_state(device, state);
     }
 }

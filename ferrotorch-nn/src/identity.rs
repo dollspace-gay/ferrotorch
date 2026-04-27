@@ -500,9 +500,9 @@ impl CosineSimilarity {
                 let mut n2 = <T as num_traits::Zero>::zero();
                 for d in 0..dim_size {
                     let idx = o * dim_size * inner + d * inner + i;
-                    dot = dot + d1[idx] * d2[idx];
-                    n1 = n1 + d1[idx] * d1[idx];
-                    n2 = n2 + d2[idx] * d2[idx];
+                    dot += d1[idx] * d2[idx];
+                    n1 += d1[idx] * d1[idx];
+                    n2 += d2[idx] * d2[idx];
                 }
                 let denom = (n1.sqrt() * n2.sqrt()).max(eps_t);
                 result.push(dot / denom);
@@ -591,7 +591,7 @@ impl PairwiseDistance {
                 } else {
                     diff
                 };
-                norm = norm + (abs_diff + eps_t).powf(p_t);
+                norm += (abs_diff + eps_t).powf(p_t);
             }
             result.push(norm.powf(inv_p));
         }

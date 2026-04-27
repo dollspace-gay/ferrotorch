@@ -291,11 +291,7 @@ impl<T: Float> NestedTensor<T> {
                 let mut remaining = flat;
                 let mut full_flat = b * full_strides[0];
                 for d in 0..comp_ndim {
-                    let coord = if comp_strides[d] > 0 {
-                        remaining / comp_strides[d]
-                    } else {
-                        0
-                    };
+                    let coord = remaining.checked_div(comp_strides[d]).unwrap_or(0);
                     if comp_strides[d] > 0 {
                         remaining %= comp_strides[d];
                     }

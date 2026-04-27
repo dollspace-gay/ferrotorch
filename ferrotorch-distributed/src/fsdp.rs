@@ -41,10 +41,12 @@ use crate::collective::{ReduceOp, all_gather, allreduce, reduce_scatter};
 ///
 /// CL-372.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ShardingStrategy {
     /// Shard parameters + gradients + optimizer state (ZeRO-3 /
     /// full FSDP). This is the default and matches the behavior
     /// that existed before CL-372.
+    #[default]
     FullShard,
     /// Shard gradients + optimizer state only, keep params
     /// replicated (ZeRO-2).
@@ -59,11 +61,6 @@ pub enum ShardingStrategy {
     HybridShard { intra_node_size: usize },
 }
 
-impl Default for ShardingStrategy {
-    fn default() -> Self {
-        Self::FullShard
-    }
-}
 
 /// Fully Sharded Data Parallel module wrapper.
 ///
@@ -498,7 +495,7 @@ impl<M: Module<T>, T: Float> FSDP<M, T> {
                 // pass, and stash them in full_params so sync_gradients
                 // can read the backward-accumulated gradients.
                 let params = self.module.parameters_mut();
-                for (_i, param) in params.into_iter().enumerate() {
+                for param in params.into_iter() {
                     let t = param.tensor().clone();
                     let data = t.data_vec()?;
                     let shape = t.shape().to_vec();

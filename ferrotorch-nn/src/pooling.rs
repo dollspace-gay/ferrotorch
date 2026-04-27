@@ -3781,7 +3781,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_max_pool3d_backward() {
-        let mut data = vec![1.0f32; 1 * 2 * 2 * 2 * 2];
+        let mut data = vec![1.0f32; 2 * 2 * 2 * 2];
         data[0] = 10.0; // max in first channel region
         let input = leaf_5d(&data, [1, 2, 2, 2, 2], true);
         let out = adaptive_max_pool3d(&input, (1, 1, 1)).unwrap();

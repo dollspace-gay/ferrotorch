@@ -400,7 +400,7 @@ mod tests {
         let t: Tensor<f32> = rand(&[10, 20]).unwrap();
         assert_eq!(t.shape(), &[10, 20]);
         // Values should be in [0, 1).
-        assert!(t.data().unwrap().iter().all(|&x| x >= 0.0 && x < 1.0));
+        assert!(t.data().unwrap().iter().all(|&x| (0.0..1.0).contains(&x)));
     }
 
     #[test]
@@ -448,7 +448,7 @@ mod tests {
         let t: Tensor<f32> = zeros(&[5, 6]).unwrap();
         let r = rand_like(&t).unwrap();
         assert_eq!(r.shape(), &[5, 6]);
-        assert!(r.data().unwrap().iter().all(|&x| x >= 0.0 && x < 1.0));
+        assert!(r.data().unwrap().iter().all(|&x| (0.0..1.0).contains(&x)));
     }
 
     #[test]

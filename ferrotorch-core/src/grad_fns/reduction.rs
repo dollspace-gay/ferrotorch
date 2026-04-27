@@ -242,7 +242,7 @@ fn mean_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
             let mean_handle = if is_f32 {
                 let sum_handle = backend.sum_f32(input.gpu_handle()?, input.numel())?;
                 let n = input.numel() as f32;
-                let inv_n_data = vec![1.0f32 / n];
+                let inv_n_data = [1.0f32 / n];
                 let inv_n_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(inv_n_data.as_ptr() as *const u8, inv_n_data.len() * 4)
                 };
@@ -251,7 +251,7 @@ fn mean_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
             } else {
                 let sum_handle = backend.sum_f64(input.gpu_handle()?, input.numel())?;
                 let n = input.numel() as f64;
-                let inv_n_data = vec![1.0f64 / n];
+                let inv_n_data = [1.0f64 / n];
                 let inv_n_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(inv_n_data.as_ptr() as *const u8, inv_n_data.len() * 8)
                 };

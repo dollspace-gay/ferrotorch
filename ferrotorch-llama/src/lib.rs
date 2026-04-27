@@ -31,11 +31,14 @@ pub mod attention;
 pub mod mlp;
 pub mod layer;
 pub mod model;
+pub mod gguf_remap;
+pub mod grammar;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 
 pub use attention::LlamaAttention;
 pub use config::{LlamaActivation, LlamaConfig};
+pub use gguf_remap::{gguf_key_to_hf, gguf_to_hf_state_dict};
 pub use layer::LlamaDecoderLayer;
 pub use mlp::LlamaMLP;
 pub use model::{LlamaForCausalLM, LlamaModel};

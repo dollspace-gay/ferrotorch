@@ -381,7 +381,7 @@ mod tests {
         let samples = dist.sample(&[1000]).unwrap();
         let data = samples.data().unwrap();
         for &x in data {
-            assert!(x >= 2.0 && x < 5.0, "sample {x} out of range [2, 5)");
+            assert!((2.0..5.0).contains(&x), "sample {x} out of range [2, 5)");
         }
     }
 

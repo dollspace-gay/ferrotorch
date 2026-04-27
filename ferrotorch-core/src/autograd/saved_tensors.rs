@@ -101,9 +101,9 @@ pub fn pack_saved_tensor<T: Float>(tensor: Tensor<T>) -> FerrotorchResult<Tensor
             let guard = h.borrow();
             if let Some((ref pack, _)) = *guard {
                 // SAFETY: T is f32.
-                let t_f32: Tensor<f32> = unsafe { std::mem::transmute(tensor) };
+                let t_f32: Tensor<f32> = unsafe { std::mem::transmute::<Tensor<T>, Tensor<f32>>(tensor) };
                 let result = pack(t_f32)?;
-                Ok(unsafe { std::mem::transmute(result) })
+                Ok(unsafe { std::mem::transmute::<Tensor<f32>, Tensor<T>>(result) })
             } else {
                 Ok(tensor)
             }
@@ -112,9 +112,9 @@ pub fn pack_saved_tensor<T: Float>(tensor: Tensor<T>) -> FerrotorchResult<Tensor
         HOOKS_F64.with(|h| {
             let guard = h.borrow();
             if let Some((ref pack, _)) = *guard {
-                let t_f64: Tensor<f64> = unsafe { std::mem::transmute(tensor) };
+                let t_f64: Tensor<f64> = unsafe { std::mem::transmute::<Tensor<T>, Tensor<f64>>(tensor) };
                 let result = pack(t_f64)?;
-                Ok(unsafe { std::mem::transmute(result) })
+                Ok(unsafe { std::mem::transmute::<Tensor<f64>, Tensor<T>>(result) })
             } else {
                 Ok(tensor)
             }
@@ -133,9 +133,9 @@ pub fn unpack_saved_tensor<T: Float>(tensor: Tensor<T>) -> FerrotorchResult<Tens
         HOOKS_F32.with(|h| {
             let guard = h.borrow();
             if let Some((_, ref unpack)) = *guard {
-                let t_f32: Tensor<f32> = unsafe { std::mem::transmute(tensor) };
+                let t_f32: Tensor<f32> = unsafe { std::mem::transmute::<Tensor<T>, Tensor<f32>>(tensor) };
                 let result = unpack(t_f32)?;
-                Ok(unsafe { std::mem::transmute(result) })
+                Ok(unsafe { std::mem::transmute::<Tensor<f32>, Tensor<T>>(result) })
             } else {
                 Ok(tensor)
             }
@@ -144,9 +144,9 @@ pub fn unpack_saved_tensor<T: Float>(tensor: Tensor<T>) -> FerrotorchResult<Tens
         HOOKS_F64.with(|h| {
             let guard = h.borrow();
             if let Some((_, ref unpack)) = *guard {
-                let t_f64: Tensor<f64> = unsafe { std::mem::transmute(tensor) };
+                let t_f64: Tensor<f64> = unsafe { std::mem::transmute::<Tensor<T>, Tensor<f64>>(tensor) };
                 let result = unpack(t_f64)?;
-                Ok(unsafe { std::mem::transmute(result) })
+                Ok(unsafe { std::mem::transmute::<Tensor<f64>, Tensor<T>>(result) })
             } else {
                 Ok(tensor)
             }

@@ -172,7 +172,7 @@ impl<T: Float> Adam<T> {
                     };
                     if group_wd > 0.0 {
                         let wd_t = scalar(T::from(group_wd).unwrap())?.to(device)?;
-                        let weighted = mul(&param_t, &wd_t)?;
+                        let weighted = mul(param_t, &wd_t)?;
                         grad = add(&grad, &weighted)?;
                     }
 
@@ -256,7 +256,7 @@ impl<T: Float> Adam<T> {
                     // param = param - lr * update
                     let lr_t = scalar(T::from(group_lr).unwrap())?.to(device)?;
                     let scaled_update = mul(&update, &lr_t)?;
-                    let new_param = sub(&param_t, &scaled_update)?;
+                    let new_param = sub(param_t, &scaled_update)?;
 
                     // Commit parameter update.
                     let (storage, _) = new_param.into_storage_and_shape()?;
@@ -357,7 +357,7 @@ impl<T: Float> Optimizer<T> for Adam<T> {
                             // exclusive access to parameters; no aliasing.
                             unsafe {
                                 let storage_ptr = std::sync::Arc::as_ptr(
-                                    &tensor.inner_storage_arc(),
+                                    tensor.inner_storage_arc(),
                                 ) as *mut ferrotorch_core::TensorStorage<T>;
                                 let storage = &mut *storage_ptr;
                                 let param_handle = storage
@@ -1026,6 +1026,6 @@ mod tests {
         let p2_data = opt.param_groups()[0].params[1].data().unwrap();
         // p1 updated by Adam; p2 unchanged.
         assert!(p1_data[0] < 1.0);
-        assert_eq!(&*p2_data, &[3.0, 4.0]);
+        assert_eq!(p2_data, &[3.0, 4.0]);
     }
 }

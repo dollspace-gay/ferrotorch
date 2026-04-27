@@ -39,6 +39,7 @@ impl<T: Float> Pareto<T> {
 }
 
 impl<T: Float> Distribution<T> for Pareto<T> {
+    #[allow(clippy::needless_range_loop)]
     fn sample(&self, shape: &[usize]) -> FerrotorchResult<Tensor<T>> {
         let u = creation::rand::<T>(shape)?;
         let u_data = u.data()?;
@@ -65,6 +66,7 @@ impl<T: Float> Distribution<T> for Pareto<T> {
         })
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn log_prob(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let v = value.data()?;
         let s = self.scale.data()?;

@@ -99,7 +99,7 @@ pub trait Module<T: Float>: Send + Sync {
 
         let params_mut = self.parameters_mut();
 
-        for (name, param) in param_names.iter().zip(params_mut.into_iter()) {
+        for (name, param) in param_names.iter().zip(params_mut) {
             if let Some(tensor) = state.get(name) {
                 if param.shape() != tensor.shape() {
                     return Err(FerrotorchError::ShapeMismatch {

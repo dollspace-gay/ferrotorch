@@ -360,7 +360,7 @@ mod tests {
         let fake = leaf_vec(&[0.5, 1.5, 2.5, 3.5], false);
         let lambda = 10.0;
 
-        let penalty = gradient_penalty(|x| sum(x), &real, &fake, lambda).unwrap();
+        let penalty = gradient_penalty(sum, &real, &fake, lambda).unwrap();
 
         let expected = lambda as f32 * ((n as f32).sqrt() - 1.0).powi(2);
         assert_approx(
@@ -375,7 +375,7 @@ mod tests {
     fn test_gradient_penalty_shape_mismatch() {
         let real = leaf_vec(&[1.0, 2.0], false);
         let fake = leaf_vec(&[1.0, 2.0, 3.0], false);
-        let result = gradient_penalty(|x| sum(x), &real, &fake, 10.0);
+        let result = gradient_penalty(sum, &real, &fake, 10.0);
         assert!(result.is_err(), "should error on shape mismatch");
     }
 
@@ -418,7 +418,7 @@ mod tests {
         let real = leaf_vec(&[1.0, 2.0], false);
         let fake = leaf_vec(&[0.5, 1.5], false);
 
-        let penalty = gradient_penalty(|x| sum(x), &real, &fake, 10.0).unwrap();
+        let penalty = gradient_penalty(sum, &real, &fake, 10.0).unwrap();
 
         assert!(
             penalty.grad_fn().is_some(),
@@ -693,7 +693,7 @@ mod tests {
         let real = leaf_vec(&[1.0, 2.0], false);
         let fake = leaf_vec(&[0.5, 1.5], false);
 
-        let penalty = gradient_penalty(|x| sum(x), &real, &fake, 10.0).unwrap();
+        let penalty = gradient_penalty(sum, &real, &fake, 10.0).unwrap();
 
         // The penalty tensor should be part of the computation graph.
         assert!(

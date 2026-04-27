@@ -179,9 +179,9 @@ impl<T: Float> Optimizer<T> for Adafactor<T> {
 
                     // Weight decay.
                     if config.weight_decay != 0.0 {
-                        for i in 0..numel {
-                            let p = num_traits::ToPrimitive::to_f64(&new_param[i]).unwrap();
-                            new_param[i] = T::from(p * (1.0 - lr * config.weight_decay)).unwrap();
+                        for slot in &mut new_param[..numel] {
+                            let p = num_traits::ToPrimitive::to_f64(slot).unwrap();
+                            *slot = T::from(p * (1.0 - lr * config.weight_decay)).unwrap();
                         }
                     }
 

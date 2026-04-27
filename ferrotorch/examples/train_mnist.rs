@@ -210,7 +210,7 @@ fn sync_params_from_optimizer(
     let updated_tensors: Vec<_> = opt_params.iter().map(|p| p.tensor().clone()).collect();
 
     let model_params = model.parameters_mut();
-    for (mp, updated) in model_params.into_iter().zip(updated_tensors.into_iter()) {
+    for (mp, updated) in model_params.into_iter().zip(updated_tensors) {
         mp.set_data(updated);
     }
 

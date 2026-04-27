@@ -375,7 +375,7 @@ pub(crate) fn patch_reshape_for_symbolic_dims(
                 let pos = match_positions[0];
                 // If there's already a -1 elsewhere we shouldn't add a
                 // second one; reshape only supports a single -1.
-                if !shape.iter().any(|&d| d == -1) {
+                if !shape.contains(&-1) {
                     shape[pos] = -1;
                 }
             }
@@ -544,7 +544,7 @@ mod tests {
             &[16, 10],
         )
         .unwrap();
-        let out = compiled.forward_symbolic(&[big.clone()]).unwrap();
+        let out = compiled.forward_symbolic(std::slice::from_ref(&big)).unwrap();
         assert_eq!(out.shape(), &[16, 10]);
 
         // Verify values match eager relu(x) on the big input.
@@ -596,7 +596,7 @@ mod tests {
             &[9, 10],
         )
         .unwrap();
-        let out = compiled.forward_symbolic(&[big.clone()]).unwrap();
+        let out = compiled.forward_symbolic(std::slice::from_ref(&big)).unwrap();
         assert_eq!(out.shape(), &[9, 10]);
 
         // Sanity on values: the reshape is a no-op so output == relu(input).

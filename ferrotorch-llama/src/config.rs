@@ -88,6 +88,29 @@ impl LlamaConfig {
         }
     }
 
+    /// The canonical Meta-Llama-3.3-70B-Instruct configuration.
+    ///
+    /// Architecture parameters match `meta-llama/Llama-3.3-70B-Instruct`'s
+    /// HuggingFace `config.json`: 80 hidden layers, 64 attention heads, 8 KV
+    /// heads (GQA), hidden size 8192, intermediate size 28 672, RoPE θ
+    /// 500 000, vocab 128 256, context length 131 072. Same `tie_word_embeddings = false`
+    /// as the 8B variant.
+    pub fn llama3_3_70b_instruct() -> Self {
+        Self {
+            vocab_size: 128_256,
+            hidden_size: 8192,
+            intermediate_size: 28_672,
+            num_hidden_layers: 80,
+            num_attention_heads: 64,
+            num_key_value_heads: 8,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            max_position_embeddings: 131_072,
+            tie_word_embeddings: false,
+            hidden_act: LlamaActivation::Silu,
+        }
+    }
+
     /// Build a [`LlamaConfig`] from a parsed HuggingFace `config.json`.
     ///
     /// Validates the config first; downstream construction expects all
@@ -200,6 +223,56 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.hidden_act, LlamaActivation::FatRelu(0.01));
         assert_eq!(cfg.vocab_size, 32_000);
+    }
+
+    #[test]
+    fn llama3_3_70b_instruct_is_valid() {
+        let cfg = LlamaConfig::llama3_3_70b_instruct();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.vocab_size, 128_256);
+        assert_eq!(cfg.hidden_size, 8192);
+        assert_eq!(cfg.intermediate_size, 28_672);
+        assert_eq!(cfg.num_hidden_layers, 80);
+        assert_eq!(cfg.num_attention_heads, 64);
+        assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.head_dim(), 128); // 8192 / 64
+        assert_eq!(cfg.kv_group_size(), 8); // 64 / 8
+        assert_eq!(cfg.rope_theta, 500_000.0);
+        assert_eq!(cfg.max_position_embeddings, 131_072);
+        assert!(!cfg.tie_word_embeddings);
+        assert_eq!(cfg.hidden_act, LlamaActivation::Silu);
+    }
+
+    #[test]
+    fn from_hf_round_trips_70b_config() {
+        // Real Meta-Llama-3.3-70B-Instruct config.json values.
+        let json = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_act": "silu",
+            "hidden_size": 8192,
+            "intermediate_size": 28672,
+            "max_position_embeddings": 131072,
+            "num_attention_heads": 64,
+            "num_hidden_layers": 80,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-05,
+            "rope_theta": 500000.0,
+            "tie_word_embeddings": false,
+            "torch_dtype": "bfloat16",
+            "vocab_size": 128256
+        }"#;
+        let hf = HfTransformerConfig::from_json_str(json).unwrap();
+        let cfg = LlamaConfig::from_hf(&hf).unwrap();
+        let expected = LlamaConfig::llama3_3_70b_instruct();
+        assert_eq!(cfg.vocab_size, expected.vocab_size);
+        assert_eq!(cfg.hidden_size, expected.hidden_size);
+        assert_eq!(cfg.intermediate_size, expected.intermediate_size);
+        assert_eq!(cfg.num_hidden_layers, expected.num_hidden_layers);
+        assert_eq!(cfg.num_attention_heads, expected.num_attention_heads);
+        assert_eq!(cfg.num_key_value_heads, expected.num_key_value_heads);
+        assert_eq!(cfg.max_position_embeddings, expected.max_position_embeddings);
+        assert_eq!(cfg.tie_word_embeddings, expected.tie_word_embeddings);
+        assert!((cfg.rope_theta - expected.rope_theta).abs() < 1e-2);
     }
 
     #[test]

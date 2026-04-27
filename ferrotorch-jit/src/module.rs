@@ -782,8 +782,8 @@ mod tests {
             // Add weight-related inputs until we match input_count.
             let extra_needed = module.input_count() - 1;
             let extra_candidates = [weight_data, weight_t_data];
-            for i in 0..extra_needed.min(extra_candidates.len()) {
-                all_inputs.push(extra_candidates[i].clone());
+            for cand in extra_candidates.iter().take(extra_needed) {
+                all_inputs.push(cand.clone());
             }
 
             if all_inputs.len() == module.input_count() {

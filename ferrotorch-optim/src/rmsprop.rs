@@ -167,10 +167,8 @@ impl<T: Float> Rmsprop<T> {
                 let key = (gi, pi);
 
                 // Lazy-init state.
-                if !self.foreach_state.contains_key(&key) {
-                    self.foreach_state.insert(
-                        key,
-                        ForeachState {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.foreach_state.entry(key) {
+                    e.insert(ForeachState {
                             square_avg: zeros::<T>(param_t.shape())?.to(device)?,
                             grad_avg: if centered {
                                 Some(zeros::<T>(param_t.shape())?.to(device)?)
@@ -182,8 +180,7 @@ impl<T: Float> Rmsprop<T> {
                             } else {
                                 None
                             },
-                        },
-                    );
+                        });
                 }
 
                 no_grad(|| {

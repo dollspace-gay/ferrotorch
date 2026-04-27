@@ -56,24 +56,19 @@ use crate::error::{GpuError, GpuResult};
 ///   at all. Fastest, but the caller is fully responsible for making
 ///   sure no other thread interferes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum CaptureMode {
     /// Global serialization (`CU_STREAM_CAPTURE_MODE_GLOBAL`).
     Global,
     /// Thread-local serialization (`CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`).
     /// This is the default in PyTorch's `cuda.graph` context.
+    #[default]
     ThreadLocal,
     /// Relaxed — no cross-thread serialization
     /// (`CU_STREAM_CAPTURE_MODE_RELAXED`).
     Relaxed,
 }
 
-impl Default for CaptureMode {
-    fn default() -> Self {
-        // ThreadLocal is what ferrotorch-gpu has historically used and
-        // matches PyTorch's `torch.cuda.graph(stream=..., capture_error_mode="thread_local")`.
-        Self::ThreadLocal
-    }
-}
 
 #[cfg(feature = "cuda")]
 impl CaptureMode {

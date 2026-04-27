@@ -110,9 +110,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    type TestProfilerEvent = (String, String, Vec<Vec<usize>>, u64);
+
     #[derive(Default)]
     struct TestProfiler {
-        events: Mutex<Vec<(String, String, Vec<Vec<usize>>, u64)>>,
+        events: Mutex<Vec<TestProfilerEvent>>,
     }
     impl OpProfiler for TestProfiler {
         fn record_op(&self, name: &str, category: &str, shapes: &[&[usize]], duration_us: u64) {

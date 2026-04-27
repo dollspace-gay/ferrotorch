@@ -2761,7 +2761,7 @@ impl<T: Float> Module<T> for LocalResponseNorm {
 
         for b in 0..batch {
             for c in 0..channels {
-                let c_start = if c >= half { c - half } else { 0 };
+                let c_start = c.saturating_sub(half);
                 let c_end = (c + half + 1).min(channels);
 
                 for s in 0..spatial {
@@ -2888,7 +2888,7 @@ impl<T: Float> GradFn<T> for LocalResponseNormBackward<T> {
                     // Term 2: cross-channel interaction
                     // For each channel c whose window includes i_c:
                     // contribution = -2*beta*alpha/size * x_i * x_c * D_c^(-beta-1) * go_c
-                    let c_start = if i_c >= half { i_c - half } else { 0 };
+                    let c_start = i_c.saturating_sub(half);
                     let c_end = (i_c + half + 1).min(channels);
 
                     let mut cross_sum = zero::<T>();
@@ -4911,7 +4911,7 @@ mod tests {
         // With large alpha and k=0 (edge case), output should be significantly
         // attenuated compared to input.
         let lrn = LocalResponseNorm::new(3, 10.0, 1.0, 1.0).unwrap();
-        let data: Vec<f32> = vec![1.0; 1 * 3 * 2];
+        let data: Vec<f32> = vec![1.0; 3 * 2];
         let input = Tensor::<f32>::from_storage(
             TensorStorage::cpu(data),
             vec![1, 3, 2],

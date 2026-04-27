@@ -1229,7 +1229,7 @@ mod tests {
     fn test_dropout2d_backward_routes_through_surviving_channels() {
         let d = Dropout2d::<f32>::new(0.5).unwrap();
         // [1, 20, 3, 3]
-        let input = leaf_tensor(&[1.0; 1 * 20 * 3 * 3], &[1, 20, 3, 3], true);
+        let input = leaf_tensor(&[1.0; 20 * 3 * 3], &[1, 20, 3, 3], true);
         let output = d.forward(&input).unwrap();
 
         let out_data = output.data().unwrap().to_vec();

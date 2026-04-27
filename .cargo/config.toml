@@ -1,2 +1,10 @@
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]
+
+# Default CUDA version for cudarc when nvcc isn't on PATH. WSL ships a
+# libcuda.so forwarding shim that lags Windows-side driver releases; pinning
+# to 12080 avoids cudarc dlsym'ing symbols (e.g. `cuCoredumpDeregisterCompleteCallback`,
+# CUDA 13.0.20+) the WSL shim doesn't expose. Override per-build with
+# `CUDARC_CUDA_VERSION=...` if you have a newer libcuda available.
+[env]
+CUDARC_CUDA_VERSION = { value = "12080", force = false }

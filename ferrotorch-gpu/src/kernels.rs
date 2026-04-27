@@ -10619,7 +10619,7 @@ pub fn gpu_gelu_backward_erf(
             let z = x * inv_sqrt_2;
             let az = z.abs();
             let t = 1.0 / (1.0 + 0.3275911 * az);
-            let poly = t * (0.2548296 + t * (-0.2844967 + t * (1.4214137 + t * (-1.4531520 + t * 0.3275911))));
+            let poly = t * (0.2548296 + t * (-0.2844967 + t * (1.4214137 + t * (-1.453_152 + t * 0.3275911))));
             let erf_abs = 1.0 - poly * (-az * az).exp();
             let erf_val = if z >= 0.0 { erf_abs } else { -erf_abs };
             let cdf = 0.5 * (1.0 + erf_val);
@@ -11945,9 +11945,7 @@ fn pad_strided_copy_params(
     // Pad unused dims with `n + 1` so `flat / out_stride[d] == 0`
     // in the kernel (any flat < n is strictly less than n + 1).
     let pad_val = (n as u32).saturating_add(1).max(1);
-    for d in rank..STRIDED_COPY_MAX_DIMS {
-        out_stride[d] = pad_val;
-    }
+    out_stride[rank..STRIDED_COPY_MAX_DIMS].fill(pad_val);
 
     // src_stride with 0 fill for unused dims (no contribution).
     let mut src_stride_out = [0u32; STRIDED_COPY_MAX_DIMS];
@@ -12023,7 +12021,7 @@ pub fn gpu_strided_copy(
             // CPU fallback — decode indices on the host.
             let host = gpu_to_cpu(input, device)?;
             let mut result = vec![0.0f32; n];
-            for i in 0..n {
+            for (i, slot) in result.iter_mut().enumerate() {
                 let mut flat = i as u32;
                 let mut src_idx = src_offset as u32;
                 for d in 0..STRIDED_COPY_MAX_DIMS {
@@ -12033,7 +12031,7 @@ pub fn gpu_strided_copy(
                     flat -= coord * os;
                     src_idx += coord * ss;
                 }
-                result[i] = host[src_idx as usize];
+                *slot = host[src_idx as usize];
             }
             return cpu_to_gpu(&result, device);
         }
@@ -12113,7 +12111,7 @@ pub fn gpu_strided_copy_f64(
         Err(_) => {
             let host = gpu_to_cpu(input, device)?;
             let mut result = vec![0.0f64; n];
-            for i in 0..n {
+            for (i, slot) in result.iter_mut().enumerate() {
                 let mut flat = i as u32;
                 let mut src_idx = src_offset as u32;
                 for d in 0..STRIDED_COPY_MAX_DIMS {
@@ -12123,7 +12121,7 @@ pub fn gpu_strided_copy_f64(
                     flat -= coord * os;
                     src_idx += coord * ss;
                 }
-                result[i] = host[src_idx as usize];
+                *slot = host[src_idx as usize];
             }
             return cpu_to_gpu(&result, device);
         }
@@ -12864,7 +12862,7 @@ pub fn gpu_gelu_tanh(input: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<C
         return Ok(out);
     }
     cpu_fallback_unary(input, device, |x| {
-        let sqrt_2_over_pi: f32 = 0.7978845608;
+        let sqrt_2_over_pi: f32 = 0.797_884_6;
         let c: f32 = 0.044715;
         let inner = sqrt_2_over_pi * (x + c * x * x * x);
         0.5 * x * (1.0 + inner.tanh())
@@ -12886,7 +12884,7 @@ pub fn gpu_gelu_erf(input: &CudaBuffer<f32>, device: &GpuDevice) -> GpuResult<Cu
         let z = x * std::f32::consts::FRAC_1_SQRT_2;
         let az = z.abs();
         let t = 1.0 / (1.0 + 0.3275911 * az);
-        let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        let poly = t * (0.254_829_6 + t * (-0.284_496_72 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
         let erf_abs = 1.0 - poly * (-az * az).exp();
         let erf_val = if z < 0.0 { -erf_abs } else { erf_abs };
         x * 0.5 * (1.0 + erf_val)
@@ -12919,7 +12917,7 @@ pub fn gpu_gelu_backward_tanh(
         .iter()
         .zip(input_host.iter())
         .map(|(&g, &x)| {
-            let sqrt_2_over_pi: f32 = 0.7978845608;
+            let sqrt_2_over_pi: f32 = 0.797_884_6;
             let c: f32 = 0.044715;
             let c3: f32 = 0.134145;
             let u = sqrt_2_over_pi * (x + c * x * x * x);

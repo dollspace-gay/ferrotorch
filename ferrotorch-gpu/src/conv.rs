@@ -85,11 +85,11 @@ fn im2col_cpu(
                     let row_off = col_b + row * col_cols;
 
                     // Compute the safe interior range where no padding check is needed.
-                    let oh_start = if kh < pad_h { (pad_h - kh + stride_h - 1) / stride_h } else { 0 };
+                    let oh_start = if kh < pad_h { (pad_h - kh).div_ceil(stride_h) } else { 0 };
                     let oh_end = ((height + pad_h).saturating_sub(kh)).min(h_out * stride_h) / stride_h;
                     let oh_end = oh_end.min(h_out);
 
-                    let ow_start = if kw < pad_w { (pad_w - kw + stride_w - 1) / stride_w } else { 0 };
+                    let ow_start = if kw < pad_w { (pad_w - kw).div_ceil(stride_w) } else { 0 };
                     let ow_end = ((width + pad_w).saturating_sub(kw)).min(w_out * stride_w) / stride_w;
                     let ow_end = ow_end.min(w_out);
 

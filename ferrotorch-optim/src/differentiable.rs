@@ -92,6 +92,9 @@ pub fn diff_sgd_step<T: Float>(
     Ok(updated)
 }
 
+/// Updated `(params, velocities)` returned by [`diff_sgd_momentum_step`].
+pub type DiffSgdMomentumOutput<T> = (Vec<Tensor<T>>, Vec<Tensor<T>>);
+
 /// Differentiable SGD step with momentum: `velocity = momentum * prev_v + grad`
 /// and `new_param = param - lr * velocity`.
 ///
@@ -110,7 +113,7 @@ pub fn diff_sgd_momentum_step<T: Float>(
     prev_velocities: &[Tensor<T>],
     lr: f64,
     momentum: f64,
-) -> FerrotorchResult<(Vec<Tensor<T>>, Vec<Tensor<T>>)> {
+) -> FerrotorchResult<DiffSgdMomentumOutput<T>> {
     if params.len() != grads.len() {
         return Err(FerrotorchError::InvalidArgument {
             message: format!(
@@ -240,7 +243,7 @@ mod tests {
         // d(loss)/d(theta) = 1 (since grad is detached).
         let theta = leaf(&[1.0, 2.0, 3.0], &[3], true);
         let g = leaf(&[0.1, 0.2, 0.3], &[3], false);
-        let adapted = diff_sgd_step(&[theta.clone()], &[g], 0.1).unwrap();
+        let adapted = diff_sgd_step(std::slice::from_ref(&theta), &[g], 0.1).unwrap();
         let loss = sum(&adapted[0]).unwrap();
         loss.backward().unwrap();
         let theta_grad = theta.grad().unwrap().unwrap();
@@ -261,7 +264,7 @@ mod tests {
         // loss = adapted (scalar); d(loss)/d(grad) = -0.1.
         let theta = leaf(&[1.0], &[1], false);
         let g = leaf(&[0.5], &[1], true);
-        let adapted = diff_sgd_step(&[theta], &[g.clone()], 0.1).unwrap();
+        let adapted = diff_sgd_step(&[theta], std::slice::from_ref(&g), 0.1).unwrap();
         let loss = sum(&adapted[0]).unwrap();
         loss.backward().unwrap();
         let grad_of_g = g.grad().unwrap().unwrap();
@@ -334,7 +337,7 @@ mod tests {
         let theta = leaf(&[5.0], &[1], true);
         let g = leaf(&[0.5], &[1], false);
         let (adapted, _) =
-            diff_sgd_momentum_step(&[theta.clone()], &[g], &[], 0.1, 0.9).unwrap();
+            diff_sgd_momentum_step(std::slice::from_ref(&theta), &[g], &[], 0.1, 0.9).unwrap();
         let loss = sum(&adapted[0]).unwrap();
         loss.backward().unwrap();
         // d/d(theta) of (theta - 0.1*0.5) = 1

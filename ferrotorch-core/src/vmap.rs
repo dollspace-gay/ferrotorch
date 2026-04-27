@@ -518,7 +518,7 @@ where
 /// # Note on cost
 ///
 /// This is the loop-based reference implementation: O(batch_size) forward
-/// + backward calls. A future fused per-sample-grad path may use the
+/// and backward calls. A future fused per-sample-grad path may use the
 /// expand-trick (replicate the parameter, vmap the loss, batched backward)
 /// but this version is correct and useful immediately.
 pub fn per_sample_grad<T, F>(
@@ -1026,7 +1026,7 @@ mod tests {
         let result = vmap(
             |outer_slice| {
                 vmap(
-                    |inner_slice| crate::grad_fns::arithmetic::neg(inner_slice),
+                    crate::grad_fns::arithmetic::neg,
                     0,
                     0,
                 )(outer_slice)

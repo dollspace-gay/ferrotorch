@@ -42,6 +42,7 @@ impl<T: Float> Kumaraswamy<T> {
 }
 
 impl<T: Float> Distribution<T> for Kumaraswamy<T> {
+    #[allow(clippy::needless_range_loop)]
     fn sample(&self, shape: &[usize]) -> FerrotorchResult<Tensor<T>> {
         let u = creation::rand::<T>(shape)?;
         let u_data = u.data()?;
@@ -69,6 +70,7 @@ impl<T: Float> Distribution<T> for Kumaraswamy<T> {
         })
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn log_prob(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let v = value.data()?;
         let a = self.a.data()?;

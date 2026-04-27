@@ -101,13 +101,13 @@ pub fn diag<T: Float>(input: &Tensor<T>, diagonal: i64) -> FerrotorchResult<Tens
             let zero = <T as num_traits::Zero>::zero();
             let mut out = vec![zero; size * size];
 
-            for i in 0..n {
+            for (i, &val) in data[..n].iter().enumerate() {
                 let (r, c) = if diagonal >= 0 {
                     (i, i + offset)
                 } else {
                     (i + offset, i)
                 };
-                out[r * size + c] = data[i];
+                out[r * size + c] = val;
             }
 
             Tensor::from_storage(TensorStorage::cpu(out), vec![size, size], false)
@@ -279,7 +279,7 @@ pub fn cdist<T: Float>(x1: &Tensor<T>, x2: &Tensor<T>, p: f64) -> FerrotorchResu
                     } else {
                         diff
                     };
-                    dist = dist + abs_diff.powf(p_val);
+                    dist += abs_diff.powf(p_val);
                 }
                 out.push(dist.powf(inv_p));
             }

@@ -88,7 +88,7 @@ impl<T: Float> Distribution<T> for Poisson<T> {
                 if p <= l {
                     break;
                 }
-                k = k + one;
+                k += one;
             }
             result.push(k);
         }
@@ -155,7 +155,7 @@ impl<T: Float> Distribution<T> for Poisson<T> {
                         if p > T::from(1e-15).unwrap() {
                             entropy = entropy - p * log_p;
                         }
-                        k = k + one;
+                        k += one;
                         log_p = log_p + lambda.ln() - k.ln();
                         if log_p < T::from(-40.0).unwrap() {
                             break;

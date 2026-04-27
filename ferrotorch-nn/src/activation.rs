@@ -142,7 +142,7 @@ impl Softmax2d {
                         let idx = batch * c * h * w + ch * h * w + row * w + col;
                         let e = (data[idx] - max_val).exp();
                         out[idx] = e;
-                        sum_exp = sum_exp + e;
+                        sum_exp += e;
                     }
                     // Normalize.
                     for ch in 0..c {
@@ -1876,7 +1876,7 @@ mod tests {
         let y = m.forward(&x).unwrap();
         let val = y.data().unwrap()[0];
         let softplus = (1.0 + (-1.0_f64).exp()).ln();
-        let expected = -1.0 * softplus.tanh();
+        let expected = -softplus.tanh();
         assert!(
             (val - expected).abs() < 1e-7,
             "mish(-1) expected {}, got {}",
@@ -2482,6 +2482,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_rrelu_eval_forward() {
         // In eval mode, RReLU uses deterministic mean slope.
         let mut m = RReLU::default(); // lower=1/8, upper=1/3
@@ -2531,7 +2532,7 @@ mod tests {
         for (i, &val) in d.iter().enumerate() {
             // slope * (-1) should be in [-0.5, -0.1]
             assert!(
-                val >= -0.5 - 1e-7 && val <= -0.1 + 1e-7,
+                (-0.5 - 1e-7..=-0.1 + 1e-7).contains(&val),
                 "RReLU(-1, train)[{}] = {} not in [-0.5, -0.1]",
                 i,
                 val
@@ -2911,7 +2912,7 @@ mod tests {
 
     #[test]
     fn test_relu6_backward_matches_numerical() {
-        let relu6_fn = |v: f64| v.max(0.0).min(6.0);
+        let relu6_fn = |v: f64| v.clamp(0.0, 6.0);
 
         for &val in &[-2.0, 0.5, 3.0, 5.5, 8.0] {
             let x = t_scalar_grad(val);
@@ -2935,7 +2936,7 @@ mod tests {
 
     #[test]
     fn test_hardtanh_backward_matches_numerical() {
-        let hardtanh_fn = |v: f64| v.max(-1.0).min(1.0);
+        let hardtanh_fn = |v: f64| v.clamp(-1.0, 1.0);
 
         for &val in &[-2.0, -0.5, 0.0, 0.5, 2.0] {
             let x = t_scalar_grad(val);

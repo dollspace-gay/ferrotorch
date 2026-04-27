@@ -240,7 +240,7 @@ impl<T: Float> AdamW<T> {
                     let decay_t = scalar(decay_factor)?.to(device)?;
                     let lr_t = scalar(T::from(group_lr).unwrap())?.to(device)?;
 
-                    let decayed = mul(&param_t, &decay_t)?;
+                    let decayed = mul(param_t, &decay_t)?;
                     let scaled_update = mul(&update, &lr_t)?;
                     let new_param = sub(&decayed, &scaled_update)?;
 

@@ -920,8 +920,8 @@ mod tests {
     fn test_matmul_3d_2d_broadcast() {
         // (2, 3, 4) @ (4, 2) -> (2, 3, 2)
         // The 2D right operand broadcasts over the batch dim.
-        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
-        let b = t(&vec![1.0; 4 * 2], &[4, 2]);
+        let a = t(&[1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&[1.0; 4 * 2], &[4, 2]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 3, 2]);
         // Each element = sum of 4 ones = 4.0
@@ -933,8 +933,8 @@ mod tests {
     #[test]
     fn test_matmul_2d_3d_broadcast() {
         // (3, 4) @ (2, 4, 2) -> (2, 3, 2)
-        let a = t(&vec![1.0; 3 * 4], &[3, 4]);
-        let b = t(&vec![1.0; 2 * 4 * 2], &[2, 4, 2]);
+        let a = t(&[1.0; 3 * 4], &[3, 4]);
+        let b = t(&[1.0; 2 * 4 * 2], &[2, 4, 2]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 3, 2]);
     }
@@ -942,8 +942,8 @@ mod tests {
     #[test]
     fn test_matmul_batch_broadcast_1_vs_n() {
         // (1, 2, 3) @ (4, 3, 2) -> (4, 2, 2) — batch dim 1 broadcasts to 4
-        let a = t(&vec![1.0; 1 * 2 * 3], &[1, 2, 3]);
-        let b = t(&vec![1.0; 4 * 3 * 2], &[4, 3, 2]);
+        let a = t(&[1.0; 2 * 3], &[1, 2, 3]);
+        let b = t(&[1.0; 4 * 3 * 2], &[4, 3, 2]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[4, 2, 2]);
     }
@@ -951,7 +951,7 @@ mod tests {
     #[test]
     fn test_matmul_4d() {
         // (2, 3, 2, 4) @ (2, 3, 4, 5) -> (2, 3, 2, 5)
-        let a = t(&vec![1.0; 2 * 3 * 2 * 4], &[2, 3, 2, 4]);
+        let a = t(&[1.0; 2 * 3 * 2 * 4], &[2, 3, 2, 4]);
         let b = t(&vec![1.0; 2 * 3 * 4 * 5], &[2, 3, 4, 5]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 3, 2, 5]);
@@ -960,8 +960,8 @@ mod tests {
     #[test]
     fn test_matmul_3d_1d() {
         // (2, 3, 4) @ (4,) -> (2, 3) — 1D promoted to (4,1), col squeezed
-        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
-        let b = t(&vec![1.0; 4], &[4]);
+        let a = t(&[1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&[1.0; 4], &[4]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 3]);
         for &v in c.data().unwrap().iter() {
@@ -972,8 +972,8 @@ mod tests {
     #[test]
     fn test_matmul_1d_3d() {
         // (4,) @ (2, 4, 3) -> (2, 3) — 1D promoted to (1,4), row squeezed
-        let a = t(&vec![1.0; 4], &[4]);
-        let b = t(&vec![1.0; 2 * 4 * 3], &[2, 4, 3]);
+        let a = t(&[1.0; 4], &[4]);
+        let b = t(&[1.0; 2 * 4 * 3], &[2, 4, 3]);
         let c = matmul(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 3]);
     }
@@ -981,16 +981,16 @@ mod tests {
     #[test]
     fn test_matmul_broadcast_mismatch() {
         // (2, 3, 4) @ (3, 4, 2) — batch dims 2 vs 3, not broadcastable
-        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
-        let b = t(&vec![1.0; 3 * 4 * 2], &[3, 4, 2]);
+        let a = t(&[1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&[1.0; 3 * 4 * 2], &[3, 4, 2]);
         assert!(matmul(&a, &b).is_err());
     }
 
     #[test]
     fn test_matmul_inner_dim_mismatch() {
         // (2, 3, 4) @ (2, 5, 2) — inner dims 4 vs 5
-        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
-        let b = t(&vec![1.0; 2 * 5 * 2], &[2, 5, 2]);
+        let a = t(&[1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&[1.0; 2 * 5 * 2], &[2, 5, 2]);
         assert!(matmul(&a, &b).is_err());
     }
 
@@ -1017,8 +1017,8 @@ mod tests {
     #[test]
     fn test_bmm_forward_shape() {
         // [2, 3, 4] @ [2, 4, 5] -> [2, 3, 5]
-        let a = t(&vec![1.0; 2 * 3 * 4], &[2, 3, 4]);
-        let b = t(&vec![1.0; 2 * 4 * 5], &[2, 4, 5]);
+        let a = t(&[1.0; 2 * 3 * 4], &[2, 3, 4]);
+        let b = t(&[1.0; 2 * 4 * 5], &[2, 4, 5]);
         let c = bmm(&a, &b).unwrap();
         assert_eq!(c.shape(), &[2, 3, 5]);
     }
@@ -1078,18 +1078,18 @@ mod tests {
     #[test]
     fn test_bmm_shape_mismatch() {
         // Batch dimension mismatch.
-        let a = t(&vec![1.0; 2 * 2 * 2], &[2, 2, 2]);
-        let b = t(&vec![1.0; 3 * 2 * 2], &[3, 2, 2]);
+        let a = t(&[1.0; 2 * 2 * 2], &[2, 2, 2]);
+        let b = t(&[1.0; 3 * 2 * 2], &[3, 2, 2]);
         assert!(bmm(&a, &b).is_err());
 
         // Inner dimension mismatch.
-        let a = t(&vec![1.0; 2 * 2 * 3], &[2, 2, 3]);
-        let b = t(&vec![1.0; 2 * 4 * 2], &[2, 4, 2]);
+        let a = t(&[1.0; 2 * 2 * 3], &[2, 2, 3]);
+        let b = t(&[1.0; 2 * 4 * 2], &[2, 4, 2]);
         assert!(bmm(&a, &b).is_err());
 
         // Wrong ndim.
         let a = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        let b = t(&vec![1.0; 1 * 2 * 2], &[1, 2, 2]);
+        let b = t(&[1.0; 2 * 2], &[1, 2, 2]);
         assert!(bmm(&a, &b).is_err());
     }
 }

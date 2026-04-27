@@ -210,6 +210,7 @@ impl<T: Float> Distribution<T> for RelaxedOneHotCategorical<T> {
 
 /// Concrete forward sampling for RelaxedOneHotCategorical (shared by sample
 /// and rsample). Result lies on the open K-simplex.
+#[allow(clippy::needless_range_loop)]
 fn relaxed_one_hot_sample<T: Float>(
     temperature: T,
     normalized: &[T],

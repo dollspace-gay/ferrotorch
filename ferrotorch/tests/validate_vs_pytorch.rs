@@ -379,7 +379,7 @@ fn test_transformer_block_training() {
 
         optimizer.zero_grad().unwrap();
 
-        let normed = ln.forward(&x).unwrap();
+        let normed = ln.forward(x).unwrap();
         let qkv = qkv_proj.forward(&normed).unwrap();
         let qkv_chunks = chunk_t(&qkv, 3, 2).unwrap();
 
@@ -472,7 +472,7 @@ fn test_speed_comparison() {
     let a = rand::<f32>(&[1000, 1000]).unwrap();
     let b = rand::<f32>(&[1000, 1000]).unwrap();
 
-    let run = |name: &str, iters: usize, f: &dyn Fn()| -> f64 {
+    let run = |_name: &str, iters: usize, f: &dyn Fn()| -> f64 {
         for _ in 0..5 {
             f();
         }
@@ -480,8 +480,8 @@ fn test_speed_comparison() {
         for _ in 0..iters {
             f();
         }
-        let us = start.elapsed().as_secs_f64() / iters as f64 * 1e6;
-        us
+        
+        start.elapsed().as_secs_f64() / iters as f64 * 1e6
     };
 
     let ft_add = run("add_1M", 100, &|| {

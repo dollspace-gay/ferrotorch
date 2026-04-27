@@ -136,7 +136,7 @@ mod tests {
 
         for step in 1..=10 {
             sched.step(&mut opt);
-            let expected = 0.1 * gamma.powi(step as i32);
+            let expected = 0.1 * gamma.powi(step);
             assert!(
                 (opt.lr - expected).abs() < 1e-12,
                 "step {step}: expected {expected}, got {}",

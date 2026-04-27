@@ -1468,7 +1468,7 @@ mod tests {
     fn test_f16_to_f32_subnormal() {
         let val = f16_to_f32(0x0001); // smallest positive subnormal
         assert!(val > 0.0);
-        assert!((val - 5.960464477539063e-8).abs() < 1e-14, "got {}", val);
+        assert!((val - 5.960_464_5e-8).abs() < 1e-14, "got {}", val);
     }
 
     #[test]

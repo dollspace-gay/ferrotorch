@@ -189,7 +189,7 @@ impl<T: Float> Sgd<T> {
                     }
                     if group_wd > 0.0 {
                         let wd_t = scalar(T::from(group_wd).unwrap())?.to(device)?;
-                        let weighted = mul(&param_t, &wd_t)?;
+                        let weighted = mul(param_t, &wd_t)?;
                         grad = add(&grad, &weighted)?;
                     }
 
@@ -232,7 +232,7 @@ impl<T: Float> Sgd<T> {
                     // Step 3: param = param - lr * effective_grad
                     let lr_t = scalar(T::from(group_lr).unwrap())?.to(device)?;
                     let scaled = mul(&effective_grad, &lr_t)?;
-                    let new_param = sub(&param_t, &scaled)?;
+                    let new_param = sub(param_t, &scaled)?;
 
                     // Commit by swapping the underlying storage on the same
                     // device. update_storage is GPU-native — no round-trip.

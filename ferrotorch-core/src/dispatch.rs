@@ -154,13 +154,11 @@ impl DispatchKeySet {
         set
     }
 
-    /// Construct a set from an iterable of keys.
-    pub fn from_iter<I: IntoIterator<Item = DispatchKey>>(keys: I) -> Self {
-        let mut set = Self::empty();
-        for k in keys {
-            set = set.insert(k);
-        }
-        set
+    /// Construct a set from an iterable of keys. Convenience wrapper over
+    /// the [`FromIterator`] impl below for callers that don't want to chain
+    /// `.into_iter().collect()`.
+    pub fn from_keys<I: IntoIterator<Item = DispatchKey>>(keys: I) -> Self {
+        keys.into_iter().collect()
     }
 
     /// Returns true if `key` is in this set.
@@ -225,12 +223,11 @@ impl DispatchKeySet {
         }
         // Walk keys from highest to lowest discriminant and return
         // the first one present.
-        for &k in DispatchKey::ALL.iter().rev() {
-            if self.contains(k) {
-                return Some(k);
-            }
-        }
-        None
+        DispatchKey::ALL
+            .iter()
+            .rev()
+            .find(|&&k| self.contains(k))
+            .copied()
     }
 
     /// Returns an iterator over all keys in the set, in
@@ -256,9 +253,19 @@ impl Default for DispatchKeySet {
     }
 }
 
+impl FromIterator<DispatchKey> for DispatchKeySet {
+    fn from_iter<I: IntoIterator<Item = DispatchKey>>(keys: I) -> Self {
+        let mut set = Self::empty();
+        for k in keys {
+            set = set.insert(k);
+        }
+        set
+    }
+}
+
 impl<const N: usize> From<[DispatchKey; N]> for DispatchKeySet {
     fn from(arr: [DispatchKey; N]) -> Self {
-        Self::from_iter(arr)
+        Self::from_keys(arr)
     }
 }
 
@@ -650,7 +657,7 @@ mod tests {
         // call() with both keys → Cuda (higher priority).
         let t = make_tensor(vec![1.0], vec![1]);
         let keyset = DispatchKeySet::from([DispatchKey::Cpu, DispatchKey::Cuda]);
-        d.call("add", &[t.clone()], keyset).unwrap();
+        d.call("add", std::slice::from_ref(&t), keyset).unwrap();
         assert_eq!(cuda_count.load(Ordering::Relaxed), 1);
         assert_eq!(cpu_count.load(Ordering::Relaxed), 0);
 

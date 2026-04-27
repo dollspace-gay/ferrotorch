@@ -1436,6 +1436,7 @@ pub trait GpuBackend: Send + Sync {
             message: "strided_cat_f32 GPU op not yet implemented".into(),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     fn strided_cat_f64(
         &self,
         _input: &GpuBufferHandle,
@@ -1617,6 +1618,7 @@ pub trait GpuBackend: Send + Sync {
             message: "maxpool2d_f32 GPU op not yet implemented".into(),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     fn maxpool2d_f64(
         &self,
         _input: &GpuBufferHandle,
@@ -1656,6 +1658,7 @@ pub trait GpuBackend: Send + Sync {
             message: "avgpool2d_f32 GPU op not yet implemented".into(),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     fn avgpool2d_f64(
         &self,
         _input: &GpuBufferHandle,
@@ -1693,6 +1696,7 @@ pub trait GpuBackend: Send + Sync {
             message: "conv2d_f32 GPU op not yet implemented".into(),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     fn conv2d_f64(
         &self,
         _input: &GpuBufferHandle,

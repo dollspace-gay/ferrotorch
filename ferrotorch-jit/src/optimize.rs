@@ -554,7 +554,16 @@ fn fuse_linear_activation(graph: &mut IrGraph) {
 fn fuse_attention_pattern(graph: &mut IrGraph) {
     // Simple scan: look for Matmul → Mul/Div → Softmax → Matmul
     let topo = graph.topological_order();
-    let mut fusions: Vec<(IrNodeId, IrNodeId, IrNodeId, IrNodeId, usize, crate::graph::IrValueId, Vec<crate::graph::IrValueId>)> = Vec::new();
+    type FusionTuple = (
+        IrNodeId,
+        IrNodeId,
+        IrNodeId,
+        IrNodeId,
+        usize,
+        crate::graph::IrValueId,
+        Vec<crate::graph::IrValueId>,
+    );
+    let mut fusions: Vec<FusionTuple> = Vec::new();
 
     for (i, &nid) in topo.iter().enumerate() {
         let node = match graph.nodes.iter().find(|n| n.id == nid) {

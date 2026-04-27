@@ -785,7 +785,7 @@ impl<T: Float> SemiStructuredSparseTensor<T> {
     pub fn compress(dense: &Tensor<T>) -> FerrotorchResult<Self> {
         let data = dense.data_vec()?;
         let numel = data.len();
-        if !numel.is_multiple_of(4) {
+        if numel % 4 != 0 {
             return Err(FerrotorchError::InvalidArgument {
                 message: format!(
                     "SemiStructuredSparseTensor::compress: numel must be a \

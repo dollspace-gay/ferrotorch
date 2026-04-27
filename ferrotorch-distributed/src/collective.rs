@@ -452,6 +452,7 @@ pub fn all_to_all<T: Float>(
 }
 
 /// Like [`all_to_all`] but with a configurable recv timeout.
+#[allow(clippy::needless_range_loop)]
 pub fn all_to_all_with_timeout<T: Float>(
     tensor: &Tensor<T>,
     backend: &dyn Backend,

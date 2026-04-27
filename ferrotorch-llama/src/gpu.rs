@@ -41,6 +41,15 @@ struct ForwardTaps {
     mlp_block_size: usize,
     n_mlp_blocks: usize,
     bootstrap_k: Option<usize>,
+    /// When true, the MLP magnitude tap uses a local plainact
+    /// surrogate `max_i in block_b |gated[i] * (down_proj^T @ y_full)[i]|`
+    /// instead of `max_i |gated[i]|`. Local plainact aligns the
+    /// per-block training target with the block's contribution to the
+    /// layer output (multiplied through down_proj), which is closer
+    /// to the ShadowLLM paper's `plainact = grad × activation`
+    /// criterion than raw activation magnitude. Costs one extra
+    /// matmul per layer.
+    plainact_local: bool,
     attn_f32: Vec<CudaSlice<f32>>,
     mlp_f32: Vec<CudaSlice<f32>>,
     bootstrap_hidden: Option<CudaSlice<u16>>,
@@ -182,7 +191,13 @@ impl LlamaGpuInferencer {
         mlp_block_size: usize,
         n_mlp_blocks: usize,
     ) -> FerrotorchResult<ProfiledForwardResult> {
-        self.forward_from_ids_profiled_with_bootstrap(ids, mlp_block_size, n_mlp_blocks, None)
+        self.forward_from_ids_profiled_with_bootstrap(
+            ids,
+            mlp_block_size,
+            n_mlp_blocks,
+            None,
+            false,
+        )
     }
 
     /// Profiled forward with an optional bootstrap hidden-state tap.
@@ -201,6 +216,7 @@ impl LlamaGpuInferencer {
         mlp_block_size: usize,
         n_mlp_blocks: usize,
         bootstrap_k: Option<usize>,
+        plainact_local: bool,
     ) -> FerrotorchResult<ProfiledForwardResult> {
         let cfg = &self.config;
         let seq = ids.len();
@@ -236,6 +252,7 @@ impl LlamaGpuInferencer {
             mlp_block_size,
             n_mlp_blocks,
             bootstrap_k,
+            plainact_local,
             attn_f32: Vec::with_capacity(n_layers),
             mlp_f32: Vec::with_capacity(n_layers),
             bootstrap_hidden: None,
@@ -482,18 +499,23 @@ impl LlamaGpuInferencer {
             };
             let gated = gpu_mul_bf16(&activated_gate, &up, dev).map_err(map_gpu_err)?;
 
-            // MLP tap — per-block L-inf magnitude of the gated activation
-            // (what multiplies each row of down_proj).
+            // MLP tap (default) — per-block L-inf magnitude of the gated
+            // activation (what multiplies each row of down_proj). When
+            // `plainact_local` is set, we delay the tap until after the
+            // residual addition so we can compute the local plainact
+            // surrogate `|gated * (down_proj^T @ y_full)|` per neuron.
             if let Some(t) = taps.as_deref_mut() {
-                let m = gpu_block_reduce_max_abs_bf16(
-                    &gated,
-                    seq,
-                    t.n_mlp_blocks,
-                    t.mlp_block_size,
-                    dev,
-                )
-                .map_err(map_gpu_err)?;
-                t.mlp_f32.push(m);
+                if !t.plainact_local {
+                    let m = gpu_block_reduce_max_abs_bf16(
+                        &gated,
+                        seq,
+                        t.n_mlp_blocks,
+                        t.mlp_block_size,
+                        dev,
+                    )
+                    .map_err(map_gpu_err)?;
+                    t.mlp_f32.push(m);
+                }
             }
 
             let down =
@@ -501,6 +523,41 @@ impl LlamaGpuInferencer {
                     .map_err(map_gpu_err)?;
 
             hidden_buf = gpu_add_bf16(&hidden_buf, &down, dev).map_err(map_gpu_err)?;
+
+            // Plainact-local tap. Computed AFTER the residual add so
+            // we have y_full = residual + mlp_out. The signal is
+            // `|gated[i] * (y_full @ down_proj)[i]|` per neuron i,
+            // reduced to per-block max-abs. This approximates the
+            // ShadowLLM paper's plainact criterion (gradient of CE
+            // loss × activation) using the gradient of `||y_full||²`
+            // wrt each neuron — which is closed-form `2 * y_full @
+            // down_proj`. No backward pass needed; ~10ms extra per
+            // forward at seq=256 (one extra matmul per layer).
+            if let Some(t) = taps.as_deref_mut() {
+                if t.plainact_local {
+                    use ferrotorch_gpu::gpu_matmul_bf16_bf16;
+                    // z = y_full @ down_proj  → [seq, ffn]
+                    let z = gpu_matmul_bf16_bf16(
+                        &hidden_buf,
+                        &layer.down_proj,
+                        seq,
+                        hidden,
+                        ffn,
+                        dev,
+                    )
+                    .map_err(map_gpu_err)?;
+                    let act_grad = gpu_mul_bf16(&gated, &z, dev).map_err(map_gpu_err)?;
+                    let m = gpu_block_reduce_max_abs_bf16(
+                        &act_grad,
+                        seq,
+                        t.n_mlp_blocks,
+                        t.mlp_block_size,
+                        dev,
+                    )
+                    .map_err(map_gpu_err)?;
+                    t.mlp_f32.push(m);
+                }
+            }
 
             // Bootstrap tap — after finishing layer `layer_idx`, if
             // this matches the requested `bootstrap_k` we clone the

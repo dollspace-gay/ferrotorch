@@ -215,7 +215,7 @@ pub fn histc<T: Float>(
         let clamped = f.clamp(min_val, max_val - 1e-30);
         let idx = ((clamped - min_val) / bin_width) as usize;
         let idx = idx.min(bins - 1);
-        counts[idx] = counts[idx] + <T as num_traits::One>::one();
+        counts[idx] += <T as num_traits::One>::one();
     }
 
     Tensor::from_storage(TensorStorage::cpu(counts), vec![bins], false)

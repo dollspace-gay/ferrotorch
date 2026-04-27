@@ -792,7 +792,7 @@ mod tests {
         let input = leaf_vec(&[1.0, 2.0, 3.0], false);
         let v = leaf_vec(&[4.0, 5.0, 6.0], false);
 
-        let (primal, tangent) = jvp_exact(|x| Ok(x), &input, &v).unwrap();
+        let (primal, tangent) = jvp_exact(Ok, &input, &v).unwrap();
 
         let p = primal.data_vec().unwrap();
         let t = tangent.data_vec().unwrap();
@@ -846,7 +846,7 @@ mod tests {
     fn test_jvp_exact_shape_mismatch() {
         let input = leaf_vec(&[1.0, 2.0], false);
         let v = leaf_vec(&[1.0], false);
-        assert!(jvp_exact(|x| Ok(x), &input, &v).is_err());
+        assert!(jvp_exact(Ok, &input, &v).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn test_jacfwd_non_1d_input_error() {
         let input = leaf_mat(&[1.0, 2.0, 3.0, 4.0], 2, 2);
-        assert!(jacfwd(|x| Ok(x), &input).is_err());
+        assert!(jacfwd(Ok, &input).is_err());
     }
 
     // -----------------------------------------------------------------------

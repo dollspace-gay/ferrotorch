@@ -207,10 +207,12 @@ pub struct RotaryPositionEmbedding<T: Float> {
 /// support context lengths beyond the model's training distribution.
 /// Default is [`RoPEScaling::None`] (classical RoPE with no modification).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum RoPEScaling {
     /// No scaling. `inv_freq[i] = 1 / base^(2i / dim)`. Matches the
     /// original RoFormer formulation and the Llama 3 8B base model
     /// (8k context, no stretching).
+    #[default]
     None,
 
     /// Linear / positional interpolation (Chen et al. 2023,
@@ -260,11 +262,6 @@ pub enum RoPEScaling {
     },
 }
 
-impl Default for RoPEScaling {
-    fn default() -> Self {
-        RoPEScaling::None
-    }
-}
 
 impl RoPEScaling {
     /// Convenience: YARN with the paper's default beta_fast=32, beta_slow=1.
@@ -2572,7 +2569,7 @@ mod tests {
         cache.update(k1, v1).unwrap();
 
         // Second update: all 2s.
-        let k2_data = vec![2.0f64; 1 * 1 * 1 * 3];
+        let k2_data = vec![2.0f64; 3];
         let k2 = ferrotorch_core::from_slice(&k2_data, &[1, 1, 1, 3]).unwrap();
         let v2 = ferrotorch_core::from_slice(&k2_data, &[1, 1, 1, 3]).unwrap();
         let (fk, _fv) = cache.update(k2, v2).unwrap();

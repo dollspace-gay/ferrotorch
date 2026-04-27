@@ -189,7 +189,7 @@ where
     L: FnOnce(&ComputeClient<R>, CubeCount, CubeDim, ArrayArg<R>, ArrayArg<R>),
 {
     let n = x.len();
-    let size_bytes = n * std::mem::size_of::<f32>();
+    let size_bytes = std::mem::size_of_val(x);
 
     let x_handle = client.create_from_slice(f32::as_bytes(x));
     let out_handle = client.empty(size_bytes);
@@ -211,7 +211,7 @@ where
 {
     let n = a.len();
     debug_assert_eq!(n, b.len());
-    let size_bytes = n * std::mem::size_of::<f32>();
+    let size_bytes = std::mem::size_of_val(a);
 
     let a_handle = client.create_from_slice(f32::as_bytes(a));
     let b_handle = client.create_from_slice(f32::as_bytes(b));

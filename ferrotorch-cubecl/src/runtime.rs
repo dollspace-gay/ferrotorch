@@ -188,7 +188,7 @@ impl CubeRuntime {
                 {
                     let wgpu_device = wgpu_device_for_index(idx);
                     let client = WgpuRuntime::client(&wgpu_device);
-                    return Ok(CubeClient::Wgpu(client));
+                    Ok(CubeClient::Wgpu(client))
                 }
                 #[cfg(not(feature = "wgpu"))]
                 {

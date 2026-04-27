@@ -37,7 +37,7 @@ pub fn download_weights(info: &ModelInfo, cache: &HubCache) -> FerrotorchResult<
 
     #[cfg(feature = "http")]
     {
-        return download_and_verify(info, cache);
+        download_and_verify(info, cache)
     }
 
     #[cfg(not(feature = "http"))]

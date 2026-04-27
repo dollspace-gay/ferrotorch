@@ -363,7 +363,7 @@ mod tests {
         let dist = Gumbel::new(loc, scale).unwrap();
 
         let h = dist.entropy().unwrap();
-        let euler_gamma = 0.577_215_664_901_532_9_f32;
+        let euler_gamma = 0.577_215_7_f32;
         let expected = 1.0 + 0.0 + euler_gamma; // ln(1) = 0
         assert!(
             (h.item().unwrap() - expected).abs() < 1e-5,
@@ -379,7 +379,7 @@ mod tests {
         let dist = Gumbel::new(loc, scale).unwrap();
 
         let h = dist.entropy().unwrap();
-        let euler_gamma = 0.577_215_664_901_532_9_f32;
+        let euler_gamma = 0.577_215_7_f32;
         let expected = 1.0 + 2.0f32.ln() + euler_gamma;
         assert!(
             (h.item().unwrap() - expected).abs() < 1e-5,

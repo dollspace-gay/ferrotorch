@@ -110,6 +110,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_vision_normalize_spatial() {
         // 3-channel 2x2 image, all pixels = 0.0.
         // After normalization: (0 - mean) / std for each channel.

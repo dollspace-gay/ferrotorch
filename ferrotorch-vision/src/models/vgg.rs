@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_vgg11_output_shape() {
         let model = vgg11::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn test_vgg16_output_shape() {
         let model = vgg16::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }

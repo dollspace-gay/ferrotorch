@@ -1271,7 +1271,7 @@ mod tests {
         let interp_result = InterpreterBackend
             .compile(&g)
             .unwrap()
-            .execute(&[input.clone()])
+            .execute(std::slice::from_ref(&input))
             .unwrap();
         let native_result = NativeBackend
             .compile(&g)
@@ -1298,7 +1298,7 @@ mod tests {
         let interp_result = InterpreterBackend
             .compile(&g)
             .unwrap()
-            .execute(&[input.clone()])
+            .execute(std::slice::from_ref(&input))
             .unwrap();
         let native_result = NativeBackend
             .compile(&g)
@@ -1529,7 +1529,7 @@ mod tests {
         let interp_result = InterpreterBackend
             .compile(&g)
             .unwrap()
-            .execute(&[input.clone()])
+            .execute(std::slice::from_ref(&input))
             .unwrap();
         let inductor_result = InductorBackend::new(InductorTarget::CpuRust)
             .compile(&g)
@@ -1676,7 +1676,7 @@ mod tests {
         let interp = InterpreterBackend
             .compile(&g)
             .unwrap()
-            .execute(&[input.clone()])
+            .execute(std::slice::from_ref(&input))
             .unwrap();
         let jit = InductorBackend::new(InductorTarget::CpuC)
             .compile(&g)

@@ -135,10 +135,11 @@ mod tests {
         // Verify the re-export exists. The actual checkpoint logic is tested
         // exhaustively in ferrotorch-core. Here we just confirm the symbol
         // is accessible.
-        let _f: fn(
+        type CheckpointFn = fn(
             fn(&Tensor<f32>) -> FerrotorchResult<Tensor<f32>>,
             &Tensor<f32>,
-        ) -> FerrotorchResult<Tensor<f32>> = checkpoint;
+        ) -> FerrotorchResult<Tensor<f32>>;
+        let _f: CheckpointFn = checkpoint;
     }
 
     // -- checkpoint_sequential -----------------------------------------------

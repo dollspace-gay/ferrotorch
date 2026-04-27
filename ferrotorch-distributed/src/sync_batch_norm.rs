@@ -153,6 +153,9 @@ impl<T: Float> SyncBatchNorm2d<T> {
 }
 
 impl<T: Float> Module<T> for SyncBatchNorm2d<T> {
+    // De-interleaving sum/sum_sq from a packed reduce buffer isn't expressible
+    // as a single slice memcpy.
+    #[allow(clippy::manual_memcpy)]
     fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let shape = input.shape().to_vec();
         if shape.len() != 4 {
@@ -405,6 +408,7 @@ impl<T: Float> std::fmt::Debug for SyncBatchNorm2dBackward<T> {
 }
 
 impl<T: Float> GradFn<T> for SyncBatchNorm2dBackward<T> {
+    #[allow(clippy::manual_memcpy)]
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         let shape = self.input.shape();
         let batch = shape[0];
@@ -708,7 +712,7 @@ mod tests {
         sync.eval();
         // Now run with a different input — output should still be normalized
         // using the running stats from training.
-        let other = cpu_tensor(&vec![100.0_f32; 12], &[1, 3, 2, 2]);
+        let other = cpu_tensor(&[100.0_f32; 12], &[1, 3, 2, 2]);
         let out = sync.forward(&other).unwrap();
         // Just verify forward completes and produces finite output.
         for v in out.data().unwrap() {

@@ -1357,6 +1357,7 @@ DONE:
 }
 ";
 
+#[allow(clippy::too_many_arguments)]
 pub fn gpu_rope_half_bf16(
     input: &cudarc::driver::CudaSlice<u16>,
     cos_cache: &cudarc::driver::CudaSlice<u16>,
@@ -2196,14 +2197,14 @@ mod tests {
 
     fn upload_bf16(dev: &GpuDevice, data: &[f32]) -> cudarc::driver::CudaSlice<u16> {
         let bits: Vec<u16> = data.iter().map(|&x| half::bf16::from_f32(x).to_bits()).collect();
-        dev.stream().memcpy_stod(&bits).expect("upload bf16")
+        dev.stream().clone_htod(&bits).expect("upload bf16")
     }
 
     fn download_bf16(
         dev: &GpuDevice,
         buf: &cudarc::driver::CudaSlice<u16>,
     ) -> Vec<f32> {
-        let bits = dev.stream().memcpy_dtov(buf).expect("download bf16");
+        let bits = dev.stream().clone_dtoh(buf).expect("download bf16");
         bits.into_iter()
             .map(|b| half::bf16::from_bits(b).to_f32())
             .collect()
@@ -2249,7 +2250,7 @@ mod tests {
         let weight_f: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let weight = upload_bf16(&dev, &weight_f);
         let indices: Vec<u32> = vec![2, 0, 3];
-        let idx = dev.stream().memcpy_stod(&indices).expect("indices");
+        let idx = dev.stream().clone_htod(&indices).expect("indices");
 
         let out = gpu_embedding_gather_bf16(&weight, &idx, 3, &dev).expect("gather");
         let got = download_bf16(&dev, &out);
@@ -2440,8 +2441,8 @@ mod tests {
         let half_dim = head_dim / 2;
         let mut cos_buf = vec![0.0f32; max_seq * half_dim];
         let sin_buf = vec![0.0f32; max_seq * half_dim];
-        for d in 0..half_dim {
-            cos_buf[d] = 1.0;
+        for c in cos_buf.iter_mut().take(half_dim) {
+            *c = 1.0;
         }
 
         let input_g = upload_bf16(&dev, &input);
@@ -2492,7 +2493,7 @@ mod tests {
         let input = upload_bf16(&dev, &data);
         let out = gpu_block_reduce_max_abs_bf16(&input, rows, n_blocks, block_size, &dev)
             .expect("block_reduce");
-        let got: Vec<f32> = dev.stream().memcpy_dtov(&out).expect("download f32");
+        let got: Vec<f32> = dev.stream().clone_dtoh(&out).expect("download f32");
 
         assert_eq!(got.len(), rows * n_blocks);
 
@@ -2530,7 +2531,7 @@ mod tests {
         let input = upload_bf16(&dev, &data);
         let out = gpu_block_reduce_max_abs_bf16(&input, rows, 1, block_size, &dev)
             .expect("block_reduce single");
-        let got: Vec<f32> = dev.stream().memcpy_dtov(&out).expect("download f32");
+        let got: Vec<f32> = dev.stream().clone_dtoh(&out).expect("download f32");
         assert_eq!(got.len(), rows);
         for r in 0..rows {
             let expected = (0..block_size)

@@ -255,15 +255,6 @@ impl<T: Float> Module<T> for Yolo<T> {
 }
 
 // ===========================================================================
-// Convenience constructor
-// ===========================================================================
-
-/// Construct a simplified YOLO model with 3 anchors.
-///
-/// * `num_classes` -- number of object classes.
-///
-/// Equivalent to `Yolo::new(num_classes, 3)`.
-// ===========================================================================
 // IntermediateFeatures — CL-499
 // ===========================================================================
 
@@ -302,6 +293,11 @@ impl<T: Float> crate::models::feature_extractor::IntermediateFeatures<T> for Yol
     }
 }
 
+/// Construct a simplified YOLO model with 3 anchors.
+///
+/// * `num_classes` -- number of object classes.
+///
+/// Equivalent to `Yolo::new(num_classes, 3)`.
 pub fn yolo<T: Float>(num_classes: usize) -> FerrotorchResult<Yolo<T>> {
     Yolo::new(num_classes, 3)
 }
@@ -333,7 +329,7 @@ mod tests {
     fn test_yolo_forward_shape_default_anchors() {
         // 20 classes (like VOC), 3 anchors: output channels = 3 * (5 + 20) = 75
         let model = Yolo::<f32>::new(20, 3).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 416 * 416], [1, 3, 416, 416], false);
+        let input = leaf_4d(&vec![0.01; 3 * 416 * 416], [1, 3, 416, 416], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 75, 13, 13]);
     }
@@ -351,7 +347,7 @@ mod tests {
     fn test_yolo_forward_shape_custom_anchors() {
         // 10 classes, 5 anchors: output channels = 5 * (5 + 10) = 75
         let model = Yolo::<f32>::new(10, 5).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 416 * 416], [1, 3, 416, 416], false);
+        let input = leaf_4d(&vec![0.01; 3 * 416 * 416], [1, 3, 416, 416], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 75, 13, 13]);
     }
@@ -393,7 +389,7 @@ mod tests {
             + 128 * 256 * 3 * 3
             + 256 * 512 * 3 * 3;
         let out_ch = 3 * (5 + 20); // 75
-        let head_params = 512 * out_ch * 1 * 1 + out_ch; // weight + bias
+        let head_params = (512 * out_ch) + out_ch; // weight + bias
         let expected = backbone_params + head_params;
 
         assert_eq!(
@@ -475,7 +471,7 @@ mod tests {
         // Use tiny spatial dims to keep memory reasonable.
         // 32x32 input -> after 5 maxpool(2) -> 1x1 grid.
         let model = Yolo::<f32>::new(2, 1).unwrap();
-        let input = leaf_4d(&vec![0.5; 1 * 3 * 32 * 32], [1, 3, 32, 32], true);
+        let input = leaf_4d(&vec![0.5; 3 * 32 * 32], [1, 3, 32, 32], true);
 
         let output = model.forward(&input).unwrap();
         let loss = ferrotorch_core::grad_fns::reduction::sum(&output).unwrap();

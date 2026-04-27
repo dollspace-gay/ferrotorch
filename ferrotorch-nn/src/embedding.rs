@@ -595,8 +595,8 @@ impl<T: Float> EmbeddingBag<T> {
 
             match self.mode {
                 EmbeddingBagMode::Sum | EmbeddingBagMode::Mean => {
-                    for i in start..end {
-                        let idx = num_traits::ToPrimitive::to_usize(&input_data[i]).unwrap();
+                    for elem in &input_data[start..end] {
+                        let idx = num_traits::ToPrimitive::to_usize(elem).unwrap();
                         let row_start = idx * dim;
                         let out_start = b * dim;
                         for d in 0..dim {
@@ -617,8 +617,8 @@ impl<T: Float> EmbeddingBag<T> {
                     for d in 0..dim {
                         output[out_start + d] = T::neg_infinity();
                     }
-                    for i in start..end {
-                        let idx = num_traits::ToPrimitive::to_usize(&input_data[i]).unwrap();
+                    for elem in &input_data[start..end] {
+                        let idx = num_traits::ToPrimitive::to_usize(elem).unwrap();
                         let row_start = idx * dim;
                         for d in 0..dim {
                             let val = weight_data[row_start + d];
@@ -770,6 +770,7 @@ mod tests {
     // --- Padding index tests ---
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_padding_idx_zeros() {
         let emb = Embedding::<f32>::new(5, 3, Some(2)).unwrap();
 

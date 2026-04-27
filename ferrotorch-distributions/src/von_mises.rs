@@ -60,6 +60,7 @@ fn log_bessel_i0<T: Float>(x: T) -> T {
 }
 
 impl<T: Float> Distribution<T> for VonMises<T> {
+    #[allow(clippy::needless_range_loop)]
     fn sample(&self, shape: &[usize]) -> FerrotorchResult<Tensor<T>> {
         // Best's algorithm for Von Mises sampling.
         let l_data = self.loc.data()?;
@@ -127,6 +128,7 @@ impl<T: Float> Distribution<T> for VonMises<T> {
         })
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn log_prob(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
         let v = value.data()?;
         let l = self.loc.data()?;
@@ -146,6 +148,7 @@ impl<T: Float> Distribution<T> for VonMises<T> {
         Tensor::from_storage(TensorStorage::cpu(out), value.shape().to_vec(), false)
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn entropy(&self) -> FerrotorchResult<Tensor<T>> {
         // H = log(2*pi*I_0(kappa)) - kappa * I_1(kappa)/I_0(kappa)
         // Approximate I_1/I_0 ≈ 1 - 1/(2*kappa) for large kappa.

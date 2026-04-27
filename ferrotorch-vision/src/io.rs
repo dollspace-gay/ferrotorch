@@ -275,8 +275,8 @@ mod tests {
         let h = 2u32;
         let c = 3u32;
         let mut data = vec![0u8; (w * h * c) as usize];
-        for i in 0..data.len() {
-            data[i] = (i * 17 % 256) as u8;
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i * 17 % 256) as u8;
         }
 
         let original = RawImage {
@@ -321,12 +321,10 @@ mod tests {
         // The blue channel was all 255 -> should be 1.0.
         // Blue channel starts at index 2 * 4 * 5 = 40.
         let blue_start = 2 * 4 * 5;
-        for i in blue_start..(blue_start + 4 * 5) {
+        for (j, &val) in data[blue_start..blue_start + 4 * 5].iter().enumerate() {
             assert!(
-                (data[i] - 1.0).abs() < 1e-6,
-                "blue channel pixel {} was {} not 1.0",
-                i - blue_start,
-                data[i],
+                (val - 1.0).abs() < 1e-6,
+                "blue channel pixel {j} was {val} not 1.0",
             );
         }
     }

@@ -1339,7 +1339,7 @@ mod tests {
         }
 
         // Reconstruct: L * L^T should equal A.
-        let mut llt = vec![0.0f32; 9];
+        let mut llt = [0.0f32; 9];
         for i in 0..3 {
             for j in 0..3 {
                 let mut acc = 0.0f32;
@@ -1419,7 +1419,7 @@ mod tests {
         let b: Vec<f32> = vec![5.0, 3.0, 10.0, 7.0]; // 2x2 row-major
         let x = gpu_solve_f32(&a, &b, 2, 2, &dev).unwrap();
         // Verify: A * X should equal B
-        let mut ax = vec![0.0f32; 4];
+        let mut ax = [0.0f32; 4];
         for i in 0..2 {
             for j in 0..2 {
                 ax[i * 2 + j] = a[i * 2] * x[j] + a[i * 2 + 1] * x[2 + j];
@@ -1539,7 +1539,7 @@ mod tests {
         let n = 3;
 
         // Reconstruct
-        let mut recon = vec![0.0f32; 9];
+        let mut recon = [0.0f32; 9];
         for i in 0..3 {
             for j in 0..3 {
                 let mut acc = 0.0f32;

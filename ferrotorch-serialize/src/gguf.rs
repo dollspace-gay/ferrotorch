@@ -1059,9 +1059,7 @@ mod tests {
         block.push(0x97); // elements 2,3 => -1.0, 1.0
         block.push(0xA6); // elements 4,5 => -2.0, 2.0
         // Fill remaining 13 bytes with 0x88 (all zeros).
-        for _ in 0..13 {
-            block.push(0x88);
-        }
+        block.extend(std::iter::repeat_n(0x88, 13));
 
         let result = dequantize_q4_0(&block, 32).unwrap();
         assert_eq!(result.len(), 32);
@@ -1081,9 +1079,7 @@ mod tests {
         block.extend_from_slice(&scale_bytes);
         // Byte 0x97 => lo=7, hi=9 => (7-8)*0.5=-0.5, (9-8)*0.5=0.5
         block.push(0x97);
-        for _ in 0..15 {
-            block.push(0x88);
-        }
+        block.extend(std::iter::repeat_n(0x88, 15));
 
         let result = dequantize_q4_0(&block, 32).unwrap();
         assert!((result[0] - -0.5).abs() < 1e-3);
@@ -1106,12 +1102,11 @@ mod tests {
 
         let result = dequantize_q8_0(&block, 32).unwrap();
         assert_eq!(result.len(), 32);
-        for i in 0..32 {
+        for (i, &r) in result.iter().enumerate().take(32) {
             assert!(
-                (result[i] - i as f32).abs() < 1e-3,
-                "element {i}: expected {}, got {}",
+                (r - i as f32).abs() < 1e-3,
+                "element {i}: expected {}, got {r}",
                 i as f32,
-                result[i]
             );
         }
     }
@@ -1125,9 +1120,7 @@ mod tests {
         // -1 as u8 = 0xFF, -2 as u8 = 0xFE, etc.
         block.push(0xFF); // -1
         block.push(0xFE); // -2
-        for _ in 2..32 {
-            block.push(0x00);
-        }
+        block.extend(std::iter::repeat_n(0x00, 30));
 
         let result = dequantize_q8_0(&block, 32).unwrap();
         assert!((result[0] - -2.0).abs() < 1e-3); // -1 * 2.0
@@ -1190,9 +1183,8 @@ mod tests {
         let scale_bytes = f32_to_f16_bytes(1.0);
         let mut block = Vec::new();
         block.extend_from_slice(&scale_bytes);
-        for _ in 0..16 {
-            block.push(0x88); // all nibbles = 8 => (8-8)*1.0 = 0.0
-        }
+        // all nibbles = 8 => (8-8)*1.0 = 0.0
+        block.extend(std::iter::repeat_n(0x88, 16));
 
         let bytes = build_gguf(
             &[],
@@ -1227,12 +1219,11 @@ mod tests {
         let tensor = dequantize_gguf_tensor(&file, "q8_tensor").unwrap();
         assert_eq!(tensor.shape(), &[32]);
         let td = tensor.data().unwrap();
-        for i in 0..32 {
+        for (i, &t) in td.iter().enumerate().take(32) {
             assert!(
-                (td[i] - i as f32).abs() < 1e-3,
-                "element {i}: expected {}, got {}",
+                (t - i as f32).abs() < 1e-3,
+                "element {i}: expected {}, got {t}",
                 i as f32,
-                td[i]
             );
         }
     }

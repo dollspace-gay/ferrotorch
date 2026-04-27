@@ -1025,9 +1025,9 @@ fn softmax_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
                     }
                 }
                 let mut sum_exp = 0.0f32;
-                for j in 0..last_dim {
-                    let e = (scratch[j] - row_max).exp();
-                    scratch[j] = e;
+                for slot in scratch[..last_dim].iter_mut() {
+                    let e = (*slot - row_max).exp();
+                    *slot = e;
                     sum_exp += e;
                 }
                 if sum_exp > 0.0 {

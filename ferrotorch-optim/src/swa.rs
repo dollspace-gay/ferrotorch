@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn test_averaged_model_swa_first_update_copies() {
         let p = Parameter::from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
-        let mut avg = AveragedModel::new(&[p.clone()], AveragingStrategy::Swa);
+        let mut avg = AveragedModel::new(std::slice::from_ref(&p), AveragingStrategy::Swa);
 
         // Change param before first update.
         no_grad(|| unsafe { p.tensor().update_data(&[10.0f32, 20.0, 30.0]) }).unwrap();
@@ -540,16 +540,16 @@ mod tests {
         // n=1: avg = [1] + ([3] - [1]) / 2 = [2]
         // n=2: avg = [2] + ([6] - [2]) / 3 = [2 + 4/3] = [10/3]
         let p = Parameter::from_slice(&[0.0f32], &[1]).unwrap();
-        let mut avg = AveragedModel::new(&[p.clone()], AveragingStrategy::Swa);
+        let mut avg = AveragedModel::new(std::slice::from_ref(&p), AveragingStrategy::Swa);
 
         // Update 1: param = 1
         no_grad(|| unsafe { p.tensor().update_data(&[1.0f32]) }).unwrap();
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
         assert!((avg.averaged_params()[0][0] - 1.0).abs() < 1e-6);
 
         // Update 2: param = 3
         no_grad(|| unsafe { p.tensor().update_data(&[3.0f32]) }).unwrap();
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
         // avg = 1 + (3 - 1) / 2 = 2
         assert!(
             (avg.averaged_params()[0][0] - 2.0).abs() < 1e-6,
@@ -574,10 +574,10 @@ mod tests {
     fn test_averaged_model_swa_equal_weight_mean() {
         // If we average 4 identical values, the mean should be that value.
         let p = Parameter::from_slice(&[5.0f32, 10.0], &[2]).unwrap();
-        let mut avg = AveragedModel::new(&[p.clone()], AveragingStrategy::Swa);
+        let mut avg = AveragedModel::new(std::slice::from_ref(&p), AveragingStrategy::Swa);
 
         for _ in 0..4 {
-            avg.update_parameters(&[p.clone()]).unwrap();
+            avg.update_parameters(std::slice::from_ref(&p)).unwrap();
         }
 
         assert!((avg.averaged_params()[0][0] - 5.0).abs() < 1e-6);
@@ -591,11 +591,11 @@ mod tests {
     #[test]
     fn test_averaged_model_ema() {
         let p = Parameter::from_slice(&[0.0f32], &[1]).unwrap();
-        let mut avg = AveragedModel::new(&[p.clone()], AveragingStrategy::Ema(0.5));
+        let mut avg = AveragedModel::new(std::slice::from_ref(&p), AveragingStrategy::Ema(0.5));
 
         // Update 1 (first call copies): avg = 10
         no_grad(|| unsafe { p.tensor().update_data(&[10.0f32]) }).unwrap();
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
         assert!((avg.averaged_params()[0][0] - 10.0).abs() < 1e-6);
 
         // Update 2: avg = 0.5 * 10 + 0.5 * 20 = 15
@@ -615,17 +615,17 @@ mod tests {
     #[test]
     fn test_averaged_model_apply_to() {
         let p = Parameter::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
-        let mut avg = AveragedModel::new(&[p.clone()], AveragingStrategy::Swa);
+        let mut avg = AveragedModel::new(std::slice::from_ref(&p), AveragingStrategy::Swa);
 
         // Update with [1, 2], then [3, 4].
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
 
         no_grad(|| unsafe { p.tensor().update_data(&[3.0f32, 4.0]) }).unwrap();
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
         // avg = [1, 2] + ([3, 4] - [1, 2]) / 2 = [2, 3]
 
         // Apply averaged weights to the parameter.
-        avg.apply_to(&[p.clone()]).unwrap();
+        avg.apply_to(std::slice::from_ref(&p)).unwrap();
         let data = p.data().unwrap();
         assert!((data[0] - 2.0).abs() < 1e-6);
         assert!((data[1] - 3.0).abs() < 1e-6);
@@ -783,10 +783,10 @@ mod tests {
         let p_foreach =
             Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
 
-        let mut legacy = AveragedModel::new(&[p_legacy.clone()], AveragingStrategy::Swa);
+        let mut legacy = AveragedModel::new(std::slice::from_ref(&p_legacy), AveragingStrategy::Swa);
         let mut foreach =
-            AveragedModel::new(&[p_foreach.clone()], AveragingStrategy::Swa)
-                .with_foreach(&[p_foreach.clone()]);
+            AveragedModel::new(std::slice::from_ref(&p_foreach), AveragingStrategy::Swa)
+                .with_foreach(std::slice::from_ref(&p_foreach));
 
         for step in 0..5 {
             let new_vals: Vec<f32> =
@@ -794,8 +794,8 @@ mod tests {
             no_grad(|| unsafe { p_legacy.tensor().update_data(&new_vals) }).unwrap();
             no_grad(|| unsafe { p_foreach.tensor().update_data(&new_vals) }).unwrap();
 
-            legacy.update_parameters(&[p_legacy.clone()]).unwrap();
-            foreach.update_parameters(&[p_foreach.clone()]).unwrap();
+            legacy.update_parameters(std::slice::from_ref(&p_legacy)).unwrap();
+            foreach.update_parameters(std::slice::from_ref(&p_foreach)).unwrap();
         }
 
         let l = legacy.averaged_values(0).unwrap();
@@ -814,10 +814,10 @@ mod tests {
         let p_foreach = Parameter::from_slice(&[0.0f32, 0.0, 0.0], &[3]).unwrap();
 
         let mut legacy =
-            AveragedModel::new(&[p_legacy.clone()], AveragingStrategy::Ema(0.9));
+            AveragedModel::new(std::slice::from_ref(&p_legacy), AveragingStrategy::Ema(0.9));
         let mut foreach =
-            AveragedModel::new(&[p_foreach.clone()], AveragingStrategy::Ema(0.9))
-                .with_foreach(&[p_foreach.clone()]);
+            AveragedModel::new(std::slice::from_ref(&p_foreach), AveragingStrategy::Ema(0.9))
+                .with_foreach(std::slice::from_ref(&p_foreach));
 
         for step in 0..6 {
             let v = 10.0 + step as f32;
@@ -825,8 +825,8 @@ mod tests {
             no_grad(|| unsafe { p_legacy.tensor().update_data(&new_vals) }).unwrap();
             no_grad(|| unsafe { p_foreach.tensor().update_data(&new_vals) }).unwrap();
 
-            legacy.update_parameters(&[p_legacy.clone()]).unwrap();
-            foreach.update_parameters(&[p_foreach.clone()]).unwrap();
+            legacy.update_parameters(std::slice::from_ref(&p_legacy)).unwrap();
+            foreach.update_parameters(std::slice::from_ref(&p_foreach)).unwrap();
         }
 
         let l = legacy.averaged_values(0).unwrap();
@@ -842,18 +842,18 @@ mod tests {
     #[test]
     fn test_averaged_model_swa_foreach_apply_to() {
         let p = Parameter::from_slice(&[10.0f32, 20.0], &[2]).unwrap();
-        let mut avg = AveragedModel::new(&[p.clone()], AveragingStrategy::Swa)
-            .with_foreach(&[p.clone()]);
+        let mut avg = AveragedModel::new(std::slice::from_ref(&p), AveragingStrategy::Swa)
+            .with_foreach(std::slice::from_ref(&p));
 
         // Step 1: first update copies [10, 20].
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
 
         // Step 2: param = [2, 4]. avg = 10 + (2 - 10)/2 = 6; 20 + (4-20)/2 = 12
         no_grad(|| unsafe { p.tensor().update_data(&[2.0f32, 4.0]) }).unwrap();
-        avg.update_parameters(&[p.clone()]).unwrap();
+        avg.update_parameters(std::slice::from_ref(&p)).unwrap();
 
         // Apply averaged values into param.
-        avg.apply_to(&[p.clone()]).unwrap();
+        avg.apply_to(std::slice::from_ref(&p)).unwrap();
         let data = p.data().unwrap();
         assert!((data[0] - 6.0).abs() < 1e-5, "expected 6.0, got {}", data[0]);
         assert!((data[1] - 12.0).abs() < 1e-5, "expected 12.0, got {}", data[1]);

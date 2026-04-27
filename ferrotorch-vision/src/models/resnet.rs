@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn test_basic_block_same_channels() {
         let block = BasicBlock::<f32>::new(64, 64, 1).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 64 * 8 * 8], [1, 64, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 64 * 8 * 8], [1, 64, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 64, 8, 8]);
     }
@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn test_basic_block_downsample() {
         let block = BasicBlock::<f32>::new(64, 128, 2).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 64 * 8 * 8], [1, 64, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 64 * 8 * 8], [1, 64, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         // Stride 2: spatial dims halve. Channels: 64 -> 128.
         assert_eq!(output.shape(), &[1, 128, 4, 4]);
@@ -728,7 +728,7 @@ mod tests {
         let count: usize = block.parameters().iter().map(|p| p.numel()).sum();
         let expected = 64 * 128 * 3 * 3     // conv1: 64->128
                      + 128 * 128 * 3 * 3    // conv2: 128->128
-                     + 64 * 128 * 1 * 1; // downsample: 64->128
+                     + (64 * 128); // downsample: 64->128
         assert_eq!(count, expected);
     }
 
@@ -740,7 +740,7 @@ mod tests {
     fn test_bottleneck_same_channels() {
         // in_planes must match planes * EXPANSION = 64 * 4 = 256
         let block = Bottleneck::<f32>::new(256, 64, 1).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 256 * 8 * 8], [1, 256, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 256 * 8 * 8], [1, 256, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 256, 8, 8]);
     }
@@ -750,7 +750,7 @@ mod tests {
         // First block in layer1: in_planes=64, planes=64
         // Output channels = 64 * 4 = 256.
         let block = Bottleneck::<f32>::new(64, 64, 1).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 64 * 8 * 8], [1, 64, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 64 * 8 * 8], [1, 64, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 256, 8, 8]);
         assert!(block.downsample.is_some()); // 64 != 256
@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn test_bottleneck_downsample() {
         let block = Bottleneck::<f32>::new(256, 128, 2).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 256 * 8 * 8], [1, 256, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 256 * 8 * 8], [1, 256, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 512, 4, 4]);
     }
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn test_resnet18_output_shape() {
         let model = resnet18::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn test_resnet34_output_shape() {
         let model = resnet34::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn test_resnet50_output_shape() {
         let model = resnet50::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn test_gradient_flow_through_basic_block() {
         let block = BasicBlock::<f32>::new(4, 4, 1).unwrap();
-        let input = leaf_4d(&vec![0.5; 1 * 4 * 4 * 4], [1, 4, 4, 4], true);
+        let input = leaf_4d(&vec![0.5; 4 * 4 * 4], [1, 4, 4, 4], true);
 
         let output = block.forward(&input).unwrap();
 
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn test_gradient_flow_through_bottleneck() {
         let block = Bottleneck::<f32>::new(4, 2, 1).unwrap();
-        let input = leaf_4d(&vec![0.5; 1 * 4 * 4 * 4], [1, 4, 4, 4], true);
+        let input = leaf_4d(&vec![0.5; 4 * 4 * 4], [1, 4, 4, 4], true);
 
         let output = block.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 8, 4, 4]); // expansion = 4, planes = 2

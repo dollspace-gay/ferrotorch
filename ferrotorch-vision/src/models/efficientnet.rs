@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn test_conv_block_forward_shape() {
         let block = ConvBlock::<f32>::new(16, 24, 3, 2, 1).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 16 * 8 * 8], [1, 16, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 16 * 8 * 8], [1, 16, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 24, 4, 4]);
     }
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn test_conv_block_residual_forward() {
         let block = ConvBlock::<f32>::new(16, 16, 3, 1, 1).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 16 * 8 * 8], [1, 16, 8, 8], false);
+        let input = leaf_4d(&vec![0.1; 16 * 8 * 8], [1, 16, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 16, 8, 8]);
     }
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn test_conv_block_5x5_forward_shape() {
         let block = ConvBlock::<f32>::new(24, 40, 5, 2, 2).unwrap();
-        let input = leaf_4d(&vec![0.1; 1 * 24 * 16 * 16], [1, 24, 16, 16], false);
+        let input = leaf_4d(&vec![0.1; 24 * 16 * 16], [1, 24, 16, 16], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 40, 8, 8]);
     }
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn test_efficientnet_b0_output_shape() {
         let model = efficientnet_b0::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -614,7 +614,7 @@ mod tests {
         let block = ConvBlock::<f32>::new(4, 4, 3, 1, 1).unwrap();
         assert!(block.use_residual);
 
-        let input = leaf_4d(&vec![0.5; 1 * 4 * 4 * 4], [1, 4, 4, 4], true);
+        let input = leaf_4d(&vec![0.5; 4 * 4 * 4], [1, 4, 4, 4], true);
         let output = block.forward(&input).unwrap();
 
         let loss = ferrotorch_core::grad_fns::reduction::sum(&output).unwrap();

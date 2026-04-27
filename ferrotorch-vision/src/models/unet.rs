@@ -500,16 +500,6 @@ impl<T: Float> Module<T> for UNet<T> {
 }
 
 // ===========================================================================
-// Convenience constructor
-// ===========================================================================
-
-/// Construct a U-Net model for semantic segmentation.
-///
-/// * `num_classes` -- number of output classes (channel dimension of output).
-///
-/// Input: `[B, 3, H, W]` where `H` and `W` are divisible by 16.
-/// Output: `[B, num_classes, H, W]`.
-// ===========================================================================
 // IntermediateFeatures — CL-499
 // ===========================================================================
 
@@ -572,6 +562,12 @@ impl<T: Float> crate::models::feature_extractor::IntermediateFeatures<T> for UNe
     }
 }
 
+/// Construct a U-Net model for semantic segmentation.
+///
+/// * `num_classes` -- number of output classes (channel dimension of output).
+///
+/// Input: `[B, 3, H, W]` where `H` and `W` are divisible by 16.
+/// Output: `[B, num_classes, H, W]`.
 pub fn unet<T: Float>(num_classes: usize) -> FerrotorchResult<UNet<T>> {
     UNet::new(num_classes)
 }
@@ -629,7 +625,7 @@ mod tests {
     #[test]
     fn test_encoder_block_shape() {
         let block = EncoderBlock::<f32>::new(3, 64).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 16 * 16], [1, 3, 16, 16], false);
+        let input = leaf_4d(&vec![0.01; 3 * 16 * 16], [1, 3, 16, 16], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 64, 16, 16]);
     }
@@ -641,8 +637,8 @@ mod tests {
     #[test]
     fn test_decoder_block_shape() {
         let block = DecoderBlock::<f32>::new(128, 64).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 128 * 4 * 4], [1, 128, 4, 4], false);
-        let skip = leaf_4d(&vec![0.01; 1 * 64 * 8 * 8], [1, 64, 8, 8], false);
+        let input = leaf_4d(&vec![0.01; 128 * 4 * 4], [1, 128, 4, 4], false);
+        let skip = leaf_4d(&vec![0.01; 64 * 8 * 8], [1, 64, 8, 8], false);
         let output = no_grad(|| block.forward(&input, &skip).unwrap());
         assert_eq!(output.shape(), &[1, 64, 8, 8]);
     }
@@ -654,7 +650,7 @@ mod tests {
     #[test]
     fn test_unet_forward_shape() {
         let model = unet::<f32>(21).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 256 * 256], [1, 3, 256, 256], false);
+        let input = leaf_4d(&vec![0.01; 3 * 256 * 256], [1, 3, 256, 256], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 21, 256, 256]);
     }
@@ -663,7 +659,7 @@ mod tests {
     fn test_unet_forward_small() {
         // Smallest valid spatial size: 16x16 (4 halvings -> 1x1).
         let model = unet::<f32>(2).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 16 * 16], [1, 3, 16, 16], false);
+        let input = leaf_4d(&vec![0.01; 3 * 16 * 16], [1, 3, 16, 16], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 2, 16, 16]);
     }
@@ -772,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_gradient_flow_through_upsample() {
-        let input = leaf_4d(&vec![0.5; 1 * 4 * 4 * 4], [1, 4, 4, 4], true);
+        let input = leaf_4d(&vec![0.5; 4 * 4 * 4], [1, 4, 4, 4], true);
         let output = upsample_nearest_2x(&input).unwrap();
         let loss = ferrotorch_core::grad_fns::reduction::sum(&output).unwrap();
         loss.backward().unwrap();

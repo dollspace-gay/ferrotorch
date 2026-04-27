@@ -178,7 +178,7 @@ pub fn grad<T: Float>(
             let input_grads = grad_fn.backward(&grad_output)?;
             let fn_inputs = grad_fn.inputs();
 
-            for (input, maybe_grad) in fn_inputs.iter().zip(input_grads.into_iter()) {
+            for (input, maybe_grad) in fn_inputs.iter().zip(input_grads) {
                 if let Some(ig) = maybe_grad {
                     if input.requires_grad() {
                         // When create_graph=true, ensure the gradient tensor

@@ -2933,6 +2933,7 @@ impl<T: Float> ConvTranspose3d<T> {
 ///
 /// Given input `[B, C, D, H, W]`, produces `[B, C, D_up, H_up, W_up]` where
 /// `D_up = (D - 1) * stride_d + 1` (and analogously for H, W).
+#[allow(clippy::too_many_arguments)]
 fn stride_insert_zeros_3d<T: Float>(
     input: &[T],
     batch: usize,
@@ -3484,7 +3485,7 @@ mod tests {
         // Input: [1, 1, 5, 5], kernel 3x3, stride 1, padding 0
         // H_out = (5 - 3) / 1 + 1 = 3, W_out = 3
         let conv = Conv2d::<f32>::new(1, 1, (3, 3), (1, 1), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 25], &[1, 1, 5, 5]);
+        let input = t(&[0.0; 25], &[1, 1, 5, 5]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 3, 3]);
     }
@@ -3504,7 +3505,7 @@ mod tests {
         // Input: [1, 1, 6, 6], kernel 3x3, stride 2, padding 0
         // H_out = (6 - 3) / 2 + 1 = 2
         let conv = Conv2d::<f32>::new(1, 4, (3, 3), (2, 2), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 36], &[1, 1, 6, 6]);
+        let input = t(&[0.0; 36], &[1, 1, 6, 6]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 4, 2, 2]);
     }
@@ -3604,8 +3605,8 @@ mod tests {
     #[test]
     fn test_backward_produces_correct_shapes() {
         // We manually invoke the backward function and check shapes.
-        let weight_data = vec![1.0f32; 2 * 1 * 3 * 3]; // [2, 1, 3, 3]
-        let input_data = vec![1.0f32; 1 * 1 * 5 * 5]; // [1, 1, 5, 5]
+        let weight_data = vec![1.0f32; 2 * 3 * 3]; // [2, 1, 3, 3]
+        let input_data = vec![1.0f32; 5 * 5]; // [1, 1, 5, 5]
         let bias_data = vec![0.0f32; 2];
 
         let weight_param = Parameter::from_slice(&weight_data, &[2, 1, 3, 3]).unwrap();
@@ -3632,7 +3633,7 @@ mod tests {
         assert_eq!(output.grad_fn().unwrap().name(), "Conv2dBackward");
 
         // Construct a grad_output of the right shape.
-        let grad_output = t(&vec![1.0; 2 * 3 * 3], &[1, 2, 3, 3]);
+        let grad_output = t(&[1.0; 2 * 3 * 3], &[1, 2, 3, 3]);
         let grads = output.grad_fn().unwrap().backward(&grad_output).unwrap();
 
         // grad_input shape should be [1, 1, 5, 5]
@@ -3706,7 +3707,7 @@ mod tests {
     #[test]
     fn test_channel_mismatch() {
         let conv = Conv2d::<f32>::new(3, 1, (3, 3), (1, 1), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 5 * 5], &[1, 1, 5, 5]);
+        let input = t(&[0.0; 5 * 5], &[1, 1, 5, 5]);
         assert!(conv.forward(&input).is_err());
     }
 
@@ -3872,7 +3873,7 @@ mod tests {
         // Input: [1, 1, 10], kernel 3, stride 1, padding 0
         // L_out = (10 - 3) / 1 + 1 = 8
         let conv = Conv1d::<f32>::new(1, 4, 3, 1, 0, false).unwrap();
-        let input = t(&vec![0.0; 10], &[1, 1, 10]);
+        let input = t(&[0.0; 10], &[1, 1, 10]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 4, 8]);
     }
@@ -3892,7 +3893,7 @@ mod tests {
         // Input: [1, 1, 10], kernel 3, stride 2, padding 0
         // L_out = (10 - 3) / 2 + 1 = 4
         let conv = Conv1d::<f32>::new(1, 2, 3, 2, 0, false).unwrap();
-        let input = t(&vec![0.0; 10], &[1, 1, 10]);
+        let input = t(&[0.0; 10], &[1, 1, 10]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 2, 4]);
     }
@@ -3996,7 +3997,7 @@ mod tests {
     #[test]
     fn test_conv1d_channel_mismatch() {
         let conv = Conv1d::<f32>::new(3, 1, 3, 1, 0, false).unwrap();
-        let input = t(&vec![0.0; 10], &[1, 1, 10]);
+        let input = t(&[0.0; 10], &[1, 1, 10]);
         assert!(conv.forward(&input).is_err());
     }
 
@@ -4038,7 +4039,7 @@ mod tests {
         // H_out = (3 - 1) * 1 - 0 + 3 + 0 = 5
         let conv =
             ConvTranspose2d::<f32>::new(1, 1, (3, 3), (1, 1), (0, 0), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 9], &[1, 1, 3, 3]);
+        let input = t(&[0.0; 9], &[1, 1, 3, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 5, 5]);
     }
@@ -4049,7 +4050,7 @@ mod tests {
         // H_out = (2 - 1) * 2 - 0 + 3 + 0 = 5
         let conv =
             ConvTranspose2d::<f32>::new(1, 1, (3, 3), (2, 2), (0, 0), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 4], &[1, 1, 2, 2]);
+        let input = t(&[0.0; 4], &[1, 1, 2, 2]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 5, 5]);
     }
@@ -4060,7 +4061,7 @@ mod tests {
         // H_out = (3 - 1) * 2 - 2 + 3 + 0 = 5
         let conv =
             ConvTranspose2d::<f32>::new(1, 1, (3, 3), (2, 2), (1, 1), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 9], &[1, 1, 3, 3]);
+        let input = t(&[0.0; 9], &[1, 1, 3, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 5, 5]);
     }
@@ -4071,7 +4072,7 @@ mod tests {
         // H_out = (3 - 1) * 2 - 2 + 3 + 1 = 6
         let conv =
             ConvTranspose2d::<f32>::new(1, 1, (3, 3), (2, 2), (1, 1), (1, 1), false).unwrap();
-        let input = t(&vec![0.0; 9], &[1, 1, 3, 3]);
+        let input = t(&[0.0; 9], &[1, 1, 3, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 6, 6]);
     }
@@ -4087,7 +4088,7 @@ mod tests {
         // So a 4x4 input becomes 8x8 — doubling spatial dims.
         let conv =
             ConvTranspose2d::<f32>::new(1, 1, (2, 2), (2, 2), (0, 0), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 4 * 4], &[1, 1, 4, 4]);
+        let input = t(&[0.0; 4 * 4], &[1, 1, 4, 4]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 8, 8]);
     }
@@ -4257,7 +4258,7 @@ mod tests {
     fn test_conv_transpose2d_channel_mismatch() {
         let conv =
             ConvTranspose2d::<f32>::new(3, 1, (3, 3), (1, 1), (0, 0), (0, 0), false).unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 5 * 5], &[1, 1, 5, 5]);
+        let input = t(&[0.0; 5 * 5], &[1, 1, 5, 5]);
         assert!(conv.forward(&input).is_err());
     }
 
@@ -4295,7 +4296,7 @@ mod tests {
         // Input: [1, 1, 5, 5, 5], kernel 3x3x3, stride 1, padding 0
         // D_out = (5 - 3) / 1 + 1 = 3
         let conv = Conv3d::<f32>::new(1, 4, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 5 * 5 * 5], &[1, 1, 5, 5, 5]);
+        let input = t(&vec![0.0; 5 * 5 * 5], &[1, 1, 5, 5, 5]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 4, 3, 3, 3]);
     }
@@ -4315,7 +4316,7 @@ mod tests {
         // Input: [1, 1, 6, 6, 6], kernel 3x3x3, stride 2, padding 0
         // D_out = (6 - 3) / 2 + 1 = 2
         let conv = Conv3d::<f32>::new(1, 4, (3, 3, 3), (2, 2, 2), (0, 0, 0), false).unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 6 * 6 * 6], &[1, 1, 6, 6, 6]);
+        let input = t(&vec![0.0; 6 * 6 * 6], &[1, 1, 6, 6, 6]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 4, 2, 2, 2]);
     }
@@ -4408,8 +4409,8 @@ mod tests {
 
     #[test]
     fn test_conv3d_backward_produces_correct_shapes() {
-        let weight_data = vec![1.0f32; 2 * 1 * 3 * 3 * 3]; // [2, 1, 3, 3, 3]
-        let input_data = vec![1.0f32; 1 * 1 * 5 * 5 * 5]; // [1, 1, 5, 5, 5]
+        let weight_data = vec![1.0f32; 2 * 3 * 3 * 3]; // [2, 1, 3, 3, 3]
+        let input_data = vec![1.0f32; 5 * 5 * 5]; // [1, 1, 5, 5, 5]
         let bias_data = vec![0.0f32; 2];
 
         let conv = Conv3d {
@@ -4447,14 +4448,14 @@ mod tests {
     #[test]
     fn test_conv3d_invalid_ndim() {
         let conv = Conv3d::<f32>::new(1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).unwrap();
-        let input = t(&vec![0.0; 25], &[1, 1, 5, 5]);
+        let input = t(&[0.0; 25], &[1, 1, 5, 5]);
         assert!(conv.forward(&input).is_err());
     }
 
     #[test]
     fn test_conv3d_channel_mismatch() {
         let conv = Conv3d::<f32>::new(3, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), false).unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 5 * 5 * 5], &[1, 1, 5, 5, 5]);
+        let input = t(&vec![0.0; 5 * 5 * 5], &[1, 1, 5, 5, 5]);
         assert!(conv.forward(&input).is_err());
     }
 
@@ -4504,7 +4505,7 @@ mod tests {
         // Input: [1, 1, 5], kernel 3, stride 1, padding 0, output_padding 0
         // L_out = (5 - 1) * 1 - 0 + 3 + 0 = 7
         let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 1, 0, 0, false).unwrap();
-        let input = t(&vec![0.0; 5], &[1, 1, 5]);
+        let input = t(&[0.0; 5], &[1, 1, 5]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 7]);
     }
@@ -4514,7 +4515,7 @@ mod tests {
         // Input: [1, 1, 3], kernel 3, stride 2, padding 0, output_padding 0
         // L_out = (3 - 1) * 2 - 0 + 3 + 0 = 7
         let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 2, 0, 0, false).unwrap();
-        let input = t(&vec![0.0; 3], &[1, 1, 3]);
+        let input = t(&[0.0; 3], &[1, 1, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 7]);
     }
@@ -4524,7 +4525,7 @@ mod tests {
         // Input: [1, 1, 5], kernel 3, stride 2, padding 1, output_padding 0
         // L_out = (5 - 1) * 2 - 2 + 3 + 0 = 9
         let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 2, 1, 0, false).unwrap();
-        let input = t(&vec![0.0; 5], &[1, 1, 5]);
+        let input = t(&[0.0; 5], &[1, 1, 5]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 9]);
     }
@@ -4534,7 +4535,7 @@ mod tests {
         // Input: [1, 1, 5], kernel 3, stride 2, padding 1, output_padding 1
         // L_out = (5 - 1) * 2 - 2 + 3 + 1 = 10
         let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 2, 1, 1, false).unwrap();
-        let input = t(&vec![0.0; 5], &[1, 1, 5]);
+        let input = t(&[0.0; 5], &[1, 1, 5]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 10]);
     }
@@ -4642,7 +4643,7 @@ mod tests {
 
     #[test]
     fn test_conv_transpose1d_backward_produces_gradients() {
-        let weight_data = vec![1.0f32; 1 * 1 * 3]; // [1, 1, 3]
+        let weight_data = vec![1.0f32; 3]; // [1, 1, 3]
         let bias_data = vec![0.0f32; 1];
 
         let conv = ConvTranspose1d {
@@ -4664,7 +4665,7 @@ mod tests {
         assert!(output.grad_fn().is_some());
         assert_eq!(output.grad_fn().unwrap().name(), "ConvTranspose1dBackward");
 
-        let grad_output = t(&vec![1.0; 5], &[1, 1, 5]);
+        let grad_output = t(&[1.0; 5], &[1, 1, 5]);
         let grads = output.grad_fn().unwrap().backward(&grad_output).unwrap();
 
         // grad_input shape: [1, 1, 3]
@@ -4685,14 +4686,14 @@ mod tests {
     #[test]
     fn test_conv_transpose1d_invalid_ndim() {
         let conv = ConvTranspose1d::<f32>::new(1, 1, 3, 1, 0, 0, false).unwrap();
-        let input = t(&vec![0.0; 4], &[1, 1, 2, 2]);
+        let input = t(&[0.0; 4], &[1, 1, 2, 2]);
         assert!(conv.forward(&input).is_err());
     }
 
     #[test]
     fn test_conv_transpose1d_channel_mismatch() {
         let conv = ConvTranspose1d::<f32>::new(3, 1, 3, 1, 0, 0, false).unwrap();
-        let input = t(&vec![0.0; 10], &[1, 1, 10]);
+        let input = t(&[0.0; 10], &[1, 1, 10]);
         assert!(conv.forward(&input).is_err());
     }
 
@@ -4731,7 +4732,7 @@ mod tests {
             1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 27], &[1, 1, 3, 3, 3]);
+        let input = t(&[0.0; 27], &[1, 1, 3, 3, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 5, 5, 5]);
     }
@@ -4744,7 +4745,7 @@ mod tests {
             1, 1, (3, 3, 3), (2, 2, 2), (0, 0, 0), (0, 0, 0), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 8], &[1, 1, 2, 2, 2]);
+        let input = t(&[0.0; 8], &[1, 1, 2, 2, 2]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 5, 5, 5]);
     }
@@ -4757,7 +4758,7 @@ mod tests {
             1, 1, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 27], &[1, 1, 3, 3, 3]);
+        let input = t(&[0.0; 27], &[1, 1, 3, 3, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 5, 5, 5]);
     }
@@ -4770,7 +4771,7 @@ mod tests {
             1, 1, (3, 3, 3), (2, 2, 2), (1, 1, 1), (1, 1, 1), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 27], &[1, 1, 3, 3, 3]);
+        let input = t(&[0.0; 27], &[1, 1, 3, 3, 3]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 6, 6, 6]);
     }
@@ -4787,7 +4788,7 @@ mod tests {
             1, 1, (2, 2, 2), (2, 2, 2), (0, 0, 0), (0, 0, 0), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 4 * 4 * 4], &[1, 1, 4, 4, 4]);
+        let input = t(&vec![0.0; 4 * 4 * 4], &[1, 1, 4, 4, 4]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 8, 8, 8]);
     }
@@ -4851,7 +4852,7 @@ mod tests {
 
     #[test]
     fn test_conv_transpose3d_backward_produces_gradients() {
-        let weight_data = vec![1.0f32; 1 * 1 * 2 * 2 * 2]; // [1, 1, 2, 2, 2]
+        let weight_data = vec![1.0f32; 2 * 2 * 2]; // [1, 1, 2, 2, 2]
         let bias_data = vec![0.0f32; 1];
 
         let conv = ConvTranspose3d {
@@ -4867,13 +4868,13 @@ mod tests {
         };
 
         // D_out = (2-1)*1 - 0 + 2 + 0 = 3
-        let input = leaf(&vec![1.0f32; 8], &[1, 1, 2, 2, 2]);
+        let input = leaf(&[1.0f32; 8], &[1, 1, 2, 2, 2]);
         let output = conv.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 3, 3, 3]);
         assert!(output.grad_fn().is_some());
         assert_eq!(output.grad_fn().unwrap().name(), "ConvTranspose3dBackward");
 
-        let grad_output = t(&vec![1.0; 27], &[1, 1, 3, 3, 3]);
+        let grad_output = t(&[1.0; 27], &[1, 1, 3, 3, 3]);
         let grads = output.grad_fn().unwrap().backward(&grad_output).unwrap();
 
         assert!(grads[0].is_some());
@@ -4894,7 +4895,7 @@ mod tests {
             1, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 25], &[1, 1, 5, 5]);
+        let input = t(&[0.0; 25], &[1, 1, 5, 5]);
         assert!(conv.forward(&input).is_err());
     }
 
@@ -4904,7 +4905,7 @@ mod tests {
             3, 1, (3, 3, 3), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
         )
         .unwrap();
-        let input = t(&vec![0.0; 1 * 1 * 5 * 5 * 5], &[1, 1, 5, 5, 5]);
+        let input = t(&vec![0.0; 5 * 5 * 5], &[1, 1, 5, 5, 5]);
         assert!(conv.forward(&input).is_err());
     }
 

@@ -61,6 +61,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `Tensor::update_storage` leaked the previous `TensorStorage` on every call (#524). The function used `std::ptr::write`, which overwrites the target as uninitialised memory and skips the old value's destructor. AdamW's foreach path calls `update_storage` once per parameter per step, so every training step on GPU leaked the replaced weight storage — including the `GpuBufferHandle` → `CudaBuffer` → pooled `CudaSlice` underneath. Replacing with `std::ptr::replace` + explicit `drop(old)` restores correct single-ownership semantics. Observed effect on `train_hidden_predictor_8b`: GPU VRAM grew ~750 MB/s and OOM'd a 24 GB card before epoch 2 finished; after the fix memory stays flat at ~1 GB across 6 epochs. 1009 `ferrotorch-core` + 322 `ferrotorch-optim` tests still pass.
 
 ### Added
+- Add JSON-schema constrained-decoding logits processor (ferrotorch-llama::grammar::JsonSchemaProcessor) (#554)
+- Add Llama-3.3-70B-Instruct support to ferrotorch-llama (architecture + weight loader + quantization) (#553)
 - `ferrotorch-paged`: details in private repo
 - GPU backward for `abs`, plus on-device `fill` primitive used by `sum` / `mean` backward (#524). Every missing GPU grad that blocked pure-GPU training got a real kernel instead of a CPU round-trip. `abs_backward`: new PTX kernel `abs_backward_kernel` computing `out[i] = input[i] > 0 ? grad[i] : (input[i] < 0 ? -grad[i] : 0)` via `setp.lt/.gt.f32` + `selp.f32` — wired through `GpuBackend::abs_backward_f32` / `_f64` and consumed by `AbsBackward::backward`, mirroring the existing `ReluBackward` / `SigmoidBackward` dispatch. `fill_f32`: new PTX kernel `fill_f32_kernel` that broadcasts a single `.f32` kernel arg to `n` elements of a freshly-allocated `CudaBuffer<f32>`, exposed as `gpu_fill_f32(n, scalar, device)` and `GpuBackend::fill_f32`. `SumBackward` and `MeanBackward` now dispatch to `fill_f32`/`_f64` when the input lives on CUDA, eliminating the legacy `vec![go; numel].to(device)` CPU→GPU upload per backward step (on BCE+Linear at batch 128 / 1920 blocks that upload was ~1 MB per call, ~500 MB per epoch). Combined with the `update_storage` leak fix and the pre-existing `relu`/`sigmoid`/`exp`/`log`/`mul`/`add`/`sub`/`neg` GPU backward paths, the full BCE-with-logits + 2-layer MLP autograd chain now stays on-device end-to-end.
 - `ferrotorch-paged`: details in private repo
@@ -233,6 +235,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - M≤4 cuBLAS bypass: route vector-matrix multiplies through PTX `small_matmul` kernel instead of cuBLAS SGEMM
 
 ### Changed
+- pin_hot_blocks must stop when VRAM budget is exhausted, not panic (#543)
 - Sharded safetensors loader (index.json + multi-file) (#507)
 - HF config.json parser (#508)
 - Clean up pre-existing clippy errors (approx_constant, erasing_op) (#517)

@@ -94,7 +94,7 @@ where
         for elem_idx in 0..n {
             // f(x + eps)
             let mut perturbed_plus = input_data.clone();
-            perturbed_plus[elem_idx] = perturbed_plus[elem_idx] + eps_t;
+            perturbed_plus[elem_idx] += eps_t;
 
             // f(x - eps)
             let mut perturbed_minus = input_data.clone();

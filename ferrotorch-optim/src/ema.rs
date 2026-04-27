@@ -363,7 +363,7 @@ mod tests {
         // decay = 0.9
         // shadow = 0.9 * [1, 2] + 0.1 * [3, 4] = [0.9+0.3, 1.8+0.4] = [1.2, 2.2]
         let p = Parameter::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
-        let mut ema = ExponentialMovingAverage::new(&[p.clone()], 0.9);
+        let mut ema = ExponentialMovingAverage::new(std::slice::from_ref(&p), 0.9);
 
         // Simulate optimizer step changing params.
         ferrotorch_core::no_grad(|| unsafe { p.tensor().update_data(&[3.0f32, 4.0]) }).unwrap();
@@ -379,12 +379,12 @@ mod tests {
     #[test]
     fn test_ema_two_updates() {
         let p = Parameter::from_slice(&[0.0f32], &[1]).unwrap();
-        let mut ema = ExponentialMovingAverage::new(&[p.clone()], 0.5);
+        let mut ema = ExponentialMovingAverage::new(std::slice::from_ref(&p), 0.5);
 
         // Update 1: param = 1.0
         // shadow = 0.5 * 0.0 + 0.5 * 1.0 = 0.5
         ferrotorch_core::no_grad(|| unsafe { p.tensor().update_data(&[1.0f32]) }).unwrap();
-        ema.update(&[p.clone()]).unwrap();
+        ema.update(std::slice::from_ref(&p)).unwrap();
         assert!((ema.shadow_params()[0][0] - 0.5).abs() < 1e-6);
 
         // Update 2: param = 1.0
@@ -401,21 +401,21 @@ mod tests {
     #[test]
     fn test_ema_apply_and_restore() {
         let p = Parameter::from_slice(&[10.0f32, 20.0], &[2]).unwrap();
-        let mut ema = ExponentialMovingAverage::new(&[p.clone()], 0.5);
+        let mut ema = ExponentialMovingAverage::new(std::slice::from_ref(&p), 0.5);
 
         // Update once with param = [0.0, 0.0]
         ferrotorch_core::no_grad(|| unsafe { p.tensor().update_data(&[0.0f32, 0.0]) }).unwrap();
-        ema.update(&[p.clone()]).unwrap();
+        ema.update(std::slice::from_ref(&p)).unwrap();
         // shadow = 0.5 * [10, 20] + 0.5 * [0, 0] = [5, 10]
 
         // Apply shadow — params should become [5, 10].
-        ema.apply_shadow(&[p.clone()]).unwrap();
+        ema.apply_shadow(std::slice::from_ref(&p)).unwrap();
         let data = p.data().unwrap();
         assert!((data[0] - 5.0).abs() < 1e-6);
         assert!((data[1] - 10.0).abs() < 1e-6);
 
         // Restore — params should go back to [0, 0].
-        ema.restore(&[p.clone()]).unwrap();
+        ema.restore(std::slice::from_ref(&p)).unwrap();
         let data = p.data().unwrap();
         assert!((data[0] - 0.0).abs() < 1e-6);
         assert!((data[1] - 0.0).abs() < 1e-6);
@@ -425,7 +425,7 @@ mod tests {
     #[should_panic(expected = "restore() called without a prior apply_shadow")]
     fn test_ema_restore_without_apply_panics() {
         let p = Parameter::from_slice(&[1.0f32], &[1]).unwrap();
-        let mut ema = ExponentialMovingAverage::new(&[p.clone()], 0.99);
+        let mut ema = ExponentialMovingAverage::new(std::slice::from_ref(&p), 0.99);
         ema.restore(&[p]).unwrap();
     }
 
@@ -436,11 +436,11 @@ mod tests {
     #[test]
     fn test_ema_decay_warmup() {
         let p = Parameter::from_slice(&[0.0f32], &[1]).unwrap();
-        let mut ema = ExponentialMovingAverage::new(&[p.clone()], 0.999).with_decay_warmup(true);
+        let mut ema = ExponentialMovingAverage::new(std::slice::from_ref(&p), 0.999).with_decay_warmup(true);
 
         // Step 0: effective_decay = min(0.999, 1/10) = 0.1
         ferrotorch_core::no_grad(|| unsafe { p.tensor().update_data(&[10.0f32]) }).unwrap();
-        ema.update(&[p.clone()]).unwrap();
+        ema.update(std::slice::from_ref(&p)).unwrap();
 
         // shadow = 0.1 * 0.0 + 0.9 * 10.0 = 9.0
         let shadow = ema.shadow_params()[0][0];
@@ -450,7 +450,7 @@ mod tests {
         );
 
         // Step 1: effective_decay = min(0.999, 2/11) ≈ 0.1818
-        ema.update(&[p.clone()]).unwrap();
+        ema.update(std::slice::from_ref(&p)).unwrap();
         // shadow = 0.1818 * 9.0 + 0.8182 * 10.0 ≈ 1.636 + 8.182 = 9.818
         let shadow = ema.shadow_params()[0][0];
         assert!(
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn test_ema_decay_one_freezes_shadow() {
         let p = Parameter::from_slice(&[5.0f32], &[1]).unwrap();
-        let mut ema = ExponentialMovingAverage::new(&[p.clone()], 1.0);
+        let mut ema = ExponentialMovingAverage::new(std::slice::from_ref(&p), 1.0);
 
         ferrotorch_core::no_grad(|| unsafe { p.tensor().update_data(&[100.0f32]) }).unwrap();
         ema.update(&[p]).unwrap();
@@ -503,9 +503,9 @@ mod tests {
         let p_legacy = Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
         let p_foreach = Parameter::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
 
-        let mut legacy = ExponentialMovingAverage::new(&[p_legacy.clone()], 0.9);
+        let mut legacy = ExponentialMovingAverage::new(std::slice::from_ref(&p_legacy), 0.9);
         let mut foreach =
-            ExponentialMovingAverage::new(&[p_foreach.clone()], 0.9).with_foreach(&[p_foreach.clone()]);
+            ExponentialMovingAverage::new(std::slice::from_ref(&p_foreach), 0.9).with_foreach(std::slice::from_ref(&p_foreach));
 
         // Simulate parameter updates across 5 steps with varying values.
         for step in 0..5 {
@@ -520,8 +520,8 @@ mod tests {
             })
             .unwrap();
 
-            legacy.update(&[p_legacy.clone()]).unwrap();
-            foreach.update(&[p_foreach.clone()]).unwrap();
+            legacy.update(std::slice::from_ref(&p_legacy)).unwrap();
+            foreach.update(std::slice::from_ref(&p_foreach)).unwrap();
         }
 
         let l = legacy.shadow_values(0).unwrap();
@@ -539,11 +539,11 @@ mod tests {
         let p_legacy = Parameter::from_slice(&[0.0f32, 0.0, 0.0], &[3]).unwrap();
         let p_foreach = Parameter::from_slice(&[0.0f32, 0.0, 0.0], &[3]).unwrap();
 
-        let mut legacy = ExponentialMovingAverage::new(&[p_legacy.clone()], 0.999)
+        let mut legacy = ExponentialMovingAverage::new(std::slice::from_ref(&p_legacy), 0.999)
             .with_decay_warmup(true);
-        let mut foreach = ExponentialMovingAverage::new(&[p_foreach.clone()], 0.999)
+        let mut foreach = ExponentialMovingAverage::new(std::slice::from_ref(&p_foreach), 0.999)
             .with_decay_warmup(true)
-            .with_foreach(&[p_foreach.clone()]);
+            .with_foreach(std::slice::from_ref(&p_foreach));
 
         for step in 0..8 {
             let v = 10.0 + step as f32;
@@ -557,8 +557,8 @@ mod tests {
             })
             .unwrap();
 
-            legacy.update(&[p_legacy.clone()]).unwrap();
-            foreach.update(&[p_foreach.clone()]).unwrap();
+            legacy.update(std::slice::from_ref(&p_legacy)).unwrap();
+            foreach.update(std::slice::from_ref(&p_foreach)).unwrap();
         }
 
         let l = legacy.shadow_values(0).unwrap();
@@ -577,20 +577,20 @@ mod tests {
     fn test_ema_foreach_apply_and_restore() {
         let p = Parameter::from_slice(&[10.0f32, 20.0], &[2]).unwrap();
         let mut ema =
-            ExponentialMovingAverage::new(&[p.clone()], 0.5).with_foreach(&[p.clone()]);
+            ExponentialMovingAverage::new(std::slice::from_ref(&p), 0.5).with_foreach(std::slice::from_ref(&p));
 
         // Update once with param = [0.0, 0.0].
         ferrotorch_core::no_grad(|| unsafe { p.tensor().update_data(&[0.0f32, 0.0]) })
             .unwrap();
-        ema.update(&[p.clone()]).unwrap();
+        ema.update(std::slice::from_ref(&p)).unwrap();
         // shadow = 0.5 * [10, 20] + 0.5 * [0, 0] = [5, 10]
 
-        ema.apply_shadow(&[p.clone()]).unwrap();
+        ema.apply_shadow(std::slice::from_ref(&p)).unwrap();
         let data = p.data().unwrap();
         assert!((data[0] - 5.0).abs() < 1e-6);
         assert!((data[1] - 10.0).abs() < 1e-6);
 
-        ema.restore(&[p.clone()]).unwrap();
+        ema.restore(std::slice::from_ref(&p)).unwrap();
         let data = p.data().unwrap();
         assert!((data[0] - 0.0).abs() < 1e-6);
         assert!((data[1] - 0.0).abs() < 1e-6);

@@ -723,7 +723,7 @@ mod tests {
         // Should still be a valid ZIP with data.pkl.
         let file = std::fs::File::open(&path).unwrap();
         let archive = zip::ZipArchive::new(file).unwrap();
-        assert!(archive.len() >= 1); // at least data.pkl
+        assert!(!archive.is_empty()); // at least data.pkl
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -446,7 +446,7 @@ impl<T: Float> crate::tensor::GradFn<T> for NarrowBackward<T> {
         let ndim = in_shape.len();
         let out_numel = grad_out_data.len();
 
-        for flat in 0..out_numel {
+        for (flat, &grad_val) in grad_out_data[..out_numel].iter().enumerate() {
             // Decompose flat index to output coords.
             let mut rem = flat;
             let mut in_flat: usize = 0;
@@ -456,7 +456,7 @@ impl<T: Float> crate::tensor::GradFn<T> for NarrowBackward<T> {
                 let in_coord = if d == dim { coord + start } else { coord };
                 in_flat += in_coord * in_strides[d] as usize;
             }
-            grad_data[in_flat] = grad_out_data[flat];
+            grad_data[in_flat] = grad_val;
         }
 
         let device = self.input.device();
@@ -882,7 +882,7 @@ mod tests {
         // element [0,0,0] of output = element [0,0,0] of input = 1.0
         assert_eq!(bdata[0], 1.0);
         // element [1,0,0] of output = input[0,0,1] = 2.0
-        assert_eq!(bdata[1 * 2 * 3], 2.0);
+        assert_eq!(bdata[2 * 3], 2.0);
     }
 
     #[test]
@@ -996,6 +996,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_split_backward_simple() {
         // x = [1, 2, 3, 4, 5, 6], split into [1,2,3] and [4,5,6].
         // loss = sum(chunk0) + 2*sum(chunk1)

@@ -56,7 +56,7 @@ pub fn fake_quantize_differentiable<T: Float>(
     qmax: i32,
 ) -> FerrotorchResult<Tensor<T>> {
     use crate::error::FerrotorchError;
-    if !(scale > 0.0) {
+    if scale.is_nan() || scale <= 0.0 {
         return Err(FerrotorchError::InvalidArgument {
             message: format!(
                 "fake_quantize_differentiable: scale must be > 0, got {scale}"

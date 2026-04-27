@@ -1460,7 +1460,7 @@ mod tests {
     #[test]
     fn test_zero_pad3d_shape() {
         let pad = ZeroPad3d::<f32>::new((1, 1, 1, 1, 1, 1));
-        let input = t(&vec![1.0; 2 * 2 * 2], &[1, 1, 2, 2, 2]);
+        let input = t(&[1.0; 2 * 2 * 2], &[1, 1, 2, 2, 2]);
         let output = pad.forward(&input).unwrap();
         assert_eq!(output.shape(), &[1, 1, 4, 4, 4]);
     }

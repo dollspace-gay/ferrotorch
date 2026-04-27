@@ -220,7 +220,7 @@ mod tests {
 
         assert!(!is_autocast_enabled());
 
-        let was_enabled = ctx.autocast_forward(|| is_autocast_enabled());
+        let was_enabled = ctx.autocast_forward(is_autocast_enabled);
 
         assert!(
             was_enabled,
@@ -233,7 +233,7 @@ mod tests {
     fn test_autocast_forward_sets_dtype() {
         let ctx = AmpContext::<f32>::new(AutocastDtype::BF16, GradScalerConfig::default());
 
-        let dtype = ctx.autocast_forward(|| autocast_dtype());
+        let dtype = ctx.autocast_forward(autocast_dtype);
         assert_eq!(dtype, AutocastDtype::BF16);
     }
 
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_scaler_state_dict_roundtrip() {
-        let mut ctx = AmpContext::<f32>::new(
+        let ctx = AmpContext::<f32>::new(
             AutocastDtype::F16,
             GradScalerConfig {
                 init_scale: 1024.0,

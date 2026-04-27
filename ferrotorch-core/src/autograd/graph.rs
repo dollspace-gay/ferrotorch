@@ -167,7 +167,7 @@ pub fn backward_with_grad<T: Float>(
                 });
             }
 
-            for (input, maybe_grad) in inputs.iter().zip(input_grads.into_iter()) {
+            for (input, maybe_grad) in inputs.iter().zip(input_grads) {
                 if let Some(grad) = maybe_grad {
                     if input.requires_grad() {
                         // Run gradient hooks (if any), which may modify the gradient.
@@ -379,9 +379,7 @@ pub fn backward_parallel<T: Float>(
                                 });
                             }
 
-                            for (input, maybe_grad) in
-                                inputs.iter().zip(input_grads.into_iter())
-                            {
+                            for (input, maybe_grad) in inputs.iter().zip(input_grads) {
                                 if let Some(grad) = maybe_grad {
                                     if input.requires_grad() {
                                         let hooks = input.hooks();

@@ -510,7 +510,7 @@ impl StreamPool {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .entry(key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .clone();
 
         // Lazy: if the pool for this (device, priority) is empty,
@@ -531,7 +531,7 @@ impl StreamPool {
             let mut guard = slots.lock().unwrap_or_else(|p| p.into_inner());
             // Race-safe: another thread may have populated meanwhile;
             // check before overwriting.
-            let entry = guard.entry(key).or_insert_with(Vec::new);
+            let entry = guard.entry(key).or_default();
             if entry.is_empty() {
                 *entry = new_streams.clone();
             }
@@ -575,14 +575,15 @@ impl StreamPool {
 // critical section is short — a hash lookup + clone — so contention
 // is negligible. CL-322.
 #[cfg(feature = "cuda")]
-static PRIORITY_POOL: OnceLock<
-    std::sync::Mutex<HashMap<(usize, StreamPriority), Vec<Arc<CudaStream>>>>,
-> = OnceLock::new();
+type PriorityPoolMap = std::sync::Mutex<HashMap<(usize, StreamPriority), Vec<Arc<CudaStream>>>>;
+#[cfg(feature = "cuda")]
+type PriorityCounterMap = std::sync::Mutex<HashMap<(usize, StreamPriority), Arc<AtomicUsize>>>;
 
 #[cfg(feature = "cuda")]
-fn priority_pool_slots()
--> &'static std::sync::Mutex<HashMap<(usize, StreamPriority), Vec<Arc<CudaStream>>>>
-{
+static PRIORITY_POOL: OnceLock<PriorityPoolMap> = OnceLock::new();
+
+#[cfg(feature = "cuda")]
+fn priority_pool_slots() -> &'static PriorityPoolMap {
     PRIORITY_POOL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -591,9 +592,7 @@ fn priority_pool_slots()
 // `fetch_add` on the contained AtomicUsize so the lock is only held
 // briefly during the (rare) first lookup per key.
 #[cfg(feature = "cuda")]
-static PRIORITY_POOL_COUNTERS: OnceLock<
-    std::sync::Mutex<HashMap<(usize, StreamPriority), Arc<AtomicUsize>>>,
-> = OnceLock::new();
+static PRIORITY_POOL_COUNTERS: OnceLock<PriorityCounterMap> = OnceLock::new();
 
 #[cfg(feature = "cuda")]
 fn priority_pool_counter(key: (usize, StreamPriority)) -> Arc<AtomicUsize> {
@@ -1022,7 +1021,7 @@ mod tests {
         // Normal sits at the midpoint of the integer range. Both
         // greatest and least bracket it.
         let normal = StreamPriority::Normal.to_cuda_priority(range);
-        assert!(normal >= -5 && normal <= 5);
+        assert!((-5..=5).contains(&normal));
     }
 
     #[test]

@@ -494,17 +494,6 @@ impl<T: Float> Module<T> for ConvNeXt<T> {
 }
 
 // ===========================================================================
-// Convenience constructors
-// ===========================================================================
-
-/// Construct a ConvNeXt-Tiny model.
-///
-/// Architecture: `[3, 3, 9, 3]` blocks, channels `[96, 192, 384, 768]`.
-///
-/// Note: Because depthwise convolutions are replaced with regular convolutions,
-/// the parameter count is significantly larger than the original ConvNeXt-Tiny
-/// (~28M). The regular-conv variant has ~187M parameters.
-// ===========================================================================
 // IntermediateFeatures — CL-499
 // ===========================================================================
 
@@ -558,6 +547,13 @@ impl<T: Float> crate::models::feature_extractor::IntermediateFeatures<T> for Con
     }
 }
 
+/// Construct a ConvNeXt-Tiny model.
+///
+/// Architecture: `[3, 3, 9, 3]` blocks, channels `[96, 192, 384, 768]`.
+///
+/// Note: Because depthwise convolutions are replaced with regular convolutions,
+/// the parameter count is significantly larger than the original ConvNeXt-Tiny
+/// (~28M). The regular-conv variant has ~187M parameters.
 pub fn convnext_tiny<T: Float>(num_classes: usize) -> FerrotorchResult<ConvNeXt<T>> {
     ConvNeXt::new(&[3, 3, 9, 3], &[96, 192, 384, 768], num_classes)
 }
@@ -588,7 +584,7 @@ mod tests {
     #[test]
     fn test_convnext_block_output_shape() {
         let block = ConvNeXtBlock::<f32>::new(96).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 96 * 8 * 8], [1, 96, 8, 8], false);
+        let input = leaf_4d(&vec![0.01; 96 * 8 * 8], [1, 96, 8, 8], false);
         let output = no_grad(|| block.forward(&input).unwrap());
         // Same spatial dims and channels (residual block).
         assert_eq!(output.shape(), &[1, 96, 8, 8]);
@@ -623,7 +619,7 @@ mod tests {
     #[test]
     fn test_downsample_output_shape() {
         let ds = Downsample::<f32>::new(96, 192).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 96 * 8 * 8], [1, 96, 8, 8], false);
+        let input = leaf_4d(&vec![0.01; 96 * 8 * 8], [1, 96, 8, 8], false);
         let output = no_grad(|| ds.forward(&input).unwrap());
         // Spatial dims halve, channels double.
         assert_eq!(output.shape(), &[1, 192, 4, 4]);
@@ -667,7 +663,7 @@ mod tests {
     #[test]
     fn test_convnext_tiny_output_shape() {
         let model = convnext_tiny::<f32>(1000).unwrap();
-        let input = leaf_4d(&vec![0.01; 1 * 3 * 224 * 224], [1, 3, 224, 224], false);
+        let input = leaf_4d(&vec![0.01; 3 * 224 * 224], [1, 3, 224, 224], false);
         let output = no_grad(|| model.forward(&input).unwrap());
         assert_eq!(output.shape(), &[1, 1000]);
     }
@@ -781,7 +777,7 @@ mod tests {
     #[test]
     fn test_gradient_flow_through_convnext_block() {
         let block = ConvNeXtBlock::<f32>::new(4).unwrap();
-        let input = leaf_4d(&vec![0.5; 1 * 4 * 4 * 4], [1, 4, 4, 4], true);
+        let input = leaf_4d(&vec![0.5; 4 * 4 * 4], [1, 4, 4, 4], true);
 
         let output = block.forward(&input).unwrap();
 

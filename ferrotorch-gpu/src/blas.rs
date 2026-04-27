@@ -1902,7 +1902,7 @@ mod tests {
             .map(|&x| half::bf16::from_f32(x).to_bits())
             .collect();
         dev.stream()
-            .memcpy_stod(&u16_data)
+            .clone_htod(&u16_data)
             .expect("bf16 upload")
     }
 
@@ -1911,7 +1911,7 @@ mod tests {
         dev: &GpuDevice,
         buf: &cudarc::driver::CudaSlice<u16>,
     ) -> Vec<f32> {
-        let bits: Vec<u16> = dev.stream().memcpy_dtov(buf).expect("bf16 download");
+        let bits: Vec<u16> = dev.stream().clone_dtoh(buf).expect("bf16 download");
         bits.into_iter()
             .map(|b| half::bf16::from_bits(b).to_f32())
             .collect()

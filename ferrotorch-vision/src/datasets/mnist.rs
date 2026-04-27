@@ -342,7 +342,7 @@ mod tests {
         let ds = Mnist::<f32>::synthetic(Split::Train, 10);
         let sample = ds.get(0).unwrap();
         assert_eq!(sample.image.shape(), &[1, 28, 28]);
-        assert_eq!(sample.image.numel(), 1 * 28 * 28);
+        assert_eq!(sample.image.numel(), 28 * 28);
     }
 
     #[test]
@@ -352,7 +352,7 @@ mod tests {
             let sample = ds.get(i).unwrap();
             let data = sample.image.data().unwrap();
             for &v in data {
-                assert!(v >= 0.0 && v <= 1.0, "pixel value out of [0,1]: {v}");
+                assert!((0.0..=1.0).contains(&v), "pixel value out of [0,1]: {v}");
             }
         }
     }
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(sample.image.shape(), &[1, 28, 28]);
         let data = sample.image.data().unwrap();
         for &v in data {
-            assert!(v >= 0.0 && v <= 1.0);
+            assert!((0.0..=1.0).contains(&v));
         }
     }
 
@@ -491,6 +491,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_from_dir_parses_multiple_images() {
         let dir = tempfile::tempdir().unwrap();
         // 3 images of 2x2.
@@ -693,7 +694,7 @@ mod tests {
     fn test_from_dir_images_file_too_short() {
         let dir = tempfile::tempdir().unwrap();
         // Write a file that is too short to even contain the header.
-        std::fs::write(dir.path().join("train-images-idx3-ubyte"), &[0u8; 10]).unwrap();
+        std::fs::write(dir.path().join("train-images-idx3-ubyte"), [0u8; 10]).unwrap();
         std::fs::write(
             dir.path().join("train-labels-idx1-ubyte"),
             make_idx1_labels(0, &[]),
@@ -718,7 +719,7 @@ mod tests {
         )
         .unwrap();
         // Write a labels file with only 4 bytes (need at least 8 for header).
-        std::fs::write(dir.path().join("train-labels-idx1-ubyte"), &[0u8; 4]).unwrap();
+        std::fs::write(dir.path().join("train-labels-idx1-ubyte"), [0u8; 4]).unwrap();
 
         let result = Mnist::<f32>::from_dir(dir.path(), Split::Train);
         assert!(result.is_err());

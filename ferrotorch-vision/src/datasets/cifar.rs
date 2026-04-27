@@ -286,7 +286,7 @@ mod tests {
             let sample = ds.get(i).unwrap();
             let data = sample.image.data().unwrap();
             for &v in data {
-                assert!(v >= 0.0 && v <= 1.0, "pixel value out of [0,1]: {v}");
+                assert!((0.0..=1.0).contains(&v), "pixel value out of [0,1]: {v}");
             }
         }
     }

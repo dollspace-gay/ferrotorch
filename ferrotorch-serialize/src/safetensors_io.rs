@@ -42,7 +42,7 @@ fn half_to_f32(bits: u16) -> f32 {
                 f <<= 1;
                 e += 1;
             }
-            let f32_exp = (127 - 15 - e + 1) as u32;
+            let f32_exp = 127 - 15 - e + 1;
             let f32_frac = (f & 0x3FF) << 13;
             f32::from_bits((sign << 31) | (f32_exp << 23) | f32_frac)
         }
@@ -51,7 +51,7 @@ fn half_to_f32(bits: u16) -> f32 {
         f32::from_bits((sign << 31) | (0xFF << 23) | (frac << 13))
     } else {
         // Normal
-        let f32_exp = (exp + 127 - 15) as u32;
+        let f32_exp = exp + 127 - 15;
         f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
     }
 }

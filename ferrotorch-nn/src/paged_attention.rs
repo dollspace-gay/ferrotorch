@@ -719,10 +719,10 @@ mod tests {
         // in total equals ceil(total_tokens_per_seq / page_size) summed.
         // The key property: used pages scale with total tokens, not with
         // max-per-sequence * num_sequences.
-        let expected_pages: usize = (1..=10)
+        let expected_pages: usize = (1_usize..=10)
             .map(|i| {
                 let n = i * 3;
-                (n + page_size - 1) / page_size
+                n.div_ceil(page_size)
             })
             .sum();
         assert_eq!(pool.num_used(), expected_pages);

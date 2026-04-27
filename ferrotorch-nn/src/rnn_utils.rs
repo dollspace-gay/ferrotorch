@@ -279,6 +279,7 @@ pub fn pad_packed_sequence<T: Float>(
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 

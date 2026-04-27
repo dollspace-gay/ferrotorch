@@ -436,7 +436,7 @@ mod tests {
         // which means threshold=0 and all pixels get inverted.
         let out = apply_op(&data, 2, 2, 1, Op::Solarize, 1);
         // Threshold = 0, all pixels >= 0, all inverted.
-        let expected = vec![0.8, 0.5, 0.2, 0.0_f32];
+        let expected = [0.8, 0.5, 0.2, 0.0_f32];
         for (i, (&o, e)) in out.iter().zip(expected.iter()).enumerate() {
             assert!((o - e).abs() < 1e-6, "solarize[{i}]: {o} vs {e}");
         }

@@ -91,7 +91,7 @@ fn main() {
     );
     let t_fwd = Instant::now();
     let result = inferencer
-        .forward_from_ids_profiled_with_bootstrap(&ids, 1, ffn, None)
+        .forward_from_ids_profiled_with_bootstrap(&ids, 1, ffn, None, false)
         .expect("profiled forward failed");
     println!(
         "[prosparse] forward done in {:.2}s",

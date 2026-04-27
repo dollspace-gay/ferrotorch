@@ -263,7 +263,7 @@ mod tests {
         let jitter = ColorJitter::<f64>::new(0.9, 0.9, 0.9, 0.4);
         let out = jitter.apply(t).unwrap();
         for &val in out.data().unwrap() {
-            assert!(val >= 0.0 && val <= 1.0, "Output value {val} out of [0, 1]");
+            assert!((0.0..=1.0).contains(&val), "Output value {val} out of [0, 1]");
         }
     }
 
@@ -323,7 +323,7 @@ mod tests {
         let out = jitter.apply(t).unwrap();
         assert_eq!(out.shape(), &[3, 2, 2]);
         for &val in out.data().unwrap() {
-            assert!(val >= 0.0 && val <= 1.0);
+            assert!((0.0..=1.0).contains(&val));
         }
     }
 }
