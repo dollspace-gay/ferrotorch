@@ -28,6 +28,7 @@
 //! }
 //! ```
 
+pub mod grammar;
 pub mod kernels;
 pub mod ops;
 pub mod quant;
@@ -42,3 +43,6 @@ pub use quant::{
     dequantize_q5_1_to_gpu, dequantize_q8_0_to_gpu, dequantize_q8_1_to_gpu, split_q4_0_blocks,
     split_q4_1_blocks, split_q5_0_blocks, split_q5_1_blocks, split_q8_0_blocks, split_q8_1_blocks,
 };
+
+// Re-export GPU constrained-decoding token-mask compute API.
+pub use grammar::{DfaMaskInputs, compute_token_mask_dfa_to_gpu, kernel_compute_token_mask_dfa};
