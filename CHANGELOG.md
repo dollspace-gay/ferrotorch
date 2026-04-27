@@ -235,6 +235,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - M≤4 cuBLAS bypass: route vector-matrix multiplies through PTX `small_matmul` kernel instead of cuBLAS SGEMM
 
 ### Changed
+- GPU constrained-decoding token-mask compute (qnd-trial-intel-rs#6 stages 1–5):
+  - Stage 1: CubeCL `kernel_compute_token_mask_dfa` — one thread per vocab entry walks a schema-derived DFA; new `ferrotorch-cubecl/src/grammar.rs` with 3 cuda_tests on RTX 3090. (commit 0c68a804)
+  - Stage 2: `JsonSchemaProcessor` ↔ kernel bridge in `ferrotorch-llama/src/grammar/gpu_dispatch.rs`; supports `Schema::Boolean`. (commit 03a64ff5)
+  - Stage 3: extends bridge to `Schema::Null`, `Schema::Integer`, `Schema::Number`, `Schema::String`. (commit 54ecb738)
+  - Stage 4: extends bridge to `Schema::StringEnum` (prefix trie) and `Schema::Nullable(_)` (inner-DFA + null-branch merge with class-splitting). (commit 774e5b10)
+  - Stage 5: multi-frame scalar dispatch with parent terminators (`,`, `}`, `]` baked into completion states) + `Phase::ObjectKey` prefix trie over unseen properties. (commit 207fd0e3)
+  - Total: 31 cuda_tests, all byte-equal to CPU `compute_mask` on RTX 3090, no `#[ignore]`, no CPU fallback inside test bodies. Object/Array structural phases intentionally remain CPU.
+- AC-18: scale JsonSchemaProcessor sampled-completion coverage to 10000 per schema (#558)
+- Move ferrotorch-paged notes/memories to private repo (#557)
+- Extract ferrotorch-paged to private repo at /home/doll/ferrotorch-paged (#556)
+- Bump crate version, commit codebase changes, gitignore ferrotorch-paged (#555)
 - pin_hot_blocks must stop when VRAM budget is exhausted, not panic (#543)
 - Sharded safetensors loader (index.json + multi-file) (#507)
 - HF config.json parser (#508)
