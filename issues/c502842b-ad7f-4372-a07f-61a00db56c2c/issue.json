@@ -2,11 +2,12 @@
   "uuid": "c502842b-ad7f-4372-a07f-61a00db56c2c",
   "display_id": 558,
   "title": "AC-18: scale JsonSchemaProcessor sampled-completion coverage to 10000 per schema",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "y4rr",
   "created_at": "2026-04-27T21:04:04.340135481Z",
-  "updated_at": "2026-04-27T21:04:05.704504979Z",
+  "updated_at": "2026-04-27T21:10:57.237021892Z",
+  "closed_at": "2026-04-27T21:10:57.237021892Z",
   "labels": [
     "rewrite"
   ]
