@@ -1,0 +1,10 @@
+{
+  "uuid": "98bb9a61-72e7-4fbd-afda-b656b30bac09",
+  "issue_uuid": "c502842b-ad7f-4372-a07f-61a00db56c2c",
+  "author": "y4rr",
+  "content": "Plan: bump trial count from 1000 to 10000 per schema in src/grammar/json_schema.rs::sampled_completions_always_validate. AC-18 in qnd-trial-intel-rs's design doc explicitly requires '≥10 000 sampled completions per schema in a stub backend.' The existing test undercounts at 1000 per schema (5000 total); spec wants 50 000 total. Rough cost: 5×10k×~256 steps×~95-entry ascii vocab×~5-char probe ≈ 600M ops; should still complete in <30s. Update the docstring's '≥1000' to '≥10000' too.",
+  "created_at": "2026-04-27T21:04:17.904000265Z",
+  "kind": "plan",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAczGT6nzaUssyhcl7ivYvxax/9drRDqfjGIJo+QEniB1gZiLYz1SRn+djt8HvHZfJ+tysjntoqC2HqvSiLUibBQ=="
+}
