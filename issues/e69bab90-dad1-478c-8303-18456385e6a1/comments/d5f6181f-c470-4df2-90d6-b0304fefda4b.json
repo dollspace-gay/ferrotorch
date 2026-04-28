@@ -1,0 +1,10 @@
+{
+  "uuid": "d5f6181f-c470-4df2-90d6-b0304fefda4b",
+  "issue_uuid": "e69bab90-dad1-478c-8303-18456385e6a1",
+  "author": "y4rr",
+  "content": "Bumped [workspace.package] 0.4.1 -> 0.4.2 plus all 19 internal workspace.dependencies entries. Cargo.lock regenerated via cargo update --workspace. cargo check --workspace --all-targets passed clean (exit 0). Committed as 497c32ee on main. Pre-existing unrelated modifications to .gitignore, ferrotorch-gpu/src/bf16.rs, and ferrotorch-llama/{examples/llama3_8b.rs,src/gpu.rs} left untouched and unstaged.",
+  "created_at": "2026-04-28T12:46:39.249651124Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+cw2Uy45ZBiH98KxHhsYE9rX4+HmAwMeR75po7jzxlck/+Pxv0JN/wJPuNqu86PA8RGO/c/7c1hfc9M0fCXRAQ=="
+}
