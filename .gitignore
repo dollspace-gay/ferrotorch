@@ -58,5 +58,3 @@ __pycache__/
 .crosslink/
 .claude/worktrees/
 hierarchical-llm-rust/
-ferrotorch-paged/
-ferrotorch-paged-design.md

@@ -28,10 +28,10 @@
 //! reference. On a 32 GB RAM box the full bf16 load fits, but the
 //! forward pass through 32 layers of 4096 hidden × 14336 intermediate
 //! is not SIMD-accelerated for bf16 — a single prefill step takes
-//! minutes, and autoregressive decode is impractical without the
-//! planned `ferrotorch-paged` speculative paging / mixed-precision
-//! kernels. This example proves the load / tokenize / prefill path
-//! is correct; full generation is the bar for a future pass.
+//! minutes, and autoregressive decode is impractical without
+//! mixed-precision kernels. This example proves the load /
+//! tokenize / prefill path is correct; full generation is the bar
+//! for a future pass.
 
 use std::path::PathBuf;
 use std::time::Instant;

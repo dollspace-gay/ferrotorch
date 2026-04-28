@@ -29,14 +29,14 @@ use crate::config::{LlamaActivation, LlamaConfig};
 
 /// Per-layer activation taps collected during a profiled forward pass.
 ///
-/// Shape summary (see `ferrotorch-paged` for interpretation):
+/// Shape summary:
 /// * each `attn_f32` entry: `[n_heads * seq]` — max|attn_out[h, t, :]|
 /// * each `mlp_f32` entry: `[seq, n_mlp_blocks]` — max|gated[t, block]|
 /// * `bootstrap_hidden` (Some iff `bootstrap_k` was set): a `[seq,
 ///   hidden_size]` bf16 bits snapshot of the hidden state after the
-///   bootstrap_k-th layer. This is the signal the Phase-3 predictor
-///   actually needs — the 8B's routing decisions at layer `k` are
-///   driven by this tensor, not by raw token ids.
+///   bootstrap_k-th layer, intended for downstream routing
+///   predictors that condition on the model's own intermediate
+///   activations rather than raw token ids.
 struct ForwardTaps {
     mlp_block_size: usize,
     n_mlp_blocks: usize,

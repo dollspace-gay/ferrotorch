@@ -2129,7 +2129,7 @@ DONE:
 /// `[rows, n_blocks]` f32 where each output is `max(|x|)` over the
 /// corresponding `block_size`-wide slice.
 ///
-/// Used by `ferrotorch-paged`'s activation profiler to tap attention
+/// Intended for activation-profiler use cases that tap attention
 /// heads (one head == one block) and MLP neuron groups (one block ==
 /// `mlp_block_size` neurons) directly on device.
 pub fn gpu_block_reduce_max_abs_bf16(
