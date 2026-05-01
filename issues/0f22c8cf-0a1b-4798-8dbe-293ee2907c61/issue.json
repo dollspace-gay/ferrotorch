@@ -1,0 +1,10 @@
+{
+  "uuid": "0f22c8cf-0a1b-4798-8dbe-293ee2907c61",
+  "display_id": 602,
+  "title": "Fix CUDA stream-capture race in test_gpu_graph_pool (CUDA_ERROR_STREAM_CAPTURE_INVALIDATED under workspace-parallel)",
+  "status": "open",
+  "priority": "high",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T17:16:08.023432042Z",
+  "updated_at": "2026-05-01T17:16:08.023432042Z"
+}
