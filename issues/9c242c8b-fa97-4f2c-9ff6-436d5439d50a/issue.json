@@ -2,11 +2,12 @@
   "uuid": "9c242c8b-fa97-4f2c-9ff6-436d5439d50a",
   "display_id": 616,
   "title": "GPU masked_min / masked_max via inf-fill + reduce",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-05-01T21:01:06.351024013Z",
-  "updated_at": "2026-05-01T21:01:07.649492134Z",
+  "updated_at": "2026-05-01T23:33:35.932214969Z",
+  "closed_at": "2026-05-01T23:33:35.932214969Z",
   "labels": [
     "gpu"
   ]
