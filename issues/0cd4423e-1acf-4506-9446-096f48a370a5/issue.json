@@ -2,11 +2,12 @@
   "uuid": "0cd4423e-1acf-4506-9446-096f48a370a5",
   "display_id": 625,
   "title": "JIT script: procedural-macro Rust source -> IrGraph (torch.jit.script equivalent)",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-05-01T22:49:38.035831662Z",
-  "updated_at": "2026-05-01T22:49:39.357827269Z",
+  "updated_at": "2026-05-01T23:00:21.769940516Z",
+  "closed_at": "2026-05-01T23:00:21.769940516Z",
   "labels": [
     "feature"
   ]
