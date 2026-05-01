@@ -1,0 +1,11 @@
+{
+  "uuid": "18b868dd-4db4-442c-ae9c-bf46d988c408",
+  "display_id": 627,
+  "title": "GPU reduce_min / reduce_max kernels",
+  "description": "Add native PTX reduce_min and reduce_max kernels to ferrotorch-gpu, mirroring gpu_reduce_sum. Currently masked_min/max GPU paths fall back to host download + CPU reduce (#616), which is correct but burns PCIe bandwidth proportional to numel. A two-pass min/max parallel reduction kernel (analogous to reduce_sum_kernel) lets the result stay on-device.\n\nAlso enables: torch.amin/amax/min/max GPU forwards, top-k pruning, etc.",
+  "status": "open",
+  "priority": "low",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T23:31:05.475817387Z",
+  "updated_at": "2026-05-01T23:31:05.475817387Z"
+}
