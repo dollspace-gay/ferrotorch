@@ -1,0 +1,10 @@
+{
+  "uuid": "e2ed63bc-3abe-47d4-98a5-d9684426be1a",
+  "display_id": 598,
+  "title": "ferrotorch-ml: extend metric coverage (precision/recall/F1/ROC-AUC/log_loss/confusion_matrix + ranking/clustering)",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T16:35:47.641576880Z",
+  "updated_at": "2026-05-01T16:35:47.641576880Z"
+}
