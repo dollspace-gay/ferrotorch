@@ -1,0 +1,11 @@
+{
+  "uuid": "7f0a2497-a156-4ea6-ba01-7beb481e42d0",
+  "display_id": 564,
+  "title": "Phase 1A: wire ferray-fft into ferrotorch-core::fft (close 10-fn fft gap)",
+  "description": "Add ferray-fft as a workspace dep and wrap its API in ferrotorch-core::fft. ferray-fft has the exact 10 functions ferrotorch is missing per docs/audit/01-ferrotorch-core.md: fftn, ifftn, rfftn, irfftn, hfft, ihfft, hfftn, ihfftn, fftfreq, rfftfreq, fftshift, ifftshift.\n\nScope:\n- Add ferray-fft = workspace dep in ferrotorch-core/Cargo.toml.\n- Wrap each ferray-fft fn as a Tensor<T> -> Tensor<T> wrapper in ferrotorch-core/src/fft.rs, mirroring the existing fft/ifft/fft2/ifft2/rfft/irfft pattern (Tensor -> ferray::Array round-trip).\n- Add re-exports to ferrotorch-core/src/lib.rs.\n- Add tests round-tripping fft -> ifft for each new fn.\n- Add corresponding differentiable wrappers in grad_fns/fft.rs for fftn/rfftn/irfftn (the autograd-relevant subset).\n\nGPU discipline (CRITICAL):\n- ferrotorch-gpu currently has NO cuFFT bindings. ferrotorch-core's existing fft/fft2/ifft/ifft2/rfft/irfft are CPU-only.\n- DO NOT silently route GPU tensors through host. If input.device() != Cpu, return FerrotorchError::DeviceUnavailable with a message naming cuFFT, NOT a t.to(Cpu) -> compute -> t.to(device) sandwich. Document this explicitly in module-level docs.\n- The GpuBackend trait in gpu_dispatch.rs would need new fft methods if/when GPU fft lands; that's a separate issue.\n- Apply /rust-gpu-discipline pre-flight checklist before claiming the task done: search for forbidden patterns (.to(Cpu) inside compute fns, silent device fallbacks).\n\nCloses ~38% of the audit-flagged fft gap (current 6 fns -> 16/16 torch.fft fns).",
+  "status": "open",
+  "priority": "high",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T13:23:14.054086753Z",
+  "updated_at": "2026-05-01T13:23:14.054086753Z"
+}
