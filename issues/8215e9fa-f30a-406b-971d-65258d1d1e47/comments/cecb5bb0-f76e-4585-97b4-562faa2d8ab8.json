@@ -1,0 +1,10 @@
+{
+  "uuid": "cecb5bb0-f76e-4585-97b4-562faa2d8ab8",
+  "issue_uuid": "8215e9fa-f30a-406b-971d-65258d1d1e47",
+  "author": "y4rr",
+  "content": "Adding scope from #576: GPU dispatch for det / inv / pinv all need either GPU-resident LU (det, inv via getrf + getrs) or GPU-resident SVD (pinv) — both already in this issue's scope. matrix_norm split off and landed under #576 directly via composition of existing primitives.",
+  "created_at": "2026-05-01T18:04:08.106486471Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAT5LWsq5qoIsKY1FFfE+Uq0iG9fVFt547eKWlux9Ax67rzzhXJQgztiBzotwlUAyPPzG8PBJosIs+Zx6CRZ9hBw=="
+}
