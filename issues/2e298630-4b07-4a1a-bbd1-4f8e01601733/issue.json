@@ -2,11 +2,12 @@
   "uuid": "2e298630-4b07-4a1a-bbd1-4f8e01601733",
   "display_id": 596,
   "title": "Integer / bool tensor element types (long/i32/i64/bool) — required for index tensors, masks, embedding indices",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "y4rr",
   "created_at": "2026-05-01T15:38:22.219946259Z",
-  "updated_at": "2026-05-01T15:38:23.494270948Z",
+  "updated_at": "2026-05-01T20:55:36.098297432Z",
+  "closed_at": "2026-05-01T20:55:36.098297432Z",
   "labels": [
     "feature"
   ]
