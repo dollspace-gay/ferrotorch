@@ -2,11 +2,12 @@
   "uuid": "eef415f8-4b59-484f-86ad-747cd138903b",
   "display_id": 614,
   "title": "Activation tail follow-up: native prelu + glu fused GradFns",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-05-01T20:41:57.790664198Z",
-  "updated_at": "2026-05-01T20:41:59.106863158Z",
+  "updated_at": "2026-05-01T23:29:20.665823611Z",
+  "closed_at": "2026-05-01T23:29:20.665823611Z",
   "labels": [
     "feature"
   ]
