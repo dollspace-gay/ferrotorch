@@ -1,0 +1,10 @@
+{
+  "uuid": "dff52532-234b-43aa-a827-6deb996b9ec2",
+  "display_id": 620,
+  "title": "JIT trace + script: torch.jit.trace / torch.jit.script equivalent",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T21:50:19.129810747Z",
+  "updated_at": "2026-05-01T21:50:19.129810747Z"
+}
