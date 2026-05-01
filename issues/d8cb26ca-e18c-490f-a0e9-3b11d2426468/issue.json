@@ -2,11 +2,12 @@
   "uuid": "d8cb26ca-e18c-490f-a0e9-3b11d2426468",
   "display_id": 581,
   "title": "Linalg tail: ldl_factor, ldl_solve, householder_product, matrix_exp, solve_triangular, cholesky_ex, inv_ex, solve_ex",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "y4rr",
   "created_at": "2026-05-01T15:37:00.833595100Z",
-  "updated_at": "2026-05-01T15:37:02.154122197Z",
+  "updated_at": "2026-05-01T18:43:54.499812521Z",
+  "closed_at": "2026-05-01T18:43:54.499812521Z",
   "labels": [
     "feature"
   ]
