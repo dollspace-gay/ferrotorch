@@ -1,0 +1,10 @@
+{
+  "uuid": "48406b91-9ce2-4085-b71f-4e9023bc48ce",
+  "display_id": 583,
+  "title": "Module trait additions: buffers/named_buffers/register_buffer, modules/named_modules iteration, register_*_hook, zero_grad, requires_grad_, apply",
+  "status": "open",
+  "priority": "high",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T15:37:11.153778493Z",
+  "updated_at": "2026-05-01T15:37:11.153778493Z"
+}
