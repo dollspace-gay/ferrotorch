@@ -1,0 +1,10 @@
+{
+  "uuid": "a4e988fc-f6d4-44cb-a875-d0716b040a04",
+  "display_id": 580,
+  "title": "Differentiable wrappers in grad_fns/fft.rs for new fftn/ifftn/rfftn/irfftn/hfft/ihfft",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T15:36:55.638638077Z",
+  "updated_at": "2026-05-01T15:36:55.638638077Z"
+}
