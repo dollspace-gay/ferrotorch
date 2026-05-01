@@ -2,11 +2,12 @@
   "uuid": "a6d47921-6ad0-4501-a4a1-cfd8fa9ebed3",
   "display_id": 588,
   "title": "Chat-template rendering in ferrotorch-tokenize (Jinja2 over messages -> token ids; required for chat-tuned LLMs)",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "y4rr",
   "created_at": "2026-05-01T15:37:38.083670093Z",
-  "updated_at": "2026-05-01T15:37:39.400718467Z",
+  "updated_at": "2026-05-01T20:00:19.388719312Z",
+  "closed_at": "2026-05-01T20:00:19.388719312Z",
   "labels": [
     "feature"
   ]
