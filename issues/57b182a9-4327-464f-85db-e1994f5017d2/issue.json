@@ -2,11 +2,12 @@
   "uuid": "57b182a9-4327-464f-85db-e1994f5017d2",
   "display_id": 578,
   "title": "Phase 1C extension: integrate 9 new ferray-window 0.3.1 windows into ferrotorch-core::signal::windows",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "created_by": "y4rr",
   "created_at": "2026-05-01T15:32:05.198551476Z",
-  "updated_at": "2026-05-01T15:32:06.626274070Z",
+  "updated_at": "2026-05-01T15:36:25.809091298Z",
+  "closed_at": "2026-05-01T15:36:25.809091298Z",
   "labels": [
     "integration"
   ]
