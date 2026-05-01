@@ -1,0 +1,10 @@
+{
+  "uuid": "4cd79561-dd58-4307-ad96-4ea3e1a77713",
+  "display_id": 622,
+  "title": "Lazy modules: LazyLinear / LazyConv2d shape inference at first forward",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T21:50:29.299708765Z",
+  "updated_at": "2026-05-01T21:50:29.299708765Z"
+}
