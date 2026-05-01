@@ -2,11 +2,12 @@
   "uuid": "b5d19121-0254-4823-a262-cefa6fff751d",
   "display_id": 574,
   "title": "GPU strided_scatter kernel for as_strided_scatter (CPU-only today)",
-  "status": "open",
+  "status": "closed",
   "priority": "medium",
   "created_by": "y4rr",
   "created_at": "2026-05-01T14:21:23.991771651Z",
-  "updated_at": "2026-05-01T14:21:25.352787046Z",
+  "updated_at": "2026-05-01T17:36:48.323092138Z",
+  "closed_at": "2026-05-01T17:36:48.323092138Z",
   "labels": [
     "gpu"
   ]
