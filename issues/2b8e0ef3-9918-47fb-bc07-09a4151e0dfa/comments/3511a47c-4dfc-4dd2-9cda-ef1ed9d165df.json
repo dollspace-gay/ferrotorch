@@ -1,0 +1,10 @@
+{
+  "uuid": "3511a47c-4dfc-4dd2-9cda-ef1ed9d165df",
+  "issue_uuid": "2b8e0ef3-9918-47fb-bc07-09a4151e0dfa",
+  "author": "y4rr",
+  "content": "duplicate of #562 created during hub-divergence retry",
+  "created_at": "2026-05-01T12:35:42.790099816Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABXtgWYuXbayQYavQOTsVGFr3JLqhnbN1azUzqEhwfyb26Eox+GtLPDsDpTxt4rsA7J1XfAzj3KoabkWA+4BOAg=="
+}
