@@ -1,0 +1,10 @@
+{
+  "uuid": "db60e55b-a81a-47cf-9e38-7a114ebdb157",
+  "display_id": 587,
+  "title": "Memory-mapped tensor loading for safetensors / GGUF / pytorch-pickle (avoid double-buffer at LLM scale)",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T15:37:33.055443784Z",
+  "updated_at": "2026-05-01T15:37:33.055443784Z"
+}
