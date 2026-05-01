@@ -1,0 +1,10 @@
+{
+  "uuid": "014bdbf6-bb55-4c30-892c-8189ba6fd61f",
+  "display_id": 624,
+  "title": "Complex tensor op integration: complex FFT path + complex matmul + complex grad_fn",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-01T22:43:56.865268935Z",
+  "updated_at": "2026-05-01T22:43:56.865268935Z"
+}
