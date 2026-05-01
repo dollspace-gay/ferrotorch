@@ -2,11 +2,12 @@
   "uuid": "51dcc2ef-e4c5-4c7b-a240-c78e15a1c9d9",
   "display_id": 451,
   "title": "Add MPS backend for Apple Silicon GPU",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-04-03T22:21:47.028071688Z",
-  "updated_at": "2026-04-03T22:21:48.741320520Z",
+  "updated_at": "2026-05-01T23:07:19.639863757Z",
+  "closed_at": "2026-05-01T23:07:19.639863757Z",
   "labels": [
     "gpu"
   ]
