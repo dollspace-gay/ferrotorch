@@ -1,0 +1,10 @@
+{
+  "uuid": "60c4341c-e3aa-4248-9346-79fbd3cba6b1",
+  "issue_uuid": "97da4e33-7174-4796-b50f-f5519f553bea",
+  "author": "y4rr",
+  "content": "Three edits to ~/.claude/skills/rust-gpu-discipline/: (1) SKILL.md gains Step 0 'Probe the environment' before Step 1, with five concrete probe commands (nvidia-smi, /usr/local/cuda check, .cargo/config.toml CUDARC pin, cuda-feature build, cuda-feature test --no-run) and a meta-rule: any 'I can't verify this because [X]' must have [X] measured, not assumed; (2) anti-patterns.md gains #11 'The phantom constraint' using the literal example I exhibited this session ('WSL2 here doesn't expose a GPU' written from a session with a 24GB RTX 3090 idle and ready); (3) verification-script.md gains a Step 0 probe block at the top with the same commands as a copy-paste oneliner. Together: the skill no longer leaves room for self-fabricated 'I can't run the verification on this box' exits — the probe makes that claim a measurable assertion.",
+  "created_at": "2026-05-02T17:35:11.063712869Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0r+tPLpFBRP0XXeGcY5z/uS2bQMwGNLEeUOa2dNupc71Ta3JfmtJG9OPv7ld3bAKgjYtBjFVzVoX8YEJRw67AQ=="
+}
