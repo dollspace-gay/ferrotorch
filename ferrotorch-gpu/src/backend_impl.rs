@@ -2596,6 +2596,64 @@ impl GpuBackend for CudaBackendImpl {
         Ok((Self::wrap_buffer_f64(lu, a.device_ordinal()), ipiv_host))
     }
 
+    fn lstsq_f32(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        m: usize,
+        n: usize,
+        nrhs: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let b_buf = Self::unwrap_buffer(b)?;
+        let dev = self.device(a.device_ordinal())?;
+        let x = crate::cusolver::gpu_lstsq_f32(a_buf, b_buf, m, n, nrhs, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(x, a.device_ordinal()))
+    }
+
+    fn lstsq_f64(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        m: usize,
+        n: usize,
+        nrhs: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let b_buf = Self::unwrap_buffer_f64(b)?;
+        let dev = self.device(a.device_ordinal())?;
+        let x = crate::cusolver::gpu_lstsq_f64(a_buf, b_buf, m, n, nrhs, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(x, a.device_ordinal()))
+    }
+
+    fn eig_f32(
+        &self,
+        a: &GpuBufferHandle,
+        n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let (w, v) =
+            crate::cusolver::gpu_eig_f32(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        let ord = a.device_ordinal();
+        Ok((Self::wrap_buffer(w, ord), Self::wrap_buffer(v, ord)))
+    }
+
+    fn eig_f64(
+        &self,
+        a: &GpuBufferHandle,
+        n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let (w, v) =
+            crate::cusolver::gpu_eig_f64(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        let ord = a.device_ordinal();
+        Ok((Self::wrap_buffer_f64(w, ord), Self::wrap_buffer_f64(v, ord)))
+    }
+
     // GPU-resident eigh / eigvalsh (no host bounces — see cusolver::gpu_eigh_*).
     fn eigh_f32(
         &self,

@@ -943,6 +943,58 @@ pub fn svdvals<T: Float>(a: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
     }
 }
 
+/// Least-squares solution `X` minimizing `||A X - B||_F`. Just the
+/// solution — no residuals / rank / singular values. (#630)
+///
+/// On CUDA f32/f64, dispatches to cuSOLVER `cusolverDnSSgels` /
+/// `cusolverDnDDgels` (iterative refinement, no host bounce). CPU and
+/// other dtypes route through `ferray-linalg::lstsq` and discard the
+/// extra outputs. `A` is `[M, N]`; `B` is `[M, K]` (or `[M]` treated as
+/// `[M, 1]`); output is `[N, K]` (or `[N]` for the 1-D case).
+pub fn lstsq_solve<T: Float>(
+    a: &Tensor<T>,
+    b: &Tensor<T>,
+) -> FerrotorchResult<Tensor<T>> {
+    if a.ndim() != 2 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: format!("lstsq_solve: `a` must be 2-D, got {:?}", a.shape()),
+        });
+    }
+    let m = a.shape()[0];
+    let n = a.shape()[1];
+    let (b_is_1d, nrhs) = match b.ndim() {
+        1 if b.shape()[0] == m => (true, 1),
+        2 if b.shape()[0] == m => (false, b.shape()[1]),
+        _ => {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "lstsq_solve: `b` must be 1-D [{m}] or 2-D [{m}, K], got {:?}",
+                    b.shape()
+                ),
+            });
+        }
+    };
+
+    if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let x_h = if is_f32::<T>() {
+            backend.lstsq_f32(a.gpu_handle()?, b.gpu_handle()?, m, n, nrhs)?
+        } else {
+            backend.lstsq_f64(a.gpu_handle()?, b.gpu_handle()?, m, n, nrhs)?
+        };
+        let out_shape = if b_is_1d { vec![n] } else { vec![n, nrhs] };
+        return Tensor::from_storage(TensorStorage::gpu(x_h), out_shape, false);
+    }
+    if a.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "lstsq_solve" });
+    }
+
+    // CPU: route through full ferray lstsq and take the solution slice.
+    let (sol, _r, _rank, _sv) = lstsq(a, b, None)?;
+    Ok(sol)
+}
+
 /// Least-squares solution to `A x ≈ b`.
 ///
 /// Returns `(solution, residuals, rank, singular_values)`. `rcond`

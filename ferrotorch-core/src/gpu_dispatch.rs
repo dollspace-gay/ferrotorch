@@ -1733,6 +1733,64 @@ pub trait GpuBackend: Send + Sync {
             message: "lu_factor_f64 GPU op not yet implemented".into(),
         })
     }
+
+    /// GPU-resident least-squares solver via cuSOLVER `cusolverDnSSgels`
+    /// (iterative refinement). Solves `min ||A X - B||_F` for `A: m×n`,
+    /// `B: m×nrhs`. Returns `X: n×nrhs`. Mirrors `torch.linalg.lstsq`'s
+    /// solution output. (#630)
+    fn lstsq_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _b: &GpuBufferHandle,
+        _m: usize,
+        _n: usize,
+        _nrhs: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "lstsq_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// f64 counterpart. (#630)
+    fn lstsq_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _b: &GpuBufferHandle,
+        _m: usize,
+        _n: usize,
+        _nrhs: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "lstsq_f64 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// Non-symmetric eigendecomposition via cuSOLVER `cusolverDnXgeev`.
+    /// Returns `(eigenvalues, eigenvectors)` as **complex** GPU tensors:
+    ///   - eigenvalues: length `2n` interleaved re/im (logical `[n, 2]`)
+    ///   - eigenvectors: length `2 * n * n` row-major interleaved
+    ///     (logical `[n, n, 2]`)
+    /// Mirrors `torch.linalg.eig`. (#631)
+    fn eig_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "eig_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// f64 counterpart. (#631)
+    fn eig_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "eig_f64 GPU op not yet implemented".into(),
+        })
+    }
     /// Symmetric eigendecomposition (eigenvalues + eigenvectors) of an
     /// `n × n` real symmetric matrix. Returns `(eigenvalues, eigenvectors)`
     /// where eigenvectors is row-major with column `j` the `j`-th eigenvector.

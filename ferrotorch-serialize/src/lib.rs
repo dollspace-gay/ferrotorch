@@ -25,7 +25,9 @@ pub use onnx_export::{
     ir_graph_to_onnx,
 };
 pub use pytorch_export::{save_pytorch, validate_checkpoint};
-pub use pytorch_import::{PickleValue, load_pytorch_state_dict, parse_pickle};
+pub use pytorch_import::{
+    PickleValue, load_pytorch_state_dict, load_pytorch_state_dict_mmap, parse_pickle,
+};
 pub use safetensors_io::{
     ShardProgress, load_safetensors, load_safetensors_auto, load_safetensors_mmap,
     load_safetensors_sharded, load_safetensors_sharded_filtered, load_safetensors_sharded_mmap,

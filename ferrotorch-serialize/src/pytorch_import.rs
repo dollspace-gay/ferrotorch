@@ -14,11 +14,12 @@
 //!    `StateDict<T>`.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, Tensor, TensorStorage};
 use ferrotorch_nn::StateDict;
+use memmap2::Mmap;
 
 // ---------------------------------------------------------------------------
 // Pickle value tree
@@ -825,10 +826,53 @@ pub fn load_pytorch_state_dict<T: Float>(path: impl AsRef<Path>) -> FerrotorchRe
         message: format!("failed to open pytorch file {}: {e}", path.display()),
     })?;
 
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| FerrotorchError::InvalidArgument {
+    let archive = zip::ZipArchive::new(file).map_err(|e| FerrotorchError::InvalidArgument {
         message: format!("failed to read ZIP archive {}: {e}", path.display()),
     })?;
 
+    load_pytorch_state_dict_inner(archive)
+}
+
+/// Memory-mapped variant of [`load_pytorch_state_dict`] (#629). Same return
+/// contract, but uses `mmap2::Mmap` + a `Cursor<&[u8]>` instead of an open
+/// `File` for the underlying ZIP reader. The mmap is dropped before this
+/// function returns; tensor data is copied into owned `Tensor<T>` buffers,
+/// so callers don't inherit any file-lifetime invariants.
+///
+/// The win is the same as [`crate::load_safetensors_mmap`] / `load_gguf_mmap`:
+/// the OS page cache holds raw archive bytes instead of reading them into a
+/// heap `Vec<u8>` up front. The pickle parser still allocates internally
+/// while it walks the bytecode, but the outer ZIP reader is now lazy.
+pub fn load_pytorch_state_dict_mmap<T: Float>(
+    path: impl AsRef<Path>,
+) -> FerrotorchResult<StateDict<T>> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path).map_err(|e| FerrotorchError::InvalidArgument {
+        message: format!("failed to open pytorch file {}: {e}", path.display()),
+    })?;
+
+    // SAFETY: the mmap is dropped before this function returns. All
+    // tensor data is copied into owned `Tensor<T>` buffers via
+    // `convert_bytes_to_float`. The file must not be mutated while the
+    // mmap is live, matching the safetensors/GGUF mmap contracts.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| FerrotorchError::InvalidArgument {
+        message: format!("failed to mmap pytorch file {}: {e}", path.display()),
+    })?;
+
+    let cursor = Cursor::new(&mmap[..]);
+    let archive = zip::ZipArchive::new(cursor).map_err(|e| FerrotorchError::InvalidArgument {
+        message: format!("failed to read ZIP archive {}: {e}", path.display()),
+    })?;
+
+    load_pytorch_state_dict_inner(archive)
+}
+
+/// Shared inner: takes any `ZipArchive<R>` and produces a `StateDict<T>`.
+/// Both [`load_pytorch_state_dict`] (file-backed) and
+/// [`load_pytorch_state_dict_mmap`] (mmap-backed) funnel here. (#629)
+fn load_pytorch_state_dict_inner<T: Float, R: Read + std::io::Seek>(
+    mut archive: zip::ZipArchive<R>,
+) -> FerrotorchResult<StateDict<T>> {
     // Find the pickle file.
     let pkl_name = find_pkl_name(&mut archive)?;
 
@@ -892,7 +936,9 @@ pub fn load_pytorch_state_dict<T: Float>(path: impl AsRef<Path>) -> FerrotorchRe
 }
 
 /// Find the pickle file name inside the ZIP archive.
-fn find_pkl_name(archive: &mut zip::ZipArchive<std::fs::File>) -> FerrotorchResult<String> {
+fn find_pkl_name<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> FerrotorchResult<String> {
     let names: Vec<String> = (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
         .collect();
@@ -916,7 +962,10 @@ fn find_pkl_name(archive: &mut zip::ZipArchive<std::fs::File>) -> FerrotorchResu
 }
 
 /// Determine the prefix path for data blobs.
-fn find_data_prefix(archive: &mut zip::ZipArchive<std::fs::File>, infos: &[TensorInfo]) -> String {
+fn find_data_prefix<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    infos: &[TensorInfo],
+) -> String {
     if infos.is_empty() {
         return "archive/data/".to_string();
     }
@@ -938,8 +987,8 @@ fn find_data_prefix(archive: &mut zip::ZipArchive<std::fs::File>, infos: &[Tenso
 }
 
 /// Read a named entry from the ZIP archive into a byte vector.
-fn read_zip_entry(
-    archive: &mut zip::ZipArchive<std::fs::File>,
+fn read_zip_entry<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> FerrotorchResult<Vec<u8>> {
     let mut entry = archive
@@ -1720,6 +1769,39 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_synthetic_pt_file_mmap_matches_read() {
+        // (#629) The mmap-backed loader should produce byte-identical
+        // output to the read-backed loader on the same file.
+        let tensor_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let zip_bytes = build_synthetic_pt(&tensor_data);
+
+        let dir = std::env::temp_dir().join("ferrotorch_test_pt_mmap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.pt");
+        std::fs::write(&path, &zip_bytes).unwrap();
+
+        let from_read: StateDict<f32> = load_pytorch_state_dict(&path).unwrap();
+        let from_mmap: StateDict<f32> = load_pytorch_state_dict_mmap(&path).unwrap();
+
+        assert_eq!(from_read.len(), from_mmap.len());
+        for (k, v_read) in &from_read {
+            let v_mmap = &from_mmap[k];
+            assert_eq!(v_read.shape(), v_mmap.shape());
+            assert_eq!(v_read.data().unwrap(), v_mmap.data().unwrap());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_pytorch_mmap_rejects_missing_file() {
+        let result = load_pytorch_state_dict_mmap::<f32>("/nonexistent/path/model.pt");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("failed to open"));
     }
 
     #[test]

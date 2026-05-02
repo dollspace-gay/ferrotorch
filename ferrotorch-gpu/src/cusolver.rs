@@ -981,6 +981,610 @@ pub fn gpu_lu_factor_f64(
 }
 
 // ---------------------------------------------------------------------------
+// Least-squares: solve min ||A x - b||  via cusolverDn{SS,DD}gels (#630)
+// ---------------------------------------------------------------------------
+//
+// Cudarc only exposes the iterative-refinement variants (SSgels, DDgels);
+// these use the same precision as the input dtype throughout. Both expect
+// column-major operands. We use the existing gpu_transpose_2d /
+// gpu_transpose_2d_f64 to flip row-major → column-major on device.
+//
+// API: takes A (m×n) and B (m×nrhs) as device buffers, returns X (n×nrhs)
+// as a device buffer — fully on-device, no host bounce.
+
+/// GPU-resident least-squares solver (f32). Mirrors `torch.linalg.lstsq`'s
+/// solution output. Returns X minimizing `||A X - B||_F`. (#630)
+#[cfg(feature = "cuda")]
+pub fn gpu_lstsq_f32(
+    a_dev: &CudaBuffer<f32>,
+    b_dev: &CudaBuffer<f32>,
+    m: usize,
+    n: usize,
+    nrhs: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::cusolver::sys as csys;
+
+    if a_dev.len() != m * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lstsq_f32: A length mismatch",
+            expected: vec![m * n],
+            got: vec![a_dev.len()],
+        });
+    }
+    if b_dev.len() != m * nrhs {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lstsq_f32: B length mismatch",
+            expected: vec![m * nrhs],
+            got: vec![b_dev.len()],
+        });
+    }
+    if m == 0 || n == 0 || nrhs == 0 {
+        return crate::transfer::alloc_zeros_f32(n * nrhs, device);
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Row-major → column-major on device.
+    let mut d_a_col = crate::kernels::gpu_transpose_2d(a_dev, m, n, device)?;
+    let mut d_b_col = crate::kernels::gpu_transpose_2d(b_dev, m, nrhs, device)?;
+
+    let mut d_x = crate::transfer::alloc_zeros_f32(n * nrhs, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+    let mut iter: i32 = 0;
+
+    // Query workspace.
+    let mut lwork_bytes: usize = 0;
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (b_ptr, _b_sync) = d_b_col.inner_mut().device_ptr_mut(&stream);
+        let (x_ptr, _x_sync) = d_x.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnSSgels_bufferSize(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            nrhs as i32,
+            a_ptr as *mut f32,
+            m as i32,
+            b_ptr as *mut f32,
+            m as i32,
+            x_ptr as *mut f32,
+            n as i32,
+            std::ptr::null_mut(),
+            &mut lwork_bytes,
+        )
+        .result()?;
+    }
+
+    let work_elems = lwork_bytes.div_ceil(4).max(1);
+    let mut d_work = crate::transfer::alloc_zeros_f32(work_elems, device)?;
+
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (b_ptr, _b_sync) = d_b_col.inner_mut().device_ptr_mut(&stream);
+        let (x_ptr, _x_sync) = d_x.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnSSgels(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            nrhs as i32,
+            a_ptr as *mut f32,
+            m as i32,
+            b_ptr as *mut f32,
+            m as i32,
+            x_ptr as *mut f32,
+            n as i32,
+            work_ptr as *mut std::ffi::c_void,
+            lwork_bytes,
+            &mut iter,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val < 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lstsq_f32: SSgels reported an invalid argument",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    // Solution X is column-major n×nrhs; convert back to row-major.
+    crate::kernels::gpu_transpose_2d(&d_x, n, nrhs, device)
+}
+
+/// GPU-resident least-squares solver (f64). Mirrors [`gpu_lstsq_f32`]. (#630)
+#[cfg(feature = "cuda")]
+pub fn gpu_lstsq_f64(
+    a_dev: &CudaBuffer<f64>,
+    b_dev: &CudaBuffer<f64>,
+    m: usize,
+    n: usize,
+    nrhs: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::cusolver::sys as csys;
+
+    if a_dev.len() != m * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lstsq_f64: A length mismatch",
+            expected: vec![m * n],
+            got: vec![a_dev.len()],
+        });
+    }
+    if b_dev.len() != m * nrhs {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lstsq_f64: B length mismatch",
+            expected: vec![m * nrhs],
+            got: vec![b_dev.len()],
+        });
+    }
+    if m == 0 || n == 0 || nrhs == 0 {
+        return crate::transfer::alloc_zeros_f64(n * nrhs, device);
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    let mut d_a_col = crate::kernels::gpu_transpose_2d_f64(a_dev, m, n, device)?;
+    let mut d_b_col = crate::kernels::gpu_transpose_2d_f64(b_dev, m, nrhs, device)?;
+    let mut d_x = crate::transfer::alloc_zeros_f64(n * nrhs, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+    let mut iter: i32 = 0;
+
+    let mut lwork_bytes: usize = 0;
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (b_ptr, _b_sync) = d_b_col.inner_mut().device_ptr_mut(&stream);
+        let (x_ptr, _x_sync) = d_x.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnDDgels_bufferSize(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            nrhs as i32,
+            a_ptr as *mut f64,
+            m as i32,
+            b_ptr as *mut f64,
+            m as i32,
+            x_ptr as *mut f64,
+            n as i32,
+            std::ptr::null_mut(),
+            &mut lwork_bytes,
+        )
+        .result()?;
+    }
+
+    let work_elems = lwork_bytes.div_ceil(8).max(1);
+    let mut d_work = crate::transfer::alloc_zeros_f64(work_elems, device)?;
+
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (b_ptr, _b_sync) = d_b_col.inner_mut().device_ptr_mut(&stream);
+        let (x_ptr, _x_sync) = d_x.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDDgels(
+            dn.cu(),
+            m as i32,
+            n as i32,
+            nrhs as i32,
+            a_ptr as *mut f64,
+            m as i32,
+            b_ptr as *mut f64,
+            m as i32,
+            x_ptr as *mut f64,
+            n as i32,
+            work_ptr as *mut std::ffi::c_void,
+            lwork_bytes,
+            &mut iter,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val < 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lstsq_f64: DDgels reported an invalid argument",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    crate::kernels::gpu_transpose_2d_f64(&d_x, n, nrhs, device)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_lstsq_f32(
+    _a: &CudaBuffer<f32>,
+    _b: &CudaBuffer<f32>,
+    _m: usize,
+    _n: usize,
+    _nrhs: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_lstsq_f64(
+    _a: &CudaBuffer<f64>,
+    _b: &CudaBuffer<f64>,
+    _m: usize,
+    _n: usize,
+    _nrhs: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+// ---------------------------------------------------------------------------
+// Non-symmetric eigendecomposition: A = V Λ V^{-1}  via cusolverDnXgeev (#631)
+// ---------------------------------------------------------------------------
+//
+// Wraps the cusolver "X" (extended) geev API. For real input A of size n×n:
+//   - W:  complex eigenvalues, length n, stored as `[n, 2]` interleaved
+//         re/im pairs (matches the FFT convention).
+//   - VR: complex right eigenvectors, n×n, stored as `[n, n, 2]` interleaved.
+// We compute right eigenvectors only (jobvl = NOVECTOR, jobvr = VECTOR) since
+// torch.linalg.eig also returns just (eigenvalues, eigenvectors).
+
+#[cfg(feature = "cuda")]
+struct DnParamsHandle {
+    inner: cudarc::cusolver::sys::cusolverDnParams_t,
+}
+
+#[cfg(feature = "cuda")]
+impl DnParamsHandle {
+    fn new() -> GpuResult<Self> {
+        use cudarc::cusolver::sys as csys;
+        let mut p: csys::cusolverDnParams_t = std::ptr::null_mut();
+        unsafe {
+            csys::cusolverDnCreateParams(&mut p).result()?;
+        }
+        Ok(Self { inner: p })
+    }
+    fn raw(&self) -> cudarc::cusolver::sys::cusolverDnParams_t {
+        self.inner
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DnParamsHandle {
+    fn drop(&mut self) {
+        if !self.inner.is_null() {
+            unsafe {
+                let _ = cudarc::cusolver::sys::cusolverDnDestroyParams(self.inner);
+            }
+        }
+    }
+}
+
+/// GPU-resident non-symmetric eigendecomposition (f32 → complex output).
+/// Mirrors `torch.linalg.eig` for real f32 inputs. Returns
+/// `(W: CudaBuffer<f32>, VR: CudaBuffer<f32>)` where:
+///   - W has length `2n` interleaved re/im (logical shape `[n, 2]`)
+///   - VR has length `2 * n * n` row-major (logical shape `[n, n, 2]`)
+/// (#631)
+#[cfg(feature = "cuda")]
+pub fn gpu_eig_f32(
+    a_dev: &CudaBuffer<f32>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<f32>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if a_dev.len() != n * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eig_f32: A length mismatch",
+            expected: vec![n * n],
+            got: vec![a_dev.len()],
+        });
+    }
+    if n == 0 {
+        return Ok((
+            crate::transfer::alloc_zeros_f32(0, device)?,
+            crate::transfer::alloc_zeros_f32(0, device)?,
+        ));
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+    let params = DnParamsHandle::new()?;
+
+    // Row-major → column-major on device (cuSOLVER expects column-major).
+    let mut d_a_col = crate::kernels::gpu_transpose_2d(a_dev, n, n, device)?;
+    // W: complex eigenvalues, 2n f32 (re/im interleaved).
+    let mut d_w = crate::transfer::alloc_zeros_f32(2 * n, device)?;
+    // VR: complex right eigenvectors, 2 * n * n f32 (re/im interleaved per element).
+    let mut d_vr = crate::transfer::alloc_zeros_f32(2 * n * n, device)?;
+    // VL: dummy 1-element placeholder for the buffer-size argument-validation
+    // path. Even with jobvl = NOVECTOR, cuSOLVER's X-API rejects null VL.
+    let mut d_vl_dummy = crate::transfer::alloc_zeros_f32(2, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let novec = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_NOVECTOR;
+    let vec_mode = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
+    let dt_a = csys::cudaDataType::CUDA_R_32F;
+    let dt_w = csys::cudaDataType::CUDA_C_32F;
+    let dt_v = csys::cudaDataType::CUDA_C_32F;
+    let compute_type = csys::cudaDataType::CUDA_R_32F;
+
+    // Buffer-size query.
+    let mut wks_dev_bytes: usize = 0;
+    let mut wks_host_bytes: usize = 0;
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _w_sync) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (vr_ptr, _vr_sync) = d_vr.inner_mut().device_ptr_mut(&stream);
+        let (vl_ptr, _vl_sync) = d_vl_dummy.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnXgeev_bufferSize(
+            dn.cu(),
+            params.raw(),
+            novec,
+            vec_mode,
+            n as i64,
+            dt_a,
+            a_ptr as *const std::ffi::c_void,
+            n as i64,
+            dt_w,
+            w_ptr as *const std::ffi::c_void,
+            dt_v,
+            vl_ptr as *const std::ffi::c_void,
+            n as i64,
+            dt_v,
+            vr_ptr as *const std::ffi::c_void,
+            n as i64,
+            compute_type,
+            &mut wks_dev_bytes,
+            &mut wks_host_bytes,
+        )
+        .result()?;
+    }
+
+    let dev_work_elems = wks_dev_bytes.div_ceil(4).max(1);
+    let mut d_work = crate::transfer::alloc_zeros_f32(dev_work_elems, device)?;
+    let mut host_work: Vec<u8> = vec![0u8; wks_host_bytes];
+
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _w_sync) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (vr_ptr, _vr_sync) = d_vr.inner_mut().device_ptr_mut(&stream);
+        let (vl_ptr, _vl_sync) = d_vl_dummy.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnXgeev(
+            dn.cu(),
+            params.raw(),
+            novec,
+            vec_mode,
+            n as i64,
+            dt_a,
+            a_ptr as *mut std::ffi::c_void,
+            n as i64,
+            dt_w,
+            w_ptr as *mut std::ffi::c_void,
+            dt_v,
+            vl_ptr as *mut std::ffi::c_void,
+            n as i64,
+            dt_v,
+            vr_ptr as *mut std::ffi::c_void,
+            n as i64,
+            compute_type,
+            work_ptr as *mut std::ffi::c_void,
+            wks_dev_bytes,
+            host_work.as_mut_ptr() as *mut std::ffi::c_void,
+            wks_host_bytes,
+            info_ptr as *mut std::ffi::c_int,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eig_f32: Xgeev failed (non-converged eigenvalues)",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    // VR is stored as a column-major n×n complex matrix in cuSOLVER's
+    // layout: each element occupies 2 consecutive f32s (re/im). To convert
+    // to row-major while preserving the `[n, n, 2]` interleaved-complex
+    // logical shape, we view VR as a column-major (2n)×n grid of f32 (each
+    // complex column expands to 2 floats stacked) and transpose it to
+    // row-major. After transpose, layout is `[n, 2n]`, which when reshaped
+    // to `[n, n, 2]` matches our interleaved convention.
+    //
+    // However the more direct mental model: cuSOLVER's column-major
+    // complex VR stores element (row=i, col=j) at position
+    // `col_major_offset(j, i) = (j * n + i) * 2`. We want row-major at
+    // `(i * n + j) * 2`. The transpose-2d kernel works on f32 strides; we
+    // would need to transpose pairs of f32. Easiest is a host-side
+    // permutation — pulling 2*n*n f32 down, swapping, and pushing back.
+    // For typical eig sizes (n ≤ 1024) this is small.
+    let host = crate::transfer::gpu_to_cpu(&d_vr, device)?;
+    let mut row_major = vec![0.0_f32; 2 * n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let src = (j * n + i) * 2;
+            let dst = (i * n + j) * 2;
+            row_major[dst] = host[src];
+            row_major[dst + 1] = host[src + 1];
+        }
+    }
+    let d_vr_row = crate::transfer::cpu_to_gpu(&row_major, device)?;
+
+    Ok((d_w, d_vr_row))
+}
+
+/// f64 counterpart of [`gpu_eig_f32`]. (#631)
+#[cfg(feature = "cuda")]
+pub fn gpu_eig_f64(
+    a_dev: &CudaBuffer<f64>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if a_dev.len() != n * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eig_f64: A length mismatch",
+            expected: vec![n * n],
+            got: vec![a_dev.len()],
+        });
+    }
+    if n == 0 {
+        return Ok((
+            crate::transfer::alloc_zeros_f64(0, device)?,
+            crate::transfer::alloc_zeros_f64(0, device)?,
+        ));
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+    let params = DnParamsHandle::new()?;
+
+    let mut d_a_col = crate::kernels::gpu_transpose_2d_f64(a_dev, n, n, device)?;
+    let mut d_w = crate::transfer::alloc_zeros_f64(2 * n, device)?;
+    let mut d_vr = crate::transfer::alloc_zeros_f64(2 * n * n, device)?;
+    let mut d_vl_dummy = crate::transfer::alloc_zeros_f64(2, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let novec = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_NOVECTOR;
+    let vec_mode = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
+    let dt_a = csys::cudaDataType::CUDA_R_64F;
+    let dt_w = csys::cudaDataType::CUDA_C_64F;
+    let dt_v = csys::cudaDataType::CUDA_C_64F;
+    let compute_type = csys::cudaDataType::CUDA_R_64F;
+
+    let mut wks_dev_bytes: usize = 0;
+    let mut wks_host_bytes: usize = 0;
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _w_sync) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (vr_ptr, _vr_sync) = d_vr.inner_mut().device_ptr_mut(&stream);
+        let (vl_ptr, _vl_sync) = d_vl_dummy.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnXgeev_bufferSize(
+            dn.cu(),
+            params.raw(),
+            novec,
+            vec_mode,
+            n as i64,
+            dt_a,
+            a_ptr as *const std::ffi::c_void,
+            n as i64,
+            dt_w,
+            w_ptr as *const std::ffi::c_void,
+            dt_v,
+            vl_ptr as *const std::ffi::c_void,
+            n as i64,
+            dt_v,
+            vr_ptr as *const std::ffi::c_void,
+            n as i64,
+            compute_type,
+            &mut wks_dev_bytes,
+            &mut wks_host_bytes,
+        )
+        .result()?;
+    }
+
+    let dev_work_elems = wks_dev_bytes.div_ceil(8).max(1);
+    let mut d_work = crate::transfer::alloc_zeros_f64(dev_work_elems, device)?;
+    let mut host_work: Vec<u8> = vec![0u8; wks_host_bytes];
+
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _w_sync) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (vr_ptr, _vr_sync) = d_vr.inner_mut().device_ptr_mut(&stream);
+        let (vl_ptr, _vl_sync) = d_vl_dummy.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnXgeev(
+            dn.cu(),
+            params.raw(),
+            novec,
+            vec_mode,
+            n as i64,
+            dt_a,
+            a_ptr as *mut std::ffi::c_void,
+            n as i64,
+            dt_w,
+            w_ptr as *mut std::ffi::c_void,
+            dt_v,
+            vl_ptr as *mut std::ffi::c_void,
+            n as i64,
+            dt_v,
+            vr_ptr as *mut std::ffi::c_void,
+            n as i64,
+            compute_type,
+            work_ptr as *mut std::ffi::c_void,
+            wks_dev_bytes,
+            host_work.as_mut_ptr() as *mut std::ffi::c_void,
+            wks_host_bytes,
+            info_ptr as *mut std::ffi::c_int,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eig_f64: Xgeev failed",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    // Same column-major complex → row-major complex permutation as f32.
+    let host = crate::transfer::gpu_to_cpu(&d_vr, device)?;
+    let mut row_major = vec![0.0_f64; 2 * n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let src = (j * n + i) * 2;
+            let dst = (i * n + j) * 2;
+            row_major[dst] = host[src];
+            row_major[dst + 1] = host[src + 1];
+        }
+    }
+    let d_vr_row = crate::transfer::cpu_to_gpu(&row_major, device)?;
+
+    Ok((d_w, d_vr_row))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_eig_f32(
+    _a: &CudaBuffer<f32>,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<f32>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_eig_f64(
+    _a: &CudaBuffer<f64>,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
+// ---------------------------------------------------------------------------
 // QR: A = Q * R   (reduced/thin)
 // ---------------------------------------------------------------------------
 
