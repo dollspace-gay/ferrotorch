@@ -364,6 +364,27 @@ pub fn prod<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
 }
 
 fn prod_inner<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let t_is_f32 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>();
+    let t_is_f64 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
+
+    // GPU path: native reduce_prod kernel (#524).
+    if input.is_cuda() && (t_is_f32 || t_is_f64) {
+        let backend =
+            crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+        let handle = if t_is_f32 {
+            backend.prod_f32(input.gpu_handle()?, input.numel())?
+        } else {
+            backend.prod_f64(input.gpu_handle()?, input.numel())?
+        };
+        let storage = TensorStorage::gpu(handle);
+        if is_grad_enabled() && input.requires_grad() {
+            let grad_fn = Arc::new(ProdBackward {
+                input: input.clone(),
+            });
+            return Tensor::from_operation(storage, vec![], grad_fn);
+        }
+        return Tensor::from_storage(storage, vec![], false);
+    }
     if input.is_cuda() {
         return Err(FerrotorchError::NotImplementedOnCuda { op: "prod" });
     }

@@ -5171,6 +5171,97 @@ END:
 // where outer_idx = i / inner_size, inner_idx = i % inner_size.
 
 
+/// PTX source for `reduce_prod_kernel`: parallel block-level product
+/// reduction (#524). Mirrors `REDUCE_SUM_PTX` exactly but the
+/// accumulator inits to 1.0 and the combiner is `mul.f32` instead of
+/// `add.f32`. Used for `prod` forward.
+#[cfg(feature = "cuda")]
+pub(crate) const REDUCE_PROD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.shared .align 4 .f32 sdata[256];
+
+.visible .entry reduce_prod_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n
+) {
+    .reg .u32 %tid, %bid, %bdim, %gdim, %n_reg, %idx, %stride, %half;
+    .reg .u64 %in, %out, %off;
+    .reg .f32 %acc, %other;
+    .reg .pred %p, %ptid;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %tid, %tid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %gdim, %nctaid.x;
+
+    mad.lo.u32 %idx, %bid, %bdim, %tid;
+    mul.lo.u32 %stride, %bdim, %gdim;
+    mov.f32 %acc, 0f3F800000;        // 1.0 (multiplicative identity)
+
+GRID_LOOP_PROD:
+    setp.ge.u32 %p, %idx, %n_reg;
+    @%p bra GRID_DONE_PROD;
+
+    cvt.u64.u32 %off, %idx;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %in, %off;
+    ld.global.f32 %other, [%off];
+    mul.f32 %acc, %acc, %other;
+    add.u32 %idx, %idx, %stride;
+    bra GRID_LOOP_PROD;
+
+GRID_DONE_PROD:
+    cvt.u64.u32 %off, %tid;
+    shl.b64 %off, %off, 2;
+    st.shared.f32 [sdata + %off], %acc;
+    bar.sync 0;
+
+    mov.u32 %half, 128;
+TREE_LOOP_PROD:
+    setp.lt.u32 %p, %half, 1;
+    @%p bra TREE_DONE_PROD;
+
+    setp.ge.u32 %ptid, %tid, %half;
+    @%ptid bra TREE_SKIP_PROD;
+
+    add.u32 %idx, %tid, %half;
+    cvt.u64.u32 %off, %idx;
+    shl.b64 %off, %off, 2;
+    ld.shared.f32 %other, [sdata + %off];
+    cvt.u64.u32 %off, %tid;
+    shl.b64 %off, %off, 2;
+    ld.shared.f32 %acc, [sdata + %off];
+    mul.f32 %acc, %acc, %other;
+    st.shared.f32 [sdata + %off], %acc;
+
+TREE_SKIP_PROD:
+    bar.sync 0;
+    shr.u32 %half, %half, 1;
+    bra TREE_LOOP_PROD;
+
+TREE_DONE_PROD:
+    setp.ne.u32 %ptid, %tid, 0;
+    @%ptid bra END_PROD;
+
+    ld.shared.f32 %acc, [sdata];
+    cvt.u64.u32 %off, %bid;
+    shl.b64 %off, %off, 2;
+    add.u64 %out, %out, %off;
+    st.global.f32 [%out], %acc;
+
+END_PROD:
+    ret;
+}
+";
+
 /// PTX source for `reduce_min_kernel`: parallel block-level min reduction (#627).
 ///
 /// Mirrors `REDUCE_SUM_PTX` exactly except:
@@ -12135,6 +12226,80 @@ pub fn gpu_reduce_sum(
     Err(GpuError::NoCudaFeature)
 }
 
+/// f32 parallel reduction returning the product of all elements (#524).
+/// Two-pass dispatch identical to `gpu_reduce_sum`/`gpu_reduce_min`, with
+/// `1.0` identity and `mul.f32` combiner.
+#[cfg(feature = "cuda")]
+pub fn gpu_reduce_prod(
+    a: &CudaBuffer<f32>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    let n = a.len();
+    if n == 0 {
+        return cpu_to_gpu(&[1.0_f32], device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        REDUCE_PROD_PTX,
+        "reduce_prod_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(a, device)?;
+            let total: f32 = host.iter().product();
+            return cpu_to_gpu(&[total], device);
+        }
+    };
+
+    const BLOCK: u32 = 256;
+    let num_blocks = ((n as u32).saturating_add(BLOCK - 1)) / BLOCK;
+    let num_blocks = num_blocks.min(1024);
+    // Sentinel-init the partials with 1.0 so blocks that exit the grid
+    // loop without writing don't poison the second pass with zeros.
+    let mut partials = cpu_to_gpu(&vec![1.0_f32; num_blocks as usize], device)?;
+    let n_u32 = n as u32;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_blocks.max(1), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(partials.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    if num_blocks <= 1 {
+        return Ok(partials);
+    }
+    if num_blocks <= 256 {
+        let host = gpu_to_cpu(&partials, device)?;
+        let total: f32 = host.iter().product();
+        return cpu_to_gpu(&[total], device);
+    }
+    gpu_reduce_prod(&partials, device)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_reduce_prod(
+    _a: &CudaBuffer<f32>,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
 /// f32 parallel reduction returning the minimum element. Two-pass kernel
 /// dispatch identical to [`gpu_reduce_sum`] but using
 /// [`REDUCE_MIN_PTX`]. (#627)
@@ -15706,6 +15871,73 @@ pub fn gpu_reduce_max_f64(
 
     gpu_reduce_max_f64(&partials, device)
 }
+
+/// f64 reduce_prod (#524).
+#[cfg(feature = "cuda")]
+pub fn gpu_reduce_prod_f64(
+    a: &CudaBuffer<f64>,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    let n = a.len();
+    if n == 0 {
+        return cpu_to_gpu(&[1.0_f64], device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let ptx = get_f64_ptx(&CACHE, REDUCE_PROD_PTX, "reduce_prod_kernel", "reduce_prod_f64_kernel");
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "reduce_prod_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(a, device)?;
+            let total: f64 = host.iter().product();
+            return cpu_to_gpu(&[total], device);
+        }
+    };
+
+    const BLOCK: u32 = 256;
+    let num_blocks = ((n as u32).saturating_add(BLOCK - 1)) / BLOCK;
+    let num_blocks = num_blocks.min(1024);
+    let mut partials = cpu_to_gpu(&vec![1.0_f64; num_blocks as usize], device)?;
+    let n_u32 = n as u32;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_blocks.max(1), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(a.inner())
+            .arg(partials.inner_mut())
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    if num_blocks <= 1 {
+        return Ok(partials);
+    }
+    if num_blocks <= 256 {
+        let host = gpu_to_cpu(&partials, device)?;
+        let total: f64 = host.iter().product();
+        return cpu_to_gpu(&[total], device);
+    }
+    gpu_reduce_prod_f64(&partials, device)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_reduce_prod_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
 
 #[cfg(not(feature = "cuda"))]
 pub fn gpu_reduce_min_f64(_a: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }

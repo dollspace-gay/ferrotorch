@@ -771,6 +771,13 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer_f64(result, a.device_ordinal()))
     }
 
+    fn prod_f64(&self, a: &GpuBufferHandle, _n: usize) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let result = crate::kernels::gpu_reduce_prod_f64(a_buf, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(result, a.device_ordinal()))
+    }
+
     fn min_f64(&self, a: &GpuBufferHandle, _n: usize) -> FerrotorchResult<GpuBufferHandle> {
         let a_buf = Self::unwrap_buffer_f64(a)?;
         let dev = self.device(a.device_ordinal())?;
@@ -1336,6 +1343,13 @@ impl GpuBackend for CudaBackendImpl {
         let a_buf = Self::unwrap_buffer(a)?;
         let dev = self.device(a.device_ordinal())?;
         let result = crate::kernels::gpu_reduce_sum(a_buf, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    fn prod_f32(&self, a: &GpuBufferHandle, _len: usize) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let result = crate::kernels::gpu_reduce_prod(a_buf, dev).map_err(Self::map_gpu_err)?;
         Ok(Self::wrap_buffer(result, a.device_ordinal()))
     }
 

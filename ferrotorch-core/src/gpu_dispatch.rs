@@ -199,6 +199,18 @@ pub trait GpuBackend: Send + Sync {
     // Reduction f32
     fn sum_f32(&self, a: &GpuBufferHandle, len: usize) -> FerrotorchResult<GpuBufferHandle>;
 
+    /// f32 product reduction. Returns a 1-element buffer holding the
+    /// product of all elements. (#524)
+    fn prod_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "GPU reduce_prod not implemented for this backend".into(),
+        })
+    }
+
     /// f32 parallel min reduction. Returns a 1-element buffer holding the
     /// minimum element of `a`. Default impl returns the
     /// "not yet implemented" error so existing backends compile unchanged
@@ -308,6 +320,17 @@ pub trait GpuBackend: Send + Sync {
     fn sum_f64(&self, _a: &GpuBufferHandle, _numel: usize) -> FerrotorchResult<GpuBufferHandle> {
         Err(FerrotorchError::InvalidArgument {
             message: "f64 GPU ops not yet implemented".into(),
+        })
+    }
+
+    /// f64 product reduction. (#524)
+    fn prod_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "f64 GPU reduce_prod not implemented for this backend".into(),
         })
     }
 
