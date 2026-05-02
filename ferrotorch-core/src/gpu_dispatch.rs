@@ -199,6 +199,58 @@ pub trait GpuBackend: Send + Sync {
     // Reduction f32
     fn sum_f32(&self, a: &GpuBufferHandle, len: usize) -> FerrotorchResult<GpuBufferHandle>;
 
+    /// f32 parallel min reduction. Returns a 1-element buffer holding the
+    /// minimum element of `a`. Default impl returns the
+    /// "not yet implemented" error so existing backends compile unchanged
+    /// — concrete backends override. (#627)
+    fn min_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "GPU reduce_min not implemented for this backend".into(),
+        })
+    }
+
+    /// f32 parallel max reduction. Counterpart of [`Self::min_f32`]. (#627)
+    fn max_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "GPU reduce_max not implemented for this backend".into(),
+        })
+    }
+
+    /// f32 fused masked-min reduction (#627). Single-pass kernel that
+    /// folds `(data, mask_f) -> min` directly, where `mask_f[i]` is 1.0
+    /// for valid entries and 0.0 for masked. Avoids the
+    /// `mul + add + reduce` chain that the unfused path requires.
+    fn masked_min_f32(
+        &self,
+        _data: &GpuBufferHandle,
+        _mask_f: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "GPU masked_reduce_min not implemented for this backend".into(),
+        })
+    }
+
+    /// f32 fused masked-max counterpart of [`Self::masked_min_f32`]. (#627)
+    fn masked_max_f32(
+        &self,
+        _data: &GpuBufferHandle,
+        _mask_f: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "GPU masked_reduce_max not implemented for this backend".into(),
+        })
+    }
+
     // Elementwise f64 (default impls return "not yet implemented" errors)
     fn add_f64(
         &self,
@@ -256,6 +308,52 @@ pub trait GpuBackend: Send + Sync {
     fn sum_f64(&self, _a: &GpuBufferHandle, _numel: usize) -> FerrotorchResult<GpuBufferHandle> {
         Err(FerrotorchError::InvalidArgument {
             message: "f64 GPU ops not yet implemented".into(),
+        })
+    }
+
+    /// f64 parallel min reduction. (#627)
+    fn min_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "f64 GPU reduce_min not implemented for this backend".into(),
+        })
+    }
+
+    /// f64 parallel max reduction. (#627)
+    fn max_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "f64 GPU reduce_max not implemented for this backend".into(),
+        })
+    }
+
+    /// f64 fused masked-min reduction (#627).
+    fn masked_min_f64(
+        &self,
+        _data: &GpuBufferHandle,
+        _mask_f: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "f64 GPU masked_reduce_min not implemented for this backend".into(),
+        })
+    }
+
+    /// f64 fused masked-max reduction (#627).
+    fn masked_max_f64(
+        &self,
+        _data: &GpuBufferHandle,
+        _mask_f: &GpuBufferHandle,
+        _len: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "f64 GPU masked_reduce_max not implemented for this backend".into(),
         })
     }
 

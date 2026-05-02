@@ -321,31 +321,32 @@ fn masked_mean_gpu<T: Float>(mt: &MaskedTensor<T>) -> FerrotorchResult<Tensor<T>
 
 /// Min of valid entries; returns a 0-d tensor (NaN if all masked).
 ///
-/// On CUDA, downloads data via [`Tensor::data_vec`] and reduces on host.
-/// Native GPU reduce_min/max kernels are tracked in #627 — when they land,
-/// the GPU path can switch to the inf-fill + reduce strategy and avoid the
-/// download. Until then, the GPU path is correct but pays an O(numel) PCIe
-/// transfer per call.
+/// GPU path: uses the fused `masked_reduce_min` PTX kernel (#627). Single
+/// launch reads `(data, mask_f)` directly and combines `mask_f != 0 ?
+/// data : +inf` into the running min accumulator — no intermediate
+/// buffers, no CPU-side sentinel construction. Same f32/f64-only gate as
+/// `masked_sum` / `masked_mean`; other dtypes (bf16/f16) take the CPU
+/// walk, matching the existing masked surface.
 pub fn masked_min<T: Float>(mt: &MaskedTensor<T>) -> FerrotorchResult<Tensor<T>> {
-    masked_extremum(mt, true)
+    if mt.data.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+        return masked_extremum_gpu(mt, true);
+    }
+    masked_extremum_cpu(mt, true)
 }
 
 /// Max of valid entries; returns a 0-d tensor (NaN if all masked).
-///
-/// See [`masked_min`] for the GPU-path notes.
 pub fn masked_max<T: Float>(mt: &MaskedTensor<T>) -> FerrotorchResult<Tensor<T>> {
-    masked_extremum(mt, false)
+    if mt.data.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+        return masked_extremum_gpu(mt, false);
+    }
+    masked_extremum_cpu(mt, false)
 }
 
-fn masked_extremum<T: Float>(
+/// CPU implementation: walk data + mask in one pass.
+fn masked_extremum_cpu<T: Float>(
     mt: &MaskedTensor<T>,
     pick_min: bool,
 ) -> FerrotorchResult<Tensor<T>> {
-    // CPU and CUDA take the same scalar walk; `data_vec()` handles the GPU
-    // download path internally so callers see one uniform code path. The
-    // result is uploaded back to the input device so callers receive a
-    // tensor on the same device as `mt.data` (matching `masked_sum_gpu`'s
-    // contract).
     let device = mt.data.device();
     let data = mt.data.data_vec()?;
     let mut best: Option<T> = None;
@@ -374,6 +375,49 @@ fn masked_extremum<T: Float>(
     let val = best.unwrap_or_else(|| T::from(f64::NAN).unwrap());
     let cpu = Tensor::from_storage(TensorStorage::cpu(vec![val]), vec![], false)?;
     if device.is_cuda() { cpu.to(device) } else { Ok(cpu) }
+}
+
+/// GPU lowering via the **fused** masked-reduce kernel (#627).
+///
+/// Single PTX launch that combines `mask_f[i] != 0 ? data[i] : ±inf`
+/// directly into the running min/max accumulator. No intermediate
+/// `prod` / `filled` buffers, no CPU-side sentinel construction — the
+/// only data uploaded is the float mask itself, which we already need
+/// for the indicator role.
+fn masked_extremum_gpu<T: Float>(
+    mt: &MaskedTensor<T>,
+    pick_min: bool,
+) -> FerrotorchResult<Tensor<T>> {
+    // All-masked → NaN, short-circuit before allocating GPU buffers.
+    if mt.count_valid() == 0 {
+        let nan = T::from(f64::NAN).unwrap();
+        return Tensor::from_storage(TensorStorage::cpu(vec![nan]), vec![], false);
+    }
+
+    let device = mt.data.device();
+    let backend = crate::gpu_dispatch::gpu_backend()
+        .ok_or(FerrotorchError::DeviceUnavailable)?;
+    let numel = mt.data.numel();
+
+    // Build the [0/1] float mask on device. This is the only host upload —
+    // the mask is fundamentally a boolean Vec on the host side, so it has
+    // to land on the device once per call regardless. The fused kernel
+    // reads it directly and folds the sentinel-fill into the reduce.
+    let mask_t: Tensor<T> = mask_as_float_tensor(&mt.mask, mt.data.shape(), device)?;
+
+    let result_h = if pick_min {
+        if is_f32::<T>() {
+            backend.masked_min_f32(mt.data.gpu_handle()?, mask_t.gpu_handle()?, numel)?
+        } else {
+            backend.masked_min_f64(mt.data.gpu_handle()?, mask_t.gpu_handle()?, numel)?
+        }
+    } else if is_f32::<T>() {
+        backend.masked_max_f32(mt.data.gpu_handle()?, mask_t.gpu_handle()?, numel)?
+    } else {
+        backend.masked_max_f64(mt.data.gpu_handle()?, mask_t.gpu_handle()?, numel)?
+    };
+
+    Tensor::from_storage(TensorStorage::gpu(result_h), vec![], false)
 }
 
 /// Number of valid (unmasked) entries; returns a 0-d tensor in `T`.

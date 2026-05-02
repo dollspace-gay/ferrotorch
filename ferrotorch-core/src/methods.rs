@@ -116,6 +116,18 @@ impl<T: Float> Tensor<T> {
         crate::grad_fns::reduction::prod(self)
     }
 
+    /// Global minimum across all elements. Mirrors `torch.amin(self)` with
+    /// no `dim` argument. Returns a 0-d tensor. On CUDA f32/f64, dispatches
+    /// to the native PTX reduce_min kernel; on CPU walks the buffer. (#627)
+    pub fn amin(&self) -> FerrotorchResult<Tensor<T>> {
+        crate::grad_fns::reduction::amin(self)
+    }
+
+    /// Global maximum across all elements. Mirrors `torch.amax(self)`. (#627)
+    pub fn amax(&self) -> FerrotorchResult<Tensor<T>> {
+        crate::grad_fns::reduction::amax(self)
+    }
+
     // --- Linalg ---
 
     pub fn matmul(&self, other: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
