@@ -612,6 +612,21 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer_f64(result, a.device_ordinal()))
     }
 
+    fn clamp_backward_f64(
+        &self,
+        grad: &GpuBufferHandle,
+        input: &GpuBufferHandle,
+        min_val: f64,
+        max_val: f64,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let g_buf = Self::unwrap_buffer_f64(grad)?;
+        let i_buf = Self::unwrap_buffer_f64(input)?;
+        let dev = self.device(input.device_ordinal())?;
+        let result = crate::kernels::gpu_clamp_backward_f64(g_buf, i_buf, min_val, max_val, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(result, input.device_ordinal()))
+    }
+
     // f64 activation backward ops
 
     fn gelu_backward_f64(&self, grad: &GpuBufferHandle, input: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {
@@ -1966,6 +1981,21 @@ impl GpuBackend for CudaBackendImpl {
         let result =
             crate::kernels::gpu_clamp(a_buf, min_val, max_val, dev).map_err(Self::map_gpu_err)?;
         Ok(Self::wrap_buffer(result, a.device_ordinal()))
+    }
+
+    fn clamp_backward_f32(
+        &self,
+        grad: &GpuBufferHandle,
+        input: &GpuBufferHandle,
+        min_val: f32,
+        max_val: f32,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let g_buf = Self::unwrap_buffer(grad)?;
+        let i_buf = Self::unwrap_buffer(input)?;
+        let dev = self.device(input.device_ordinal())?;
+        let result = crate::kernels::gpu_clamp_backward(g_buf, i_buf, min_val, max_val, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(result, input.device_ordinal()))
     }
 
     fn silu_f32(&self, a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {

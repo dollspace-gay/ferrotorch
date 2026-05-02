@@ -413,7 +413,34 @@ struct ClampBackward<T: Float> {
 impl<T: Float> GradFn<T> for ClampBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
         let da = if self.input.requires_grad() {
-            if grad_output.is_cuda() || self.input.is_cuda() {
+            // GPU-native path for f32/f64 (#524).
+            if grad_output.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+                let backend = gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+                let result_h = if is_f32::<T>() {
+                    let min_f = self.min.to_f64().unwrap_or(f64::NEG_INFINITY) as f32;
+                    let max_f = self.max.to_f64().unwrap_or(f64::INFINITY) as f32;
+                    backend.clamp_backward_f32(
+                        grad_output.gpu_handle()?,
+                        self.input.gpu_handle()?,
+                        min_f,
+                        max_f,
+                    )?
+                } else {
+                    let min_f = self.min.to_f64().unwrap_or(f64::NEG_INFINITY);
+                    let max_f = self.max.to_f64().unwrap_or(f64::INFINITY);
+                    backend.clamp_backward_f64(
+                        grad_output.gpu_handle()?,
+                        self.input.gpu_handle()?,
+                        min_f,
+                        max_f,
+                    )?
+                };
+                Some(Tensor::from_storage(
+                    TensorStorage::gpu(result_h),
+                    self.input.shape().to_vec(),
+                    false,
+                )?)
+            } else if grad_output.is_cuda() || self.input.is_cuda() {
                 return Err(FerrotorchError::NotImplementedOnCuda {
                     op: "ClampBackward",
                 });

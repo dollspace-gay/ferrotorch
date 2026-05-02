@@ -1064,6 +1064,33 @@ pub trait GpuBackend: Send + Sync {
         })
     }
 
+    /// VJP for `clamp(x, min, max)`: `out[i] = grad[i]` when `x[i]` is in
+    /// `[min, max]`, else `0`. (#524)
+    fn clamp_backward_f32(
+        &self,
+        _grad: &GpuBufferHandle,
+        _input: &GpuBufferHandle,
+        _min_val: f32,
+        _max_val: f32,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "clamp_backward_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// f64 counterpart. (#524)
+    fn clamp_backward_f64(
+        &self,
+        _grad: &GpuBufferHandle,
+        _input: &GpuBufferHandle,
+        _min_val: f64,
+        _max_val: f64,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "clamp_backward_f64 GPU op not yet implemented".into(),
+        })
+    }
+
     // SiLU activation: out[i] = x * sigmoid(x)
     fn silu_f32(&self, _a: &GpuBufferHandle) -> FerrotorchResult<GpuBufferHandle> {
         Err(FerrotorchError::InvalidArgument {

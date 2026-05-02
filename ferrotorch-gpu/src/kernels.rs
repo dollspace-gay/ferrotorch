@@ -5570,6 +5570,66 @@ END_MMAX:
 ";
 
 
+/// PTX source for `clamp_backward_kernel` (#524).
+/// VJP for `clamp(x, min, max)`: `out[i] = grad[i]` when `min <= x[i] <= max`,
+/// else `0`. Single-pass elementwise — no shared memory.
+#[cfg(feature = "cuda")]
+pub(crate) const CLAMP_BACKWARD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry clamp_backward_kernel(
+    .param .u64 grad_ptr,
+    .param .u64 input_ptr,
+    .param .u64 out_ptr,
+    .param .f32 min_val,
+    .param .f32 max_val,
+    .param .u32 n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u64 %g, %x, %out, %off;
+    .reg .f32 %vg, %vx, %vmin, %vmax, %vr;
+    .reg .pred %p, %plo, %phi, %pin;
+
+    ld.param.u64 %g, [grad_ptr];
+    ld.param.u64 %x, [input_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.f32 %vmin, [min_val];
+    ld.param.f32 %vmax, [max_val];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE_CB;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %g, %g, %off;
+    add.u64 %x, %x, %off;
+    add.u64 %out, %out, %off;
+
+    ld.global.f32 %vg, [%g];
+    ld.global.f32 %vx, [%x];
+
+    setp.ge.f32 %plo, %vx, %vmin;
+    setp.le.f32 %phi, %vx, %vmax;
+    and.pred %pin, %plo, %phi;
+
+    mov.f32 %vr, 0f00000000;
+    @%pin mov.f32 %vr, %vg;
+
+    st.global.f32 [%out], %vr;
+
+DONE_CB:
+    ret;
+}
+";
+
 /// PTX source for `pad_truncate_kernel` (#605): copies a `[batch, src_n, 2]`
 /// complex tensor into a `[batch, dst_n, 2]` output, zero-padding when
 /// `dst_n > src_n` and truncating when `dst_n < src_n`. Each thread writes
@@ -14563,6 +14623,77 @@ pub fn gpu_clamp(
     Ok(out)
 }
 
+/// VJP for `clamp(x, min, max)`: `out[i] = grad[i]` if `min <= x[i] <= max`,
+/// else `0`. (#524)
+#[cfg(feature = "cuda")]
+pub fn gpu_clamp_backward(
+    grad: &CudaBuffer<f32>,
+    input: &CudaBuffer<f32>,
+    min_val: f32,
+    max_val: f32,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch {
+            a: grad.len(),
+            b: input.len(),
+        });
+    }
+    let n = input.len();
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        CLAMP_BACKWARD_PTX,
+        "clamp_backward_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let g = gpu_to_cpu(grad, device)?;
+            let x = gpu_to_cpu(input, device)?;
+            let out: Vec<f32> = g
+                .iter()
+                .zip(x.iter())
+                .map(|(&gi, &xi)| if xi >= min_val && xi <= max_val { gi } else { 0.0 })
+                .collect();
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(n, device)?;
+    let cfg = launch_cfg(n)?;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(grad.inner())
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&min_val)
+            .arg(&max_val)
+            .arg(&n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_clamp_backward(
+    _grad: &CudaBuffer<f32>,
+    _input: &CudaBuffer<f32>,
+    _min_val: f32,
+    _max_val: f32,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
 // ---------------------------------------------------------------------------
 // Public API -- elementwise transcendentals & math ops
 // ---------------------------------------------------------------------------
@@ -19148,6 +19279,70 @@ pub fn gpu_clamp_f64(
     let result: Vec<f64> = host.iter().map(|&x| x.max(min_val).min(max_val)).collect();
     cpu_to_gpu(&result, device)
 }
+
+/// f64 VJP for `clamp(x, min, max)`. Counterpart of [`gpu_clamp_backward`].
+/// (#524)
+#[cfg(feature = "cuda")]
+pub fn gpu_clamp_backward_f64(
+    grad: &CudaBuffer<f64>,
+    input: &CudaBuffer<f64>,
+    min_val: f64,
+    max_val: f64,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    if grad.len() != input.len() {
+        return Err(GpuError::LengthMismatch {
+            a: grad.len(),
+            b: input.len(),
+        });
+    }
+    let n = input.len();
+    if n == 0 {
+        return cpu_to_gpu(&[], device);
+    }
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(
+        &CACHE,
+        CLAMP_BACKWARD_PTX,
+        "clamp_backward_kernel",
+        "clamp_backward_f64_kernel",
+    );
+    if let Ok(f) =
+        crate::module_cache::get_or_compile(ctx, ptx, "clamp_backward_f64_kernel", device.ordinal() as u32)
+    {
+        let mut out = alloc_zeros_f64(n, device)?;
+        let n_u32 = n as u32;
+        let cfg = launch_cfg(n)?;
+        unsafe {
+            stream
+                .launch_builder(&f)
+                .arg(grad.inner())
+                .arg(input.inner())
+                .arg(out.inner_mut())
+                .arg(&min_val)
+                .arg(&max_val)
+                .arg(&n_u32)
+                .launch(cfg)?;
+        }
+        return Ok(out);
+    }
+    // PTX-compile failure → host walk.
+    let g = gpu_to_cpu(grad, device)?;
+    let x = gpu_to_cpu(input, device)?;
+    let out: Vec<f64> = g
+        .iter()
+        .zip(x.iter())
+        .map(|(&gi, &xi)| if xi >= min_val && xi <= max_val { gi } else { 0.0 })
+        .collect();
+    cpu_to_gpu(&out, device)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_clamp_backward_f64(_grad: &CudaBuffer<f64>, _input: &CudaBuffer<f64>, _min: f64, _max: f64, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
 
 /// Cumulative sum for f64.
 #[cfg(feature = "cuda")]
