@@ -392,6 +392,24 @@ impl<T: Float> Tensor<T> {
         self.inner.offset
     }
 
+    /// Number of elements in the underlying storage buffer.
+    ///
+    /// May be larger than [`numel()`](Self::numel) for views (transpose,
+    /// narrow, as_strided, etc.) that address only a subset of the
+    /// storage. Used by stride-manipulation ops (`as_strided`,
+    /// `as_strided_copy`) for bounds validation.
+    #[inline]
+    pub fn storage_len(&self) -> usize {
+        self.inner.storage.len()
+    }
+
+    /// Borrow the underlying [`TensorStorage`]. Used by ops that need
+    /// access to the GPU buffer handle or to share storage Arc-wise.
+    #[inline]
+    pub fn storage(&self) -> &TensorStorage<T> {
+        &self.inner.storage
+    }
+
     #[inline]
     pub fn device(&self) -> Device {
         self.inner.storage.device()

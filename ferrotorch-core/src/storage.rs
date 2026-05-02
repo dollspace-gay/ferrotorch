@@ -74,6 +74,9 @@ impl<T: Element> TensorStorage<T> {
                 Ok(Self::gpu(handle))
             }
             Device::Xpu(ordinal) => Ok(Self::xpu(data, ordinal)),
+            Device::Mps(_) => Err(crate::error::FerrotorchError::InvalidArgument {
+                message: "MPS storage requires the ferrotorch-mps backend; not yet wired into TensorStorage".into(),
+            }),
             Device::Meta => {
                 // Discard the data; only the element count matters.
                 Ok(Self::meta(data.len()))
@@ -105,6 +108,9 @@ impl<T: Element> TensorStorage<T> {
                 Ok(Self::gpu(handle))
             }
             Device::Xpu(ordinal) => Ok(Self::xpu(data, ordinal)),
+            Device::Mps(_) => Err(crate::error::FerrotorchError::InvalidArgument {
+                message: "MPS storage requires the ferrotorch-mps backend; not yet wired into TensorStorage".into(),
+            }),
             Device::Meta => Ok(Self::meta(data.len())),
         }
     }

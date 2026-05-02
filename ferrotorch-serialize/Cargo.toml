@@ -21,6 +21,7 @@ num-traits = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+memmap2 = "0.9"
 zip = { workspace = true }
 
 [dev-dependencies]

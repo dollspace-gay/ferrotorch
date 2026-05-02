@@ -296,8 +296,15 @@ mod tests {
                 "row {row} not on simplex: sum={row_sum}"
             );
             for c in 0..3 {
+                // Closed simplex [0, 1]: at finite precision a softmax
+                // output can underflow to exactly 0.0 or saturate to 1.0
+                // for low-prob / high-prob entries at temperature 0.5,
+                // so the strict (0, 1) bound was occasionally flaky.
                 let v = data[row * 3 + c];
-                assert!(v > 0.0 && v < 1.0, "row {row} col {c}: {v} not in (0,1)");
+                assert!(
+                    (0.0..=1.0).contains(&v),
+                    "row {row} col {c}: {v} not in [0, 1]"
+                );
             }
         }
     }

@@ -1569,6 +1569,756 @@ pub fn mish<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
 }
 
 // ===========================================================================
+// Activation tail (#594) — native fused GradFns for the activations that
+// are otherwise reachable via composition from `ferrotorch-nn::functional`.
+// The fused versions skip a layer of intermediate tensor allocation and
+// keep the backward pass at O(1) rather than O(k) extra ops.
+//
+// CPU implementations only — GPU dispatch can be added per-op later
+// (most are already cheap unary maps that compose with existing GPU ops).
+// ===========================================================================
+
+// --- leaky_relu ------------------------------------------------------------
+
+/// Backward for `leaky_relu(x; negative_slope)`.
+/// VJP: grad * (1 if x > 0 else negative_slope).
+#[derive(Debug)]
+pub struct LeakyReluBackward<T: Float> {
+    input: Tensor<T>,
+    negative_slope: f64,
+}
+
+impl<T: Float> LeakyReluBackward<T> {
+    pub fn new(input: Tensor<T>, negative_slope: f64) -> Self {
+        Self {
+            input,
+            negative_slope,
+        }
+    }
+}
+
+impl<T: Float> GradFn<T> for LeakyReluBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let slope = T::from(self.negative_slope).unwrap();
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| if x > zero { g * one } else { g * slope })
+            .collect();
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "LeakyReluBackward"
+    }
+}
+
+/// Native `leaky_relu(x; negative_slope) = max(0, x) + negative_slope * min(0, x)`.
+pub fn leaky_relu<T: Float>(
+    input: &Tensor<T>,
+    negative_slope: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    let zero = <T as num_traits::Zero>::zero();
+    let slope = T::from(negative_slope).unwrap();
+    let output = unary_map(input, |x| if x > zero { x } else { slope * x })?;
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(LeakyReluBackward::new(input.clone(), negative_slope)),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// --- hardtanh --------------------------------------------------------------
+
+/// Backward for `hardtanh(x; min, max) = clamp(x, min, max)`.
+/// VJP: grad if min < x < max else 0.
+#[derive(Debug)]
+pub struct HardtanhBackward<T: Float> {
+    input: Tensor<T>,
+    min_val: f64,
+    max_val: f64,
+}
+
+impl<T: Float> HardtanhBackward<T> {
+    pub fn new(input: Tensor<T>, min_val: f64, max_val: f64) -> Self {
+        Self {
+            input,
+            min_val,
+            max_val,
+        }
+    }
+}
+
+impl<T: Float> GradFn<T> for HardtanhBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let lo = T::from(self.min_val).unwrap();
+        let hi = T::from(self.max_val).unwrap();
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| if x > lo && x < hi { g } else { zero })
+            .collect();
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "HardtanhBackward"
+    }
+}
+
+/// Native `hardtanh(x; min, max) = clamp(x, min, max)`. Default torch range
+/// is `[-1, 1]`; pass other bounds via [`hardtanh_with`].
+pub fn hardtanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    hardtanh_with(input, -1.0, 1.0)
+}
+
+/// Hardtanh with explicit bounds.
+pub fn hardtanh_with<T: Float>(
+    input: &Tensor<T>,
+    min_val: f64,
+    max_val: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    let lo = T::from(min_val).unwrap();
+    let hi = T::from(max_val).unwrap();
+    let output = unary_map(input, |x| {
+        if x < lo {
+            lo
+        } else if x > hi {
+            hi
+        } else {
+            x
+        }
+    })?;
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(HardtanhBackward::new(input.clone(), min_val, max_val)),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+/// `relu6(x) = clamp(x, 0, 6)`. Differentiable via the same backward as
+/// hardtanh restricted to `[0, 6]`.
+pub fn relu6<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    hardtanh_with(input, 0.0, 6.0)
+}
+
+// --- hardsigmoid -----------------------------------------------------------
+
+/// Backward for `hardsigmoid(x) = clamp((x + 3) / 6, 0, 1)`.
+/// VJP: grad * (1/6) when -3 < x < 3 else 0.
+#[derive(Debug)]
+pub struct HardsigmoidBackward<T: Float> {
+    input: Tensor<T>,
+}
+
+impl<T: Float> HardsigmoidBackward<T> {
+    pub fn new(input: Tensor<T>) -> Self {
+        Self { input }
+    }
+}
+
+impl<T: Float> GradFn<T> for HardsigmoidBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let inv_six = T::from(1.0 / 6.0).unwrap();
+        let lo = T::from(-3.0).unwrap();
+        let hi = T::from(3.0).unwrap();
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| if x > lo && x < hi { g * inv_six } else { zero })
+            .collect();
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "HardsigmoidBackward"
+    }
+}
+
+/// Native `hardsigmoid(x) = clamp((x + 3) / 6, 0, 1)` (MobileNetV3).
+pub fn hardsigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let zero = <T as num_traits::Zero>::zero();
+    let one = <T as num_traits::One>::one();
+    let three = T::from(3.0).unwrap();
+    let inv_six = T::from(1.0 / 6.0).unwrap();
+    let output = unary_map(input, |x| {
+        let v = (x + three) * inv_six;
+        if v < zero {
+            zero
+        } else if v > one {
+            one
+        } else {
+            v
+        }
+    })?;
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(HardsigmoidBackward::new(input.clone())),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// --- hardswish -------------------------------------------------------------
+
+/// Backward for `hardswish(x) = x * hardsigmoid(x)`.
+/// VJP: grad * (1 if x ≥ 3, 0 if x ≤ -3, else (2x + 3)/6).
+#[derive(Debug)]
+pub struct HardswishBackward<T: Float> {
+    input: Tensor<T>,
+}
+
+impl<T: Float> HardswishBackward<T> {
+    pub fn new(input: Tensor<T>) -> Self {
+        Self { input }
+    }
+}
+
+impl<T: Float> GradFn<T> for HardswishBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let two = T::from(2.0).unwrap();
+        let three = T::from(3.0).unwrap();
+        let neg_three = T::from(-3.0).unwrap();
+        let inv_six = T::from(1.0 / 6.0).unwrap();
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| {
+                if x <= neg_three {
+                    zero
+                } else if x >= three {
+                    g
+                } else {
+                    g * (two * x + three) * inv_six
+                }
+            })
+            .collect();
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "HardswishBackward"
+    }
+}
+
+/// Native `hardswish(x) = x * hardsigmoid(x)`.
+pub fn hardswish<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let zero = <T as num_traits::Zero>::zero();
+    let three = T::from(3.0).unwrap();
+    let neg_three = T::from(-3.0).unwrap();
+    let inv_six = T::from(1.0 / 6.0).unwrap();
+    let output = unary_map(input, |x| {
+        if x <= neg_three {
+            zero
+        } else if x >= three {
+            x
+        } else {
+            x * (x + three) * inv_six
+        }
+    })?;
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(HardswishBackward::new(input.clone())),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// --- selu ------------------------------------------------------------------
+
+const SELU_ALPHA: f64 = 1.6732632423543772;
+const SELU_SCALE: f64 = 1.0507009873554805;
+
+/// Backward for `selu(x) = scale * elu(x, alpha)`.
+/// VJP: grad * scale * (1 if x > 0 else alpha * exp(x)).
+#[derive(Debug)]
+pub struct SeluBackward<T: Float> {
+    input: Tensor<T>,
+}
+
+impl<T: Float> SeluBackward<T> {
+    pub fn new(input: Tensor<T>) -> Self {
+        Self { input }
+    }
+}
+
+impl<T: Float> GradFn<T> for SeluBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let alpha = T::from(SELU_ALPHA).unwrap();
+        let scale = T::from(SELU_SCALE).unwrap();
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| {
+                if x > zero {
+                    g * scale
+                } else {
+                    g * scale * alpha * x.exp()
+                }
+            })
+            .collect();
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "SeluBackward"
+    }
+}
+
+/// Native `selu(x) = scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))`
+/// with the canonical SELU constants from Klambauer et al. 2017.
+pub fn selu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let zero = <T as num_traits::Zero>::zero();
+    let one = <T as num_traits::One>::one();
+    let alpha = T::from(SELU_ALPHA).unwrap();
+    let scale = T::from(SELU_SCALE).unwrap();
+    let output = unary_map(input, |x| {
+        if x > zero {
+            scale * x
+        } else {
+            scale * alpha * (x.exp() - one)
+        }
+    })?;
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(SeluBackward::new(input.clone())),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// --- softsign --------------------------------------------------------------
+
+/// Backward for `softsign(x) = x / (1 + |x|)`.
+/// VJP: grad / (1 + |x|)^2.
+#[derive(Debug)]
+pub struct SoftsignBackward<T: Float> {
+    input: Tensor<T>,
+}
+
+impl<T: Float> SoftsignBackward<T> {
+    pub fn new(input: Tensor<T>) -> Self {
+        Self { input }
+    }
+}
+
+impl<T: Float> GradFn<T> for SoftsignBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_data = self.input.data()?;
+        let grad_data = grad_output.data()?;
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = input_data
+            .iter()
+            .zip(grad_data.iter())
+            .map(|(&x, &g)| {
+                let denom = one + x.abs();
+                g / (denom * denom)
+            })
+            .collect();
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "SoftsignBackward"
+    }
+}
+
+/// Native `softsign(x) = x / (1 + |x|)`.
+pub fn softsign<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let one = <T as num_traits::One>::one();
+    let output = unary_map(input, |x| x / (one + x.abs()))?;
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(SoftsignBackward::new(input.clone())),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// --- prelu -----------------------------------------------------------------
+
+/// Backward for `prelu(x, alpha) = max(0, x) + alpha * min(0, x)`.
+///
+/// Gradients:
+///   `dL/dx[i]    = grad[i] * (x[i] >= 0 ? 1 : alpha)`
+///   `dL/dalpha   = sum_i grad[i] * (x[i] < 0 ? x[i] : 0)`   (scalar slope)
+///
+/// Single-pass fused VJP — replaces the previous
+/// `(1 - alpha) * relu(x) + alpha * x` decomposition that walked through three
+/// separate GradFn nodes per call.
+#[derive(Debug)]
+pub struct PReluBackward<T: Float> {
+    input: Tensor<T>,
+    alpha: Tensor<T>,
+}
+
+impl<T: Float> PReluBackward<T> {
+    pub fn new(input: Tensor<T>, alpha: Tensor<T>) -> Self {
+        Self { input, alpha }
+    }
+}
+
+impl<T: Float> GradFn<T> for PReluBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let x = self.input.data()?;
+        let alpha_data = self.alpha.data()?;
+        let alpha_v = alpha_data[0];
+        let g = grad_output.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+
+        // grad wrt input
+        let grad_input: Vec<T> = x
+            .iter()
+            .zip(g.iter())
+            .map(|(&xv, &gv)| if xv >= zero { gv * one } else { gv * alpha_v })
+            .collect();
+        let grad_input_t = Tensor::from_storage(
+            TensorStorage::cpu(grad_input),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+
+        // grad wrt alpha (scalar slope): sum over all negatives.
+        let mut grad_alpha = zero;
+        for (&xv, &gv) in x.iter().zip(g.iter()) {
+            if xv < zero {
+                grad_alpha = grad_alpha + gv * xv;
+            }
+        }
+        let grad_alpha_t =
+            Tensor::from_storage(TensorStorage::cpu(vec![grad_alpha]), vec![1], false)?;
+
+        Ok(vec![Some(grad_input_t), Some(grad_alpha_t)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input, &self.alpha]
+    }
+
+    fn name(&self) -> &'static str {
+        "PReluBackward"
+    }
+}
+
+/// Native `prelu(x, alpha) = max(0, x) + alpha * min(0, x)`.
+///
+/// `alpha` is the (scalar, length-1) learnable slope tensor. This is the fused
+/// counterpart of the `nn::PReLU` module: a single forward pass over `x` and a
+/// single backward node, so the autograd graph carries one VJP instead of three.
+pub fn prelu<T: Float>(input: &Tensor<T>, alpha: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    if alpha.numel() != 1 {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "prelu: alpha must be a scalar (numel==1), got shape {:?}",
+                alpha.shape()
+            ),
+        });
+    }
+    let alpha_data = alpha.data()?;
+    let alpha_v = alpha_data[0];
+    let zero = <T as num_traits::Zero>::zero();
+
+    let output = unary_map(input, |x| if x >= zero { x } else { alpha_v * x })?;
+    if is_grad_enabled() && (input.requires_grad() || alpha.requires_grad()) {
+        Tensor::from_operation(
+            TensorStorage::cpu(output.data()?.to_vec()),
+            output.shape().to_vec(),
+            Arc::new(PReluBackward::new(input.clone(), alpha.clone())),
+        )
+    } else {
+        Ok(output)
+    }
+}
+
+// --- glu -------------------------------------------------------------------
+
+/// Backward for `glu(x; dim) = a * sigmoid(b)` where `(a, b) = split(x, dim/2)`.
+///
+/// Let `s = sigmoid(b)` and `y = a * s`. Then:
+///   `dL/da = grad * s`
+///   `dL/db = grad * a * s * (1 - s)`
+/// and the full input gradient is the concatenation of `[dL/da, dL/db]` along
+/// the splitting dim.
+///
+/// We cache the split (`a`, `b`) plus `s` so we don't recompute the sigmoid in
+/// the backward pass.
+#[derive(Debug)]
+pub struct GluBackward<T: Float> {
+    input: Tensor<T>,
+    a: Vec<T>,
+    sigmoid_b: Vec<T>,
+    dim: usize,
+}
+
+impl<T: Float> GluBackward<T> {
+    pub fn new(input: Tensor<T>, a: Vec<T>, sigmoid_b: Vec<T>, dim: usize) -> Self {
+        Self {
+            input,
+            a,
+            sigmoid_b,
+            dim,
+        }
+    }
+}
+
+impl<T: Float> GradFn<T> for GluBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let g = grad_output.data()?;
+        let one = <T as num_traits::One>::one();
+        let n_half = self.a.len();
+
+        // Per-element grads for the two halves.
+        let grad_a: Vec<T> = g
+            .iter()
+            .zip(self.sigmoid_b.iter())
+            .map(|(&gv, &sv)| gv * sv)
+            .collect();
+        let grad_b: Vec<T> = g
+            .iter()
+            .zip(self.a.iter())
+            .zip(self.sigmoid_b.iter())
+            .map(|((&gv, &av), &sv)| gv * av * sv * (one - sv))
+            .collect();
+
+        debug_assert_eq!(grad_a.len(), n_half);
+        debug_assert_eq!(grad_b.len(), n_half);
+
+        // Concatenate [grad_a, grad_b] along self.dim back into input shape.
+        let in_shape = self.input.shape();
+        let mut full = vec![<T as num_traits::Zero>::zero(); self.input.numel()];
+
+        // Compute strides (row-major).
+        let mut strides = vec![1usize; in_shape.len()];
+        for i in (0..in_shape.len() - 1).rev() {
+            strides[i] = strides[i + 1] * in_shape[i + 1];
+        }
+
+        let len_dim = in_shape[self.dim];
+        let half = len_dim / 2;
+        let stride_dim = strides[self.dim];
+
+        // Outer dims contribution (product of dims < self.dim).
+        let outer: usize = in_shape[..self.dim].iter().product();
+        // Inner dims contribution (product of dims > self.dim).
+        let inner: usize = in_shape[(self.dim + 1)..].iter().product();
+
+        // Walk every (outer, k_in_dim, inner) cell.
+        for o in 0..outer {
+            for k in 0..len_dim {
+                for i in 0..inner {
+                    let flat_full = o * (len_dim * inner) + k * inner + i;
+                    if k < half {
+                        // First half: grad_a
+                        let flat_half = o * (half * inner) + k * inner + i;
+                        full[flat_full] = grad_a[flat_half];
+                    } else {
+                        // Second half: grad_b
+                        let flat_half = o * (half * inner) + (k - half) * inner + i;
+                        full[flat_full] = grad_b[flat_half];
+                    }
+                }
+            }
+        }
+        // stride_dim isn't used directly (we computed via outer/inner) but we
+        // keep it bound to surface a future bug if shape walking changes.
+        let _ = stride_dim;
+
+        let grad_input = Tensor::from_storage(
+            TensorStorage::cpu(full),
+            self.input.shape().to_vec(),
+            false,
+        )?;
+        Ok(vec![Some(grad_input)])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "GluBackward"
+    }
+}
+
+/// Native `glu(x; dim) = a * sigmoid(b)` where `x` is split into two equal
+/// halves `(a, b)` along `dim`.
+///
+/// Single-pass fused VJP — replaces the previous functional implementation
+/// that chained `split` + `sigmoid` + `mul` into three separate backward nodes.
+pub fn glu<T: Float>(input: &Tensor<T>, dim: i64) -> FerrotorchResult<Tensor<T>> {
+    let shape = input.shape();
+    let ndim = shape.len();
+    if ndim == 0 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: "glu: input must have at least 1 dimension".into(),
+        });
+    }
+    let resolved = if dim < 0 {
+        (ndim as i64 + dim) as usize
+    } else {
+        dim as usize
+    };
+    if resolved >= ndim {
+        return Err(FerrotorchError::InvalidArgument {
+            message: format!("glu: dim {dim} out of range for {ndim}-D tensor"),
+        });
+    }
+    let len_dim = shape[resolved];
+    if len_dim % 2 != 0 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: format!(
+                "glu: split dim must be even, got {len_dim} along dim {resolved}"
+            ),
+        });
+    }
+    let half = len_dim / 2;
+
+    // Output shape = input shape with dim halved.
+    let mut out_shape = shape.to_vec();
+    out_shape[resolved] = half;
+    let n_out: usize = out_shape.iter().product();
+
+    let in_data = input.data()?;
+    let outer: usize = shape[..resolved].iter().product();
+    let inner: usize = shape[(resolved + 1)..].iter().product();
+
+    let mut a_vals = Vec::with_capacity(n_out);
+    let mut b_vals = Vec::with_capacity(n_out);
+    for o in 0..outer {
+        for k in 0..half {
+            for i in 0..inner {
+                let flat_a = o * (len_dim * inner) + k * inner + i;
+                let flat_b = o * (len_dim * inner) + (k + half) * inner + i;
+                a_vals.push(in_data[flat_a]);
+                b_vals.push(in_data[flat_b]);
+            }
+        }
+    }
+
+    // sigmoid(b) — element-wise; we only need the scalar form here so don't
+    // round-trip through the full Tensor sigmoid op.
+    let one = <T as num_traits::One>::one();
+    let sigmoid_scalar = |v: T| -> T {
+        // Numerically-stable scalar sigmoid: 1/(1+exp(-v)) for v >= 0,
+        // exp(v)/(1+exp(v)) for v < 0.
+        let zero = <T as num_traits::Zero>::zero();
+        if v >= zero {
+            one / (one + (-v).exp())
+        } else {
+            let ev = v.exp();
+            ev / (one + ev)
+        }
+    };
+    let sigmoid_b: Vec<T> = b_vals.iter().map(|&v| sigmoid_scalar(v)).collect();
+    let out: Vec<T> = a_vals
+        .iter()
+        .zip(sigmoid_b.iter())
+        .map(|(&av, &sv)| av * sv)
+        .collect();
+
+    if is_grad_enabled() && input.requires_grad() {
+        Tensor::from_operation(
+            TensorStorage::cpu(out),
+            out_shape,
+            Arc::new(GluBackward::new(input.clone(), a_vals, sigmoid_b, resolved)),
+        )
+    } else {
+        Tensor::from_storage(TensorStorage::cpu(out), out_shape, false)
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2396,5 +3146,351 @@ mod tests {
                 "mish inside no_grad should not attach grad_fn"
             );
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Activation tail (#594)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_leaky_relu_forward_positive_unchanged() {
+        let x = leaf_scalar(2.0);
+        let y = leaky_relu(&x, 0.1).unwrap();
+        assert!((y.item().unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_leaky_relu_forward_negative_scaled() {
+        let x = leaf_scalar(-3.0);
+        let y = leaky_relu(&x, 0.1).unwrap();
+        assert!((y.item().unwrap() - (-0.3)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_leaky_relu_backward() {
+        let x = leaf_vec(&[2.0, -1.0]);
+        let y = leaky_relu(&x, 0.25).unwrap();
+        let s = y.sum_all().unwrap();
+        backward(&s).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        let gd = g.data().unwrap();
+        // d/dx where x=2: 1; where x=-1: 0.25
+        assert!((gd[0] - 1.0).abs() < 1e-9);
+        assert!((gd[1] - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_hardtanh_clamps_and_grad() {
+        let x = leaf_vec(&[-2.0, -0.5, 0.5, 2.0]);
+        let y = hardtanh(&x).unwrap();
+        let yd = y.data().unwrap();
+        assert_eq!(yd, &[-1.0, -0.5, 0.5, 1.0]);
+        let s = y.sum_all().unwrap();
+        backward(&s).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        let gd = g.data().unwrap();
+        // d/dx is 0 at clamped boundaries, 1 inside.
+        assert_eq!(gd, &[0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_relu6_clamps_top_at_6() {
+        let x = leaf_vec(&[-1.0, 0.0, 3.0, 7.0]);
+        let y = relu6(&x).unwrap();
+        let d = y.data().unwrap();
+        assert_eq!(d, &[0.0, 0.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn test_hardsigmoid_endpoints_and_slope() {
+        // Forward.
+        let x = leaf_vec(&[-5.0, -3.0, 0.0, 3.0, 5.0]);
+        let y = hardsigmoid(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] - 0.0).abs() < 1e-9);
+        assert!((d[1] - 0.0).abs() < 1e-9);
+        assert!((d[2] - 0.5).abs() < 1e-9);
+        assert!((d[3] - 1.0).abs() < 1e-9);
+        assert!((d[4] - 1.0).abs() < 1e-9);
+
+        // Backward: slope = 1/6 inside (-3, 3); 0 outside.
+        let s = y.sum_all().unwrap();
+        backward(&s).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        let gd = g.data().unwrap();
+        assert!((gd[0]).abs() < 1e-9);
+        assert!((gd[2] - 1.0 / 6.0).abs() < 1e-9);
+        assert!((gd[4]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_hardswish_zero_below_minus_three() {
+        let x = leaf_vec(&[-5.0, -3.0, 0.0, 1.0, 5.0]);
+        let y = hardswish(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0]).abs() < 1e-9);
+        assert!((d[1]).abs() < 1e-9);
+        assert!((d[2]).abs() < 1e-9);
+        // x=1 → 1 * (1+3)/6 = 4/6 ≈ 0.6667
+        assert!((d[3] - 4.0 / 6.0).abs() < 1e-9);
+        assert!((d[4] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_hardswish_backward_matches_numerical() {
+        // Pick x=1 (in the linear region). Closed-form: (2x + 3)/6 = 5/6.
+        let x = leaf_scalar(1.0);
+        let y = hardswish(&x).unwrap();
+        backward(&y).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        assert!((g.item().unwrap() - 5.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_selu_zero_at_origin() {
+        let x = leaf_vec(&[-1.0, 0.0, 1.0]);
+        let y = selu(&x).unwrap();
+        let d = y.data().unwrap();
+        // selu(0) = 0; selu(1) = scale * 1 = 1.0507; selu(-1) = scale * alpha * (e^-1 - 1)
+        assert!((d[1]).abs() < 1e-9);
+        assert!((d[2] - 1.0507009873554805).abs() < 1e-9);
+        let neg_expected = 1.0507009873554805 * 1.6732632423543772 * ((-1.0_f64).exp() - 1.0);
+        assert!((d[0] - neg_expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_selu_backward_at_one_is_scale() {
+        // d/dx selu(x) at x=1 = scale * 1 = 1.0507.
+        let x = leaf_scalar(1.0);
+        let y = selu(&x).unwrap();
+        backward(&y).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        assert!((g.item().unwrap() - 1.0507009873554805).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_softsign_bounded_and_zero_origin() {
+        let x = leaf_vec(&[-1000.0, -1.0, 0.0, 1.0, 1000.0]);
+        let y = softsign(&x).unwrap();
+        let d = y.data().unwrap();
+        assert!((d[0] + 1.0).abs() < 1e-2); // approaches -1
+        assert!((d[1] + 0.5).abs() < 1e-9);
+        assert!((d[2]).abs() < 1e-9);
+        assert!((d[3] - 0.5).abs() < 1e-9);
+        assert!((d[4] - 1.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_softsign_backward_closed_form() {
+        // d/dx softsign(x) = 1 / (1 + |x|)^2; at x=1, = 1/4.
+        let x = leaf_scalar(1.0);
+        let y = softsign(&x).unwrap();
+        backward(&y).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        assert!((g.item().unwrap() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_softsign_backward_at_zero_is_one() {
+        let x = leaf_scalar(0.0);
+        let y = softsign(&x).unwrap();
+        backward(&y).unwrap();
+        let g = x.grad().unwrap().unwrap();
+        assert!((g.item().unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_softsign_backward_matches_numerical() {
+        let x_val = 0.7_f64;
+        let analytic = 1.0 / (1.0 + x_val.abs()).powi(2);
+        let numerical = numerical_grad_scalar(|t| t / (1.0 + t.abs()), x_val);
+        assert!((analytic - numerical).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_activation_tail_no_grad_does_not_attach_grad_fn() {
+        crate::autograd::no_grad::no_grad(|| {
+            let x = leaf_scalar(0.5);
+            for y in [
+                leaky_relu(&x, 0.1).unwrap(),
+                hardtanh(&x).unwrap(),
+                relu6(&x).unwrap(),
+                hardsigmoid(&x).unwrap(),
+                hardswish(&x).unwrap(),
+                selu(&x).unwrap(),
+                softsign(&x).unwrap(),
+            ] {
+                assert!(y.grad_fn().is_none());
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // PReLU / GLU fused (#614)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prelu_forward_matches_definition() {
+        let x = leaf_vec(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let alpha =
+            Tensor::from_storage(TensorStorage::cpu(vec![0.25_f64]), vec![1], false).unwrap();
+        let y = prelu(&x, &alpha).unwrap();
+        // alpha=0.25 -> negatives scaled by 0.25; non-negatives unchanged.
+        assert_eq!(y.data().unwrap(), &[-0.5, -0.25, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn prelu_backward_routes_to_input_and_alpha() {
+        // Build x and alpha as leaves with grad. Compute prelu, then sum.
+        let x = leaf_vec(&[-2.0, 1.0]);
+        let alpha = Tensor::from_storage(
+            TensorStorage::cpu(vec![0.5_f64]),
+            vec![1],
+            true,
+        )
+        .unwrap();
+        let y = prelu(&x, &alpha).unwrap();
+
+        // Build a sum scalar so backward sees grad_output = ones.
+        #[derive(Debug)]
+        struct SumBack<T: Float> {
+            input: Tensor<T>,
+            numel: usize,
+        }
+        impl<T: Float> GradFn<T> for SumBack<T> {
+            fn backward(&self, _g: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+                let ones = vec![<T as num_traits::One>::one(); self.numel];
+                let t = Tensor::from_storage(
+                    TensorStorage::cpu(ones),
+                    self.input.shape().to_vec(),
+                    false,
+                )?;
+                Ok(vec![Some(t)])
+            }
+            fn inputs(&self) -> Vec<&Tensor<T>> {
+                vec![&self.input]
+            }
+            fn name(&self) -> &'static str {
+                "Sum"
+            }
+        }
+
+        let total: f64 = y.data().unwrap().iter().sum();
+        let scalar = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBack {
+                input: y.clone(),
+                numel: 2,
+            }),
+        )
+        .unwrap();
+        backward(&scalar).unwrap();
+
+        // dL/dx[0]: x[0]=-2 -> alpha=0.5
+        // dL/dx[1]: x[1]= 1 -> 1.0
+        let gx = x.grad().unwrap().unwrap();
+        assert_eq!(gx.data().unwrap(), &[0.5, 1.0]);
+        // dL/dalpha = sum(grad * x) over negatives only = 1.0 * -2.0 = -2.0
+        let ga = alpha.grad().unwrap().unwrap();
+        assert_eq!(ga.data().unwrap(), &[-2.0]);
+    }
+
+    #[test]
+    fn prelu_rejects_nonscalar_alpha() {
+        let x = leaf_vec(&[-1.0, 1.0]);
+        let alpha =
+            Tensor::from_storage(TensorStorage::cpu(vec![0.1, 0.2]), vec![2], false).unwrap();
+        let err = prelu(&x, &alpha).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn glu_forward_matches_split_sigmoid_mul() {
+        // Input: [a0, a1, b0, b1] split on dim 0 -> a*[sigma(b0), sigma(b1)]
+        let x = leaf_vec(&[1.0, 2.0, 0.0, 0.0]);
+        let y = glu(&x, 0).unwrap();
+        // sigmoid(0) = 0.5; output = [1.0*0.5, 2.0*0.5] = [0.5, 1.0]
+        assert_eq!(y.shape(), &[2]);
+        let out = y.data().unwrap();
+        assert!((out[0] - 0.5).abs() < 1e-9);
+        assert!((out[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn glu_backward_matches_decomposition() {
+        // For x = [a, b] (1-D length 2), y = a * sigmoid(b).
+        // sum(y) backward: grad_a = sigmoid(b), grad_b = a*sigmoid(b)*(1-sigmoid(b))
+        let x = leaf_vec(&[3.0, 0.5]);
+        let y = glu(&x, 0).unwrap();
+
+        #[derive(Debug)]
+        struct SumBack<T: Float> {
+            input: Tensor<T>,
+            numel: usize,
+        }
+        impl<T: Float> GradFn<T> for SumBack<T> {
+            fn backward(&self, _g: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+                let ones = vec![<T as num_traits::One>::one(); self.numel];
+                let t = Tensor::from_storage(
+                    TensorStorage::cpu(ones),
+                    self.input.shape().to_vec(),
+                    false,
+                )?;
+                Ok(vec![Some(t)])
+            }
+            fn inputs(&self) -> Vec<&Tensor<T>> {
+                vec![&self.input]
+            }
+            fn name(&self) -> &'static str {
+                "Sum"
+            }
+        }
+
+        let total: f64 = y.data().unwrap().iter().sum();
+        let scalar = Tensor::from_operation(
+            TensorStorage::cpu(vec![total]),
+            vec![],
+            Arc::new(SumBack {
+                input: y.clone(),
+                numel: 1,
+            }),
+        )
+        .unwrap();
+        backward(&scalar).unwrap();
+
+        let g = x.grad().unwrap().unwrap();
+        let g_data = g.data().unwrap();
+        // sigmoid(0.5) ~ 0.6224593312
+        let s = 1.0 / (1.0 + (-0.5_f64).exp());
+        assert!((g_data[0] - s).abs() < 1e-9);
+        assert!((g_data[1] - 3.0 * s * (1.0 - s)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn glu_rejects_odd_dim() {
+        let x = leaf_vec(&[1.0, 2.0, 3.0]);
+        let err = glu(&x, 0).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn glu_2d_dim1() {
+        // Shape [2, 4] split on dim 1 -> [2, 2].
+        // Row 0: [1, 2 | 0, 0] -> [1*0.5, 2*0.5] = [0.5, 1.0]
+        // Row 1: [3, 4 | 0, 0] -> [1.5, 2.0]
+        let x = Tensor::from_storage(
+            TensorStorage::cpu(vec![1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]),
+            vec![2, 4],
+            true,
+        )
+        .unwrap();
+        let y = glu(&x, 1).unwrap();
+        assert_eq!(y.shape(), &[2, 2]);
+        let out = y.data().unwrap();
+        assert!((out[0] - 0.5).abs() < 1e-9);
+        assert!((out[1] - 1.0).abs() < 1e-9);
+        assert!((out[2] - 1.5).abs() < 1e-9);
+        assert!((out[3] - 2.0).abs() < 1e-9);
     }
 }

@@ -2213,6 +2213,73 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer_f64(result, input.device_ordinal()))
     }
 
+    fn strided_scatter_f32(
+        &self,
+        src: &GpuBufferHandle,
+        dst: &mut GpuBufferHandle,
+        view_shape: &[usize],
+        dst_strides: &[isize],
+        dst_offset: usize,
+    ) -> FerrotorchResult<()> {
+        let ord = src.device_ordinal();
+        if dst.device_ordinal() != ord {
+            return Err(FerrotorchError::DeviceMismatch {
+                expected: ferrotorch_core::Device::Cuda(ord),
+                got: ferrotorch_core::Device::Cuda(dst.device_ordinal()),
+            });
+        }
+        let src_buf_ptr = Self::unwrap_buffer(src)? as *const CudaBuffer<f32>;
+        let dst_buf = Self::unwrap_buffer_mut(dst)?;
+        let dev = self.device(ord)?;
+        // SAFETY: `src` and `dst` are distinct GpuBufferHandles supplied
+        // by the caller; the borrow checker forbids overlapping &/&mut
+        // through the same handle, and CudaBuffer<f32> doesn't share
+        // mutable state with anything reachable from the &CudaBuffer
+        // pointer. The `*const CudaBuffer<f32>` is reborrowed as `&` for
+        // the kernel call only.
+        let src_ref = unsafe { &*src_buf_ptr };
+        crate::kernels::gpu_strided_scatter(
+            src_ref,
+            dst_buf,
+            view_shape,
+            dst_strides,
+            dst_offset,
+            dev,
+        )
+        .map_err(Self::map_gpu_err)
+    }
+
+    fn strided_scatter_f64(
+        &self,
+        src: &GpuBufferHandle,
+        dst: &mut GpuBufferHandle,
+        view_shape: &[usize],
+        dst_strides: &[isize],
+        dst_offset: usize,
+    ) -> FerrotorchResult<()> {
+        let ord = src.device_ordinal();
+        if dst.device_ordinal() != ord {
+            return Err(FerrotorchError::DeviceMismatch {
+                expected: ferrotorch_core::Device::Cuda(ord),
+                got: ferrotorch_core::Device::Cuda(dst.device_ordinal()),
+            });
+        }
+        let src_buf_ptr = Self::unwrap_buffer_f64(src)? as *const CudaBuffer<f64>;
+        let dst_buf = Self::unwrap_buffer_f64_mut(dst)?;
+        let dev = self.device(ord)?;
+        // SAFETY: see strided_scatter_f32 above; same reasoning applies.
+        let src_ref = unsafe { &*src_buf_ptr };
+        crate::kernels::gpu_strided_scatter_f64(
+            src_ref,
+            dst_buf,
+            view_shape,
+            dst_strides,
+            dst_offset,
+            dev,
+        )
+        .map_err(Self::map_gpu_err)
+    }
+
     fn strided_cat_f32(
         &self,
         input: &GpuBufferHandle,
@@ -2382,6 +2449,130 @@ impl GpuBackend for CudaBackendImpl {
             Self::wrap_buffer_f64(q_buf, ord),
             Self::wrap_buffer_f64(r_buf, ord),
         ))
+    }
+
+    // GPU-resident eigh / eigvalsh (no host bounces — see cusolver::gpu_eigh_*).
+    fn eigh_f32(
+        &self,
+        a: &GpuBufferHandle,
+        n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let (w, v) = crate::cusolver::gpu_eigh_f32(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        let ord = a.device_ordinal();
+        Ok((Self::wrap_buffer(w, ord), Self::wrap_buffer(v, ord)))
+    }
+
+    fn eigh_f64(
+        &self,
+        a: &GpuBufferHandle,
+        n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let (w, v) = crate::cusolver::gpu_eigh_f64(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        let ord = a.device_ordinal();
+        Ok((
+            Self::wrap_buffer_f64(w, ord),
+            Self::wrap_buffer_f64(v, ord),
+        ))
+    }
+
+    fn eigvalsh_f32(&self, a: &GpuBufferHandle, n: usize) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let w = crate::cusolver::gpu_eigvalsh_f32(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(w, a.device_ordinal()))
+    }
+
+    fn eigvalsh_f64(&self, a: &GpuBufferHandle, n: usize) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let w = crate::cusolver::gpu_eigvalsh_f64(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(w, a.device_ordinal()))
+    }
+
+    // GPU 1-D FFT via cuFFT (#579). All paths are GPU-resident — see
+    // `crate::cufft` for layout / normalization details.
+    fn fft_c2c_f32(
+        &self,
+        a: &GpuBufferHandle,
+        batch: usize,
+        n: usize,
+        inverse: bool,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let out = crate::cufft::gpu_fft_c2c_f32(a_buf, batch, n, inverse, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(out, a.device_ordinal()))
+    }
+
+    fn fft_c2c_f64(
+        &self,
+        a: &GpuBufferHandle,
+        batch: usize,
+        n: usize,
+        inverse: bool,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let out = crate::cufft::gpu_fft_c2c_f64(a_buf, batch, n, inverse, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(out, a.device_ordinal()))
+    }
+
+    fn rfft_r2c_f32(
+        &self,
+        a: &GpuBufferHandle,
+        batch: usize,
+        n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let out =
+            crate::cufft::gpu_rfft_r2c_f32(a_buf, batch, n, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(out, a.device_ordinal()))
+    }
+
+    fn rfft_r2c_f64(
+        &self,
+        a: &GpuBufferHandle,
+        batch: usize,
+        n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let out =
+            crate::cufft::gpu_rfft_r2c_f64(a_buf, batch, n, dev).map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(out, a.device_ordinal()))
+    }
+
+    fn irfft_c2r_f32(
+        &self,
+        a: &GpuBufferHandle,
+        batch: usize,
+        n_out: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let out = crate::cufft::gpu_irfft_c2r_f32(a_buf, batch, n_out, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(out, a.device_ordinal()))
+    }
+
+    fn irfft_c2r_f64(
+        &self,
+        a: &GpuBufferHandle,
+        batch: usize,
+        n_out: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let out = crate::cufft::gpu_irfft_c2r_f64(a_buf, batch, n_out, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(out, a.device_ordinal()))
     }
 }
 

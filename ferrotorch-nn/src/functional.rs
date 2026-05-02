@@ -19,6 +19,7 @@ use ferrotorch_core::grad_fns::arithmetic;
 use ferrotorch_core::grad_fns::linalg::mm_differentiable;
 use ferrotorch_core::grad_fns::reduction as red;
 use ferrotorch_core::grad_fns::shape::transpose_2d;
+use ferrotorch_core::grad_fns::transcendental as trans;
 use ferrotorch_core::ops::elementwise::{binary_map, mean as elem_mean};
 use ferrotorch_core::tensor::GradFn;
 use ferrotorch_core::{FerrotorchError, FerrotorchResult, Float, Tensor, TensorStorage};
@@ -733,6 +734,544 @@ pub fn fold<T: Float>(
 }
 
 // ===========================================================================
+// Activation parity expansion (#584)
+// ===========================================================================
+
+/// Saturating hyperbolic tangent: `hardtanh(x) = clamp(x, min_val, max_val)`.
+///
+/// Default range matches `torch.nn.functional.hardtanh`: `[-1, 1]`. Pass
+/// custom bounds via [`hardtanh_with`] when you need a different range.
+#[inline]
+pub fn hardtanh<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    hardtanh_with(input, T::from(-1.0).unwrap(), T::from(1.0).unwrap())
+}
+
+/// `hardtanh` with explicit bounds. Differentiable via [`trans::clamp`];
+/// gradient is zero outside `[min_val, max_val]`.
+pub fn hardtanh_with<T: Float>(
+    input: &Tensor<T>,
+    min_val: T,
+    max_val: T,
+) -> FerrotorchResult<Tensor<T>> {
+    trans::clamp(input, min_val, max_val)
+}
+
+/// `relu6(x) = clamp(x, 0, 6)`. Used by MobileNet et al.
+#[inline]
+pub fn relu6<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    trans::clamp(input, T::from(0.0).unwrap(), T::from(6.0).unwrap())
+}
+
+/// `hardsigmoid(x) = clamp((x + 3) / 6, 0, 1)`. The piecewise-linear
+/// sigmoid approximation used in MobileNetV3.
+pub fn hardsigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let three = ferrotorch_core::scalar(T::from(3.0).unwrap())?;
+    let inv_six = ferrotorch_core::scalar(T::from(1.0 / 6.0).unwrap())?;
+    let shifted = arithmetic::add(input, &three)?;
+    let scaled = arithmetic::mul(&shifted, &inv_six)?;
+    trans::clamp(&scaled, T::from(0.0).unwrap(), T::from(1.0).unwrap())
+}
+
+/// `hardswish(x) = x * hardsigmoid(x)`. Smooth-ish approximation to SiLU
+/// used in mobile architectures.
+pub fn hardswish<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let hs = hardsigmoid(input)?;
+    arithmetic::mul(input, &hs)
+}
+
+/// `log_sigmoid(x) = log(sigmoid(x))`, computed numerically-stably as
+/// `-softplus(-x)`.
+pub fn log_sigmoid<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let neg = arithmetic::neg(input)?;
+    // Use beta=1, threshold=20 (matches torch defaults).
+    let sp = act::softplus(&neg, 1.0, 20.0)?;
+    arithmetic::neg(&sp)
+}
+
+/// `softmin(x) = softmax(-x)`. Operates along the last dimension.
+pub fn softmin<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let neg = arithmetic::neg(input)?;
+    act::softmax(&neg)
+}
+
+/// `softsign(x) = x / (1 + |x|)`. A smooth alternative to `tanh` with
+/// rational asymptotes.
+pub fn softsign<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let abs_x = arithmetic::abs(input)?;
+    let one = ferrotorch_core::scalar(T::from(1.0).unwrap())?;
+    let denom = arithmetic::add(&abs_x, &one)?;
+    arithmetic::div(input, &denom)
+}
+
+/// `tanhshrink(x) = x - tanh(x)`.
+pub fn tanhshrink<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    let t = act::tanh(input)?;
+    arithmetic::sub(input, &t)
+}
+
+/// SELU: `selu(x) = scale * elu(x, alpha)` with the canonical
+/// self-normalizing constants `alpha ≈ 1.6732632...`,
+/// `scale ≈ 1.0507009...` (Klambauer et al. 2017).
+pub fn selu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    const ALPHA: f64 = 1.6732632423543772;
+    const SCALE: f64 = 1.0507009873554805;
+    let e = act::elu(input, ALPHA)?;
+    let scale = ferrotorch_core::scalar(T::from(SCALE).unwrap())?;
+    arithmetic::mul(&e, &scale)
+}
+
+/// `softplus(x) = log(1 + exp(x))` — numerically stable smooth-ReLU
+/// approximation. Defaults to `beta=1, threshold=20` matching torch.
+#[inline]
+pub fn softplus<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    act::softplus(input, 1.0, 20.0)
+}
+
+/// `softplus(x; beta, threshold)` with explicit parameters.
+#[inline]
+pub fn softplus_with<T: Float>(
+    input: &Tensor<T>,
+    beta: f64,
+    threshold: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    act::softplus(input, beta, threshold)
+}
+
+/// `elu(x; alpha) = x where x > 0 else alpha * (exp(x) - 1)`. Default
+/// `alpha = 1.0` matches torch.
+#[inline]
+pub fn elu<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    act::elu(input, 1.0)
+}
+
+/// `elu` with explicit alpha.
+#[inline]
+pub fn elu_with<T: Float>(input: &Tensor<T>, alpha: f64) -> FerrotorchResult<Tensor<T>> {
+    act::elu(input, alpha)
+}
+
+/// `mish(x) = x * tanh(softplus(x))`. Differentiable via the existing
+/// `MishBackward` in `ferrotorch_core::grad_fns::activation`.
+#[inline]
+pub fn mish<T: Float>(input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    act::mish(input)
+}
+
+/// Gated Linear Unit: split the input along `dim` into halves `(a, b)`,
+/// return `a * sigmoid(b)`. The size of `dim` must be even.
+pub fn glu<T: Float>(input: &Tensor<T>, dim: i64) -> FerrotorchResult<Tensor<T>> {
+    act::glu(input, dim)
+}
+
+/// Functional Parametric ReLU. `alpha` must be a scalar (numel==1) tensor.
+/// Mirrors `torch.nn.functional.prelu`. Single fused forward + backward node.
+pub fn prelu<T: Float>(input: &Tensor<T>, alpha: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+    act::prelu(input, alpha)
+}
+
+// ===========================================================================
+// Loss parity expansion (#584)
+// ===========================================================================
+
+/// Apply the requested reduction to a per-element loss tensor.
+fn apply_reduction<T: Float>(
+    loss: Tensor<T>,
+    reduction: crate::module::Reduction,
+) -> FerrotorchResult<Tensor<T>> {
+    match reduction {
+        crate::module::Reduction::None => Ok(loss),
+        crate::module::Reduction::Sum => red::sum(&loss),
+        crate::module::Reduction::Mean => red::mean(&loss),
+    }
+}
+
+/// L1 (mean absolute error) loss: `mean(|pred - target|)`.
+///
+/// `reduction` controls aggregation. With `Reduction::None` returns the
+/// per-element absolute differences.
+pub fn l1_loss<T: Float>(
+    pred: &Tensor<T>,
+    target: &Tensor<T>,
+    reduction: crate::module::Reduction,
+) -> FerrotorchResult<Tensor<T>> {
+    let diff = arithmetic::sub(pred, target)?;
+    let abs_diff = arithmetic::abs(&diff)?;
+    apply_reduction(abs_diff, reduction)
+}
+
+/// Binary cross-entropy (probabilities). Expects `pred` ∈ (0, 1).
+///
+/// `bce(p, y) = -[y * log(p) + (1 - y) * log(1 - p)]`. For inputs that are
+/// raw logits use [`binary_cross_entropy_with_logits`] which is numerically
+/// more stable (it folds in a sigmoid).
+pub fn binary_cross_entropy<T: Float>(
+    pred: &Tensor<T>,
+    target: &Tensor<T>,
+    reduction: crate::module::Reduction,
+) -> FerrotorchResult<Tensor<T>> {
+    let one = ferrotorch_core::scalar(T::from(1.0).unwrap())?;
+    let log_p = trans::log(pred)?;
+    let one_minus_p = arithmetic::sub(&one, pred)?;
+    let log_1mp = trans::log(&one_minus_p)?;
+    let one_minus_y = arithmetic::sub(&one, target)?;
+    let term1 = arithmetic::mul(target, &log_p)?;
+    let term2 = arithmetic::mul(&one_minus_y, &log_1mp)?;
+    let sum = arithmetic::add(&term1, &term2)?;
+    let neg = arithmetic::neg(&sum)?;
+    apply_reduction(neg, reduction)
+}
+
+/// Numerically-stable binary cross-entropy that takes raw logits.
+///
+/// `bce_with_logits(z, y) = -y * z + softplus(z) = -y * z + log(1 + exp(z))`.
+/// This avoids the sigmoid → log composition's catastrophic cancellation
+/// for large |z|.
+pub fn binary_cross_entropy_with_logits<T: Float>(
+    logits: &Tensor<T>,
+    target: &Tensor<T>,
+    reduction: crate::module::Reduction,
+) -> FerrotorchResult<Tensor<T>> {
+    let neg_y = arithmetic::neg(target)?;
+    let term1 = arithmetic::mul(&neg_y, logits)?;
+    let sp = act::softplus(logits, 1.0, 20.0)?;
+    let total = arithmetic::add(&term1, &sp)?;
+    apply_reduction(total, reduction)
+}
+
+/// KL divergence: `kl(target || exp(pred)) = sum(target * (log(target) - pred))`.
+///
+/// `pred` is expected to be log-probabilities (matches torch's
+/// `F.kl_div(input, target, ...)` where `input` is in log-space). `target`
+/// is in probability space.
+pub fn kl_div<T: Float>(
+    pred: &Tensor<T>,
+    target: &Tensor<T>,
+    reduction: crate::module::Reduction,
+) -> FerrotorchResult<Tensor<T>> {
+    // target * (log(target) - pred), with the convention 0 * log(0) := 0.
+    // Add a tiny epsilon to keep log finite at zero, then mask: since
+    // target=0 would multiply the (log eps - pred) term against 0 anyway,
+    // the eps doesn't bias the result.
+    let eps = ferrotorch_core::scalar(T::from(1e-12_f64).unwrap())?;
+    let target_eps = arithmetic::add(target, &eps)?;
+    let log_target = trans::log(&target_eps)?;
+    let diff = arithmetic::sub(&log_target, pred)?;
+    let elemwise = arithmetic::mul(target, &diff)?;
+    apply_reduction(elemwise, reduction)
+}
+
+// ===========================================================================
+// Distance / normalization (#584)
+// ===========================================================================
+
+/// L_p normalization along `dim`: `x / max(||x||_p, eps)`.
+///
+/// `p` is the order of the norm (typically 2). The denominator is clamped
+/// from below by `eps` for numerical stability.
+pub fn normalize<T: Float>(
+    input: &Tensor<T>,
+    p: f64,
+    dim: i64,
+    eps: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    // |x|^p
+    let abs_x = arithmetic::abs(input)?;
+    let abs_p = arithmetic::pow(&abs_x, p)?;
+    // Sum along dim, keep dim for broadcasting.
+    let summed = red::sum_dim(&abs_p, dim, /* keepdim */ true)?;
+    // Norm = sum^(1/p)
+    let norm = arithmetic::pow(&summed, 1.0 / p)?;
+    // Clamp from below by eps.
+    let eps_t = T::from(eps).unwrap();
+    let clamped = trans::clamp(&norm, eps_t, T::from(f64::INFINITY).unwrap())?;
+    arithmetic::div(input, &clamped)
+}
+
+/// Cosine similarity along `dim`: `<x, y> / (||x||_2 ||y||_2)`, with
+/// denominator clamped from below by `eps` for stability.
+pub fn cosine_similarity<T: Float>(
+    x: &Tensor<T>,
+    y: &Tensor<T>,
+    dim: i64,
+    eps: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    let xy = arithmetic::mul(x, y)?;
+    let dot = red::sum_dim(&xy, dim, /* keepdim */ false)?;
+
+    let xx = arithmetic::mul(x, x)?;
+    let nx_sq = red::sum_dim(&xx, dim, false)?;
+    let nx = arithmetic::sqrt(&nx_sq)?;
+
+    let yy = arithmetic::mul(y, y)?;
+    let ny_sq = red::sum_dim(&yy, dim, false)?;
+    let ny = arithmetic::sqrt(&ny_sq)?;
+
+    let prod = arithmetic::mul(&nx, &ny)?;
+    let eps_t = T::from(eps).unwrap();
+    let denom = trans::clamp(&prod, eps_t, T::from(f64::INFINITY).unwrap())?;
+    arithmetic::div(&dot, &denom)
+}
+
+/// Pairwise distance: `||x - y||_p` along the last dim, with optional
+/// `eps` smoothing inside the L_p calculation. Defaults `keepdim = false`.
+pub fn pairwise_distance<T: Float>(
+    x: &Tensor<T>,
+    y: &Tensor<T>,
+    p: f64,
+    eps: f64,
+) -> FerrotorchResult<Tensor<T>> {
+    let diff = arithmetic::sub(x, y)?;
+    let abs_diff = arithmetic::abs(&diff)?;
+    // Add eps before raising to p to keep gradients smooth at zero.
+    let eps_t = ferrotorch_core::scalar(T::from(eps).unwrap())?;
+    let shifted = arithmetic::add(&abs_diff, &eps_t)?;
+    let pwr = arithmetic::pow(&shifted, p)?;
+    let summed = red::sum_dim(&pwr, /* dim */ -1, /* keepdim */ false)?;
+    arithmetic::pow(&summed, 1.0 / p)
+}
+
+// ===========================================================================
+// Misc utility (#584)
+// ===========================================================================
+
+/// One-hot encoding: convert integer-valued indices in `input` to a tensor
+/// of shape `[*input.shape, num_classes]` with `1.0` at each index.
+///
+/// `input` is treated as a tensor of `T` whose values round to integers
+/// in `[0, num_classes)`. Out-of-range indices return an error. This
+/// operation is **not differentiable** — the output has no grad_fn.
+pub fn one_hot<T: Float>(input: &Tensor<T>, num_classes: usize) -> FerrotorchResult<Tensor<T>> {
+    if num_classes == 0 {
+        return Err(FerrotorchError::InvalidArgument {
+            message: "one_hot: num_classes must be > 0".into(),
+        });
+    }
+    let in_data = input.data_vec()?;
+    let in_shape = input.shape().to_vec();
+
+    let mut out_shape = in_shape.clone();
+    out_shape.push(num_classes);
+    let total: usize = in_data.len() * num_classes;
+    let mut out = vec![T::from(0.0).unwrap(); total];
+
+    let one = T::from(1.0).unwrap();
+    for (i, val) in in_data.iter().enumerate() {
+        // Round-to-nearest, then bounds-check.
+        let f = val.to_f64().unwrap_or(-1.0);
+        if !f.is_finite() || f < 0.0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "one_hot: index at flat position {i} is {f}, must be in [0, {num_classes})"
+                ),
+            });
+        }
+        let idx = f.round() as usize;
+        if idx >= num_classes {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "one_hot: index {idx} out of range (num_classes = {num_classes})"
+                ),
+            });
+        }
+        out[i * num_classes + idx] = one;
+    }
+    Tensor::from_storage(TensorStorage::cpu(out), out_shape, false)
+}
+
+// ===========================================================================
+// Conv / ConvTranspose forwarders (#607)
+// ===========================================================================
+//
+// These are thin wrappers over the existing `Conv*::from_parts(..)` constructor
+// + `Module::forward(..)` path. They take user-supplied weight/bias tensors,
+// build a transient module, and run the standard im2col + matmul forward (with
+// the existing GPU fast path and CPU backward graph). Since the weight/bias
+// tensors are cloned into the transient module, autograd attribution flows
+// back to the caller's leaf tensors unchanged.
+
+use crate::conv::{Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d, ConvTranspose3d};
+use crate::module::Module;
+
+/// Functional 1-D convolution. `weight` is `[out, in, k]`, `bias` is
+/// optional `[out]`. Mirrors `torch.nn.functional.conv1d`.
+pub fn conv1d<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    bias: Option<&Tensor<T>>,
+    stride: usize,
+    padding: usize,
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = Conv1d::from_parts(
+        weight.clone(),
+        bias.cloned(),
+        stride,
+        padding,
+    )?;
+    layer.forward(input)
+}
+
+/// Functional 2-D convolution. `weight` is `[out, in, kH, kW]`, `bias` is
+/// optional `[out]`. Mirrors `torch.nn.functional.conv2d`.
+pub fn conv2d<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    bias: Option<&Tensor<T>>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = Conv2d::from_parts(
+        weight.clone(),
+        bias.cloned(),
+        stride,
+        padding,
+    )?;
+    layer.forward(input)
+}
+
+/// Functional 3-D convolution. `weight` is `[out, in, kD, kH, kW]`, `bias` is
+/// optional `[out]`. Mirrors `torch.nn.functional.conv3d`.
+pub fn conv3d<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    bias: Option<&Tensor<T>>,
+    stride: (usize, usize, usize),
+    padding: (usize, usize, usize),
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = Conv3d::from_parts(
+        weight.clone(),
+        bias.cloned(),
+        stride,
+        padding,
+    )?;
+    layer.forward(input)
+}
+
+/// Functional 1-D transposed convolution. `weight` is `[in, out, k]`.
+/// Mirrors `torch.nn.functional.conv_transpose1d`.
+pub fn conv_transpose1d<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    bias: Option<&Tensor<T>>,
+    stride: usize,
+    padding: usize,
+    output_padding: usize,
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = ConvTranspose1d::from_parts(
+        weight.clone(),
+        bias.cloned(),
+        stride,
+        padding,
+        output_padding,
+    )?;
+    layer.forward(input)
+}
+
+/// Functional 2-D transposed convolution. `weight` is `[in, out, kH, kW]`.
+/// Mirrors `torch.nn.functional.conv_transpose2d`.
+pub fn conv_transpose2d<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    bias: Option<&Tensor<T>>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    output_padding: (usize, usize),
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = ConvTranspose2d::from_parts(
+        weight.clone(),
+        bias.cloned(),
+        stride,
+        padding,
+        output_padding,
+    )?;
+    layer.forward(input)
+}
+
+/// Functional 3-D transposed convolution. `weight` is
+/// `[in, out, kD, kH, kW]`. Mirrors `torch.nn.functional.conv_transpose3d`.
+pub fn conv_transpose3d<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    bias: Option<&Tensor<T>>,
+    stride: (usize, usize, usize),
+    padding: (usize, usize, usize),
+    output_padding: (usize, usize, usize),
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = ConvTranspose3d::from_parts(
+        weight.clone(),
+        bias.cloned(),
+        stride,
+        padding,
+        output_padding,
+    )?;
+    layer.forward(input)
+}
+
+// ===========================================================================
+// Pooling re-exports (#607)
+// ===========================================================================
+//
+// PyTorch exposes pool fns under `torch.nn.functional`; we keep the existing
+// implementations in `pooling.rs` and re-export them here so callers can write
+// `nn::functional::max_pool2d(..)` instead of `nn::pooling::max_pool2d(..)`.
+
+pub use crate::pooling::{
+    adaptive_avg_pool1d, adaptive_avg_pool2d, adaptive_avg_pool3d, adaptive_max_pool1d,
+    adaptive_max_pool2d, adaptive_max_pool3d, avg_pool1d, avg_pool2d, avg_pool3d, lp_pool1d,
+    lp_pool2d, max_pool1d, max_pool2d, max_pool3d,
+};
+
+// ===========================================================================
+// Padding re-exports (#607)
+// ===========================================================================
+
+pub use crate::padding::{
+    PaddingMode, functional_pad_1d as pad1d, functional_pad_2d as pad2d,
+    functional_pad_3d as pad3d,
+};
+
+// ===========================================================================
+// Embedding (#607)
+// ===========================================================================
+
+/// Functional embedding lookup. `weight` is the lookup table
+/// `[num_embeddings, embedding_dim]`; `input` is a 1-D tensor of indices
+/// stored as floats (cast to `usize` internally). Mirrors
+/// `torch.nn.functional.embedding`.
+pub fn embedding<T: Float>(
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    padding_idx: Option<usize>,
+) -> FerrotorchResult<Tensor<T>> {
+    let layer = crate::embedding::Embedding::from_pretrained(weight.clone(), padding_idx)?;
+    layer.forward(input)
+}
+
+// ===========================================================================
+// Scaled-dot-product attention (#607)
+// ===========================================================================
+
+/// Stateless scaled-dot-product attention. Mirrors
+/// `torch.nn.functional.scaled_dot_product_attention`.
+///
+/// Inputs:
+///   - `query`: `[B, N_q, d]`
+///   - `key`:   `[B, N_k, d]`
+///   - `value`: `[B, N_k, d_v]`
+///   - `is_causal`: apply causal mask (requires `N_q == N_k`).
+///
+/// Returns `[B, N_q, d_v]`. Block size defaults to 64 to match the standard
+/// `flash_attention` tile width; tweak via [`crate::flash_attention`] directly
+/// when more control is needed.
+pub fn scaled_dot_product_attention<T: Float>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    is_causal: bool,
+) -> FerrotorchResult<Tensor<T>> {
+    crate::flash_attention::flash_attention(query, key, value, is_causal, 64)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1104,5 +1643,403 @@ mod tests {
             loss.item().unwrap(),
             expected,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Activation parity expansion (#584)
+    // -----------------------------------------------------------------------
+
+    fn close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() < tol
+    }
+
+    #[test]
+    fn test_hardtanh_default_clamps_to_minus_one_one() {
+        let x = leaf(&[-3.0, -1.0, 0.5, 1.5], &[4], false);
+        let out = hardtanh(&x).unwrap();
+        let d = out.data().unwrap();
+        assert_eq!(d, &[-1.0, -1.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_hardtanh_with_custom_bounds() {
+        let x = leaf(&[-3.0, -0.5, 1.0, 5.0], &[4], false);
+        let out = hardtanh_with(&x, -2.0, 3.0).unwrap();
+        let d = out.data().unwrap();
+        assert_eq!(d, &[-2.0, -0.5, 1.0, 3.0]);
+    }
+
+    #[test]
+    fn test_relu6_clamps_top_at_6() {
+        let x = leaf(&[-1.0, 0.0, 3.0, 7.0], &[4], false);
+        let out = relu6(&x).unwrap();
+        let d = out.data().unwrap();
+        assert_eq!(d, &[0.0, 0.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn test_hardsigmoid_endpoints() {
+        // x = -3 → 0, x = 3 → 1, x = 0 → 0.5
+        let x = leaf(&[-5.0, -3.0, 0.0, 3.0, 5.0], &[5], false);
+        let out = hardsigmoid(&x).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], 0.0, 1e-6));
+        assert!(close(d[1], 0.0, 1e-6));
+        assert!(close(d[2], 0.5, 1e-6));
+        assert!(close(d[3], 1.0, 1e-6));
+        assert!(close(d[4], 1.0, 1e-6));
+    }
+
+    #[test]
+    fn test_hardswish_zero_at_minus_three_and_below() {
+        let x = leaf(&[-5.0, -3.0, 0.0, 1.0, 5.0], &[5], false);
+        let out = hardswish(&x).unwrap();
+        let d = out.data().unwrap();
+        // x = -5 → -5 * 0 = 0; x = -3 → -3 * 0 = 0
+        assert!(close(d[0], 0.0, 1e-6));
+        assert!(close(d[1], 0.0, 1e-6));
+        // x = 0 → 0 * 0.5 = 0
+        assert!(close(d[2], 0.0, 1e-6));
+        // x = 5 → 5 * 1 = 5 (saturated)
+        assert!(close(d[4], 5.0, 1e-6));
+    }
+
+    #[test]
+    fn test_log_sigmoid_matches_log_of_sigmoid() {
+        let x = leaf(&[-2.0, -0.5, 0.0, 0.5, 2.0], &[5], false);
+        let out = log_sigmoid(&x).unwrap();
+        let d = out.data().unwrap();
+        for (i, &xi) in [-2.0, -0.5, 0.0, 0.5, 2.0].iter().enumerate() {
+            let ref_val = (1.0_f32 / (1.0 + (-xi as f32).exp())).ln();
+            assert!(close(d[i], ref_val, 1e-5), "log_sigmoid({xi}) = {} vs {ref_val}", d[i]);
+        }
+    }
+
+    #[test]
+    fn test_softmin_inverts_softmax() {
+        // softmin(x) = softmax(-x)
+        let x = leaf(&[1.0, 2.0, 3.0], &[3], false);
+        let out = softmin(&x).unwrap();
+        let neg_x = leaf(&[-1.0, -2.0, -3.0], &[3], false);
+        let ref_out = softmax(&neg_x).unwrap();
+        let d = out.data().unwrap();
+        let r = ref_out.data().unwrap();
+        for i in 0..3 {
+            assert!(close(d[i], r[i], 1e-6));
+        }
+    }
+
+    #[test]
+    fn test_softsign_bounded() {
+        // softsign(0) = 0; softsign(x) → ±1 as x → ±∞.
+        let x = leaf(&[-1000.0, -1.0, 0.0, 1.0, 1000.0], &[5], false);
+        let out = softsign(&x).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], -1.0, 1e-2));
+        assert!(close(d[1], -0.5, 1e-6));
+        assert!(close(d[2], 0.0, 1e-6));
+        assert!(close(d[3], 0.5, 1e-6));
+        assert!(close(d[4], 1.0, 1e-2));
+    }
+
+    #[test]
+    fn test_tanhshrink() {
+        let x = leaf(&[0.0, 1.0, 2.0], &[3], false);
+        let out = tanhshrink(&x).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], 0.0, 1e-6));
+        assert!(close(d[1], 1.0 - 1.0_f32.tanh(), 1e-6));
+        assert!(close(d[2], 2.0 - 2.0_f32.tanh(), 1e-6));
+    }
+
+    #[test]
+    fn test_selu_scale_constants() {
+        // selu(0) = 0, selu(1) = scale * 1 ≈ 1.0507
+        let x = leaf(&[0.0, 1.0], &[2], false);
+        let out = selu(&x).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], 0.0, 1e-6));
+        assert!(close(d[1], 1.0507009873554805, 1e-5));
+    }
+
+    #[test]
+    fn test_softplus_default_matches_explicit() {
+        let x = leaf(&[-1.0, 0.0, 1.0, 2.0], &[4], false);
+        let out_default = softplus(&x).unwrap();
+        let out_explicit = softplus_with(&x, 1.0, 20.0).unwrap();
+        let a = out_default.data().unwrap();
+        let b = out_explicit.data().unwrap();
+        for i in 0..4 {
+            assert!(close(a[i], b[i], 1e-6));
+        }
+    }
+
+    #[test]
+    fn test_elu_zero_at_origin() {
+        let x = leaf(&[-1.0, 0.0, 1.0], &[3], false);
+        let out = elu(&x).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], (-1.0_f32).exp() - 1.0, 1e-5));
+        assert!(close(d[1], 0.0, 1e-6));
+        assert!(close(d[2], 1.0, 1e-6));
+    }
+
+    #[test]
+    fn test_glu_halves_input() {
+        // [[1, 2, 3, 4]] split along last dim → a=[[1, 2]], b=[[3, 4]].
+        // out = a * sigmoid(b).
+        let x = leaf(&[1.0, 2.0, 3.0, 4.0], &[1, 4], false);
+        let out = glu(&x, -1).unwrap();
+        assert_eq!(out.shape(), &[1, 2]);
+        let d = out.data().unwrap();
+        let s3 = 1.0 / (1.0 + (-3.0_f32).exp());
+        let s4 = 1.0 / (1.0 + (-4.0_f32).exp());
+        assert!(close(d[0], 1.0 * s3, 1e-5));
+        assert!(close(d[1], 2.0 * s4, 1e-5));
+    }
+
+    #[test]
+    fn test_glu_rejects_odd_dim() {
+        let x = leaf(&[1.0, 2.0, 3.0], &[3], false);
+        let err = glu(&x, 0).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Loss parity expansion (#584)
+    // -----------------------------------------------------------------------
+
+    use crate::module::Reduction;
+
+    #[test]
+    fn test_l1_loss_mean() {
+        // pred = [1, 2, 3], target = [0, 0, 0] → |diff| = [1, 2, 3], mean = 2
+        let p = leaf(&[1.0, 2.0, 3.0], &[3], false);
+        let t = leaf(&[0.0, 0.0, 0.0], &[3], false);
+        let loss = l1_loss(&p, &t, Reduction::Mean).unwrap();
+        assert!(close(loss.item().unwrap(), 2.0, 1e-5));
+    }
+
+    #[test]
+    fn test_l1_loss_sum() {
+        let p = leaf(&[1.0, 2.0, 3.0], &[3], false);
+        let t = leaf(&[0.0, 0.0, 0.0], &[3], false);
+        let loss = l1_loss(&p, &t, Reduction::Sum).unwrap();
+        assert!(close(loss.item().unwrap(), 6.0, 1e-5));
+    }
+
+    #[test]
+    fn test_l1_loss_none_returns_per_element() {
+        let p = leaf(&[1.0, -2.0, 3.0], &[3], false);
+        let t = leaf(&[0.0, 0.0, 0.0], &[3], false);
+        let loss = l1_loss(&p, &t, Reduction::None).unwrap();
+        assert_eq!(loss.shape(), &[3]);
+        let d = loss.data().unwrap();
+        assert_eq!(d, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_binary_cross_entropy_log2_loss_for_uniform() {
+        // pred = 0.5, target = 1 → -log(0.5) = ln(2)
+        let p = leaf(&[0.5], &[1], false);
+        let t = leaf(&[1.0], &[1], false);
+        let loss = binary_cross_entropy(&p, &t, Reduction::Mean).unwrap();
+        assert!(close(loss.item().unwrap(), 2.0_f32.ln(), 1e-5));
+    }
+
+    #[test]
+    fn test_binary_cross_entropy_with_logits_matches_bce_for_sigmoid_input() {
+        // bce_with_logits(z, y) should equal bce(sigmoid(z), y) for finite z.
+        let z = leaf(&[-1.0, 0.5, 2.0], &[3], false);
+        let y = leaf(&[0.0, 1.0, 1.0], &[3], false);
+        let s = sigmoid(&z).unwrap();
+        let lhs = binary_cross_entropy_with_logits(&z, &y, Reduction::Mean)
+            .unwrap()
+            .item()
+            .unwrap();
+        let rhs = binary_cross_entropy(&s, &y, Reduction::Mean)
+            .unwrap()
+            .item()
+            .unwrap();
+        assert!(close(lhs, rhs, 1e-4), "logit-bce={lhs} vs bce(sig)={rhs}");
+    }
+
+    #[test]
+    fn test_kl_div_zero_for_matched_distributions() {
+        // target = [0.5, 0.5], pred (in log-space) = log([0.5, 0.5]).
+        // KL = sum(target * (log(target) - pred)) = 0.
+        let target = leaf(&[0.5, 0.5], &[2], false);
+        let pred = leaf(&[2.0_f32.recip().ln(), 2.0_f32.recip().ln()], &[2], false);
+        let loss = kl_div(&pred, &target, Reduction::Sum).unwrap();
+        assert!(close(loss.item().unwrap(), 0.0, 1e-5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Distance / normalization (#584)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_l2_unit_norm() {
+        // [3, 4] / sqrt(9 + 16) = [3/5, 4/5]
+        let x = leaf(&[3.0, 4.0], &[2], false);
+        let out = normalize(&x, 2.0, 0, 1e-12).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], 0.6, 1e-5));
+        assert!(close(d[1], 0.8, 1e-5));
+    }
+
+    #[test]
+    fn test_normalize_l2_2d_per_row() {
+        // [[3, 4], [6, 8]] normalized along dim=1 → [[0.6, 0.8], [0.6, 0.8]]
+        let x = leaf(&[3.0, 4.0, 6.0, 8.0], &[2, 2], false);
+        let out = normalize(&x, 2.0, 1, 1e-12).unwrap();
+        let d = out.data().unwrap();
+        assert!(close(d[0], 0.6, 1e-5));
+        assert!(close(d[1], 0.8, 1e-5));
+        assert!(close(d[2], 0.6, 1e-5));
+        assert!(close(d[3], 0.8, 1e-5));
+    }
+
+    #[test]
+    fn test_cosine_similarity_aligned_vectors() {
+        // x and 2*x should have cosine similarity 1.
+        let x = leaf(&[1.0, 2.0, 3.0], &[3], false);
+        let y = leaf(&[2.0, 4.0, 6.0], &[3], false);
+        let sim = cosine_similarity(&x, &y, 0, 1e-8).unwrap();
+        assert!(close(sim.item().unwrap(), 1.0, 1e-4));
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal_vectors() {
+        let x = leaf(&[1.0, 0.0], &[2], false);
+        let y = leaf(&[0.0, 1.0], &[2], false);
+        let sim = cosine_similarity(&x, &y, 0, 1e-8).unwrap();
+        assert!(close(sim.item().unwrap(), 0.0, 1e-5));
+    }
+
+    #[test]
+    fn test_pairwise_distance_zero_for_equal_vectors() {
+        let x = leaf(&[1.0, 2.0, 3.0], &[1, 3], false);
+        let y = leaf(&[1.0, 2.0, 3.0], &[1, 3], false);
+        let d = pairwise_distance(&x, &y, 2.0, 0.0).unwrap();
+        // Distance should be 0 (no eps floor).
+        assert!(close(d.item().unwrap(), 0.0, 1e-5));
+    }
+
+    #[test]
+    fn test_pairwise_distance_l2_simple() {
+        // ||[3, 4] - [0, 0]||_2 = 5 (rows of length 2 give per-row distance)
+        let x = leaf(&[3.0, 4.0], &[1, 2], false);
+        let y = leaf(&[0.0, 0.0], &[1, 2], false);
+        let d = pairwise_distance(&x, &y, 2.0, 0.0).unwrap();
+        assert!(close(d.item().unwrap(), 5.0, 1e-4));
+    }
+
+    // -----------------------------------------------------------------------
+    // Misc utility (#584)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_one_hot_basic() {
+        // indices = [0, 2, 1] with num_classes = 3.
+        let idx = leaf(&[0.0, 2.0, 1.0], &[3], false);
+        let oh = one_hot(&idx, 3).unwrap();
+        assert_eq!(oh.shape(), &[3, 3]);
+        let d = oh.data().unwrap();
+        assert_eq!(
+            d,
+            &[
+                1.0, 0.0, 0.0, // 0 → [1, 0, 0]
+                0.0, 0.0, 1.0, // 2 → [0, 0, 1]
+                0.0, 1.0, 0.0, // 1 → [0, 1, 0]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_one_hot_2d_input() {
+        // [[0, 1], [2, 0]] with num_classes=3 → [[ [1,0,0], [0,1,0] ], [ [0,0,1], [1,0,0] ]]
+        let idx = leaf(&[0.0, 1.0, 2.0, 0.0], &[2, 2], false);
+        let oh = one_hot(&idx, 3).unwrap();
+        assert_eq!(oh.shape(), &[2, 2, 3]);
+    }
+
+    #[test]
+    fn test_one_hot_rejects_out_of_range() {
+        let idx = leaf(&[0.0, 5.0], &[2], false);
+        let err = one_hot(&idx, 3).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn test_one_hot_rejects_negative() {
+        let idx = leaf(&[-1.0, 0.0], &[2], false);
+        let err = one_hot(&idx, 3).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    // -------------------------------------------------------------------
+    // #607 forwarders
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn conv2d_forwarder_matches_module() {
+        // Compare nn::functional::conv2d output against an equivalent
+        // Conv2d module driven via the same weight/bias.
+        let input = leaf(&[1.0; 1 * 1 * 4 * 4], &[1, 1, 4, 4], false);
+        let weight = leaf(&[1.0; 1 * 1 * 3 * 3], &[1, 1, 3, 3], false);
+        let bias = leaf(&[0.0], &[1], false);
+
+        let f_out = super::conv2d(&input, &weight, Some(&bias), (1, 1), (0, 0)).unwrap();
+        // Output spatial size: (4 - 3 + 0) / 1 + 1 = 2
+        assert_eq!(f_out.shape(), &[1, 1, 2, 2]);
+        // All ones in a 3x3 window summed = 9.0 per output cell.
+        assert_close(&f_out.data().unwrap(), &[9.0, 9.0, 9.0, 9.0], 1e-5);
+    }
+
+    #[test]
+    fn conv2d_rejects_bad_weight_shape() {
+        let input = leaf(&[0.0; 16], &[1, 1, 4, 4], false);
+        let weight = leaf(&[1.0; 4], &[2, 2], false);
+        let err = super::conv2d(&input, &weight, None, (1, 1), (0, 0)).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn conv1d_forwarder_smoke() {
+        let input = leaf(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4], false);
+        let weight = leaf(&[1.0, 1.0], &[1, 1, 2], false);
+        let out = super::conv1d(&input, &weight, None, 1, 0).unwrap();
+        // Sum-of-pairs: (1+2)=3, (2+3)=5, (3+4)=7
+        assert_eq!(out.shape(), &[1, 1, 3]);
+        assert_close(&out.data().unwrap(), &[3.0, 5.0, 7.0], 1e-5);
+    }
+
+    #[test]
+    fn embedding_forwarder_matches_module() {
+        let weight = leaf(&[0.0, 0.1, 1.0, 1.1, 2.0, 2.1], &[3, 2], false);
+        let idx = leaf(&[0.0, 2.0, 1.0], &[3], false);
+        let out = super::embedding(&idx, &weight, None).unwrap();
+        assert_eq!(out.shape(), &[3, 2]);
+        assert_close(&out.data().unwrap(), &[0.0, 0.1, 2.0, 2.1, 1.0, 1.1], 1e-5);
+    }
+
+    #[test]
+    fn pad_re_export_2d() {
+        let input = leaf(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], false);
+        let out = super::pad2d(&input, 1, 1, 1, 1, super::PaddingMode::Zeros, 0.0).unwrap();
+        assert_eq!(out.shape(), &[1, 1, 4, 4]);
+    }
+
+    #[test]
+    fn sdpa_forwarder_smoke() {
+        // Single token attention: q=k=v of shape [1,1,2] -> output [1,1,2].
+        let q = leaf(&[1.0, 0.0], &[1, 1, 2], false);
+        let k = leaf(&[1.0, 0.0], &[1, 1, 2], false);
+        let v = leaf(&[3.0, 4.0], &[1, 1, 2], false);
+        let out = super::scaled_dot_product_attention(&q, &k, &v, false).unwrap();
+        assert_eq!(out.shape(), &[1, 1, 2]);
+        // softmax over single key returns 1.0; output should equal v.
+        assert_close(&out.data().unwrap(), &[3.0, 4.0], 1e-5);
     }
 }

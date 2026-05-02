@@ -16,12 +16,15 @@ pub mod hooks;
 pub mod identity;
 pub mod init;
 pub mod lazy_conv;
+pub mod lazy_conv_transpose;
 pub mod lazy_linear;
+pub mod lazy_norm;
 pub mod linear;
 pub mod lora;
 pub mod loss;
 pub mod module;
 pub mod norm;
+pub mod buffer;
 pub mod padding;
 pub mod paged_attention;
 pub mod parameter;
@@ -77,6 +80,7 @@ pub use padding::{
     ReplicationPad2d, ReplicationPad3d, ZeroPad1d, ZeroPad2d, ZeroPad3d,
 };
 pub use paged_attention::{KVPage, PagePool, PagedAttentionManager, PagedKVCache};
+pub use buffer::Buffer;
 pub use parameter::Parameter;
 pub use parameter_container::{ParameterDict, ParameterList};
 pub use pooling::{

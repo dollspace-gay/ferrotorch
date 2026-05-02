@@ -186,6 +186,64 @@ impl<T: Float> Distribution<T> for Cauchy<T> {
             Ok(out)
         }
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // cdf(x) = 1/2 + atan((x - loc) / scale) / pi
+        let val = value.data_vec()?;
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let inv_pi = T::from(1.0 / std::f64::consts::PI).unwrap();
+        let result: Vec<T> = val
+            .iter()
+            .zip(loc_data.iter().cycle())
+            .zip(scale_data.iter().cycle())
+            .map(|((&x, &l), &s)| half + inv_pi * ((x - l) / s).atan())
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), value.shape().to_vec(), false)
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // icdf(p) = loc + scale * tan(pi * (p - 1/2))
+        let q_data = q.data_vec()?;
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let pi = T::from(std::f64::consts::PI).unwrap();
+        let result: Vec<T> = q_data
+            .iter()
+            .zip(loc_data.iter().cycle())
+            .zip(scale_data.iter().cycle())
+            .map(|((&p, &l), &s)| l + s * (pi * (p - half)).tan())
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), q.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mean is undefined; return NaN to match torch.
+        let n: usize = self.loc.shape().iter().product();
+        let nan = T::from(f64::NAN).unwrap();
+        Tensor::from_storage(
+            TensorStorage::cpu(vec![nan; n.max(1)]),
+            self.loc.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.loc.clone())
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // Variance is undefined; return +∞ to match torch.
+        let n: usize = self.loc.shape().iter().product();
+        let inf = T::from(f64::INFINITY).unwrap();
+        Tensor::from_storage(
+            TensorStorage::cpu(vec![inf; n.max(1)]),
+            self.loc.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,5 +490,36 @@ mod tests {
         let lp = dist.log_prob(&x).unwrap();
         let expected = -(std::f64::consts::PI).ln();
         assert!((lp.item().unwrap() - expected).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // CDF / ICDF / mean (NaN) / mode / variance (∞) (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cauchy_mean_is_nan_variance_is_inf() {
+        let dist = Cauchy::new(scalar(0.0f64).unwrap(), scalar(1.0f64).unwrap()).unwrap();
+        assert!(dist.mean().unwrap().item().unwrap().is_nan());
+        assert!(dist.variance().unwrap().item().unwrap().is_infinite());
+        assert!((dist.mode().unwrap().item().unwrap() - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cauchy_cdf_at_loc_is_half() {
+        let dist = Cauchy::new(scalar(2.0f64).unwrap(), scalar(1.0f64).unwrap()).unwrap();
+        let x = scalar(2.0f64).unwrap();
+        let c = dist.cdf(&x).unwrap();
+        assert!((c.item().unwrap() - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cauchy_icdf_roundtrip() {
+        let dist = Cauchy::new(scalar(0.0f64).unwrap(), scalar(1.0f64).unwrap()).unwrap();
+        for p in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let q = scalar(p).unwrap();
+            let x = dist.icdf(&q).unwrap();
+            let p2 = dist.cdf(&x).unwrap();
+            assert!((p2.item().unwrap() - p).abs() < 1e-9);
+        }
     }
 }

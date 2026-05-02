@@ -25,6 +25,7 @@ use std::time::Instant;
 use ferrotorch_core::{FerrotorchResult, Float, Tensor};
 use ferrotorch_nn::Module;
 use ferrotorch_optim::Optimizer;
+use ferrotorch_optim::grad_scaler::GradScaler;
 use ferrotorch_optim::scheduler::LrScheduler;
 use ferrotorch_serialize::{TrainingCheckpoint, load_checkpoint, save_checkpoint};
 
@@ -57,12 +58,21 @@ pub struct Learner<M, T: Float> {
     optimizer: Box<dyn Optimizer<T>>,
     loss_fn: LossFn<T>,
     scheduler: Option<Box<dyn LrScheduler<T>>>,
+    /// Optional automatic-mixed-precision gradient scaler. When set, the
+    /// training loop scales the loss before backward, unscales gradients
+    /// inside `scaler.step`, skips the optimizer step on inf/NaN, and
+    /// updates the scale factor at the end of each batch. (#595)
+    grad_scaler: Option<GradScaler<T>>,
     train_metrics: Vec<Box<dyn Metric<Input = f64>>>,
     val_metrics: Vec<Box<dyn Metric<Input = f64>>>,
     callbacks: Vec<Box<dyn Callback<T>>>,
     checkpoint_dir: Option<PathBuf>,
     epoch: usize,
     step: usize,
+    /// Number of optimizer steps that the grad scaler skipped this run
+    /// (inf/NaN detected in scaled gradients). Useful for monitoring AMP
+    /// stability. Reset at the start of each `fit` call.
+    skipped_steps: usize,
 }
 
 impl<M: Module<T>, T: Float> Learner<M, T> {
@@ -79,12 +89,14 @@ impl<M: Module<T>, T: Float> Learner<M, T> {
             optimizer,
             loss_fn,
             scheduler: None,
+            grad_scaler: None,
             train_metrics: Vec::new(),
             val_metrics: Vec::new(),
             callbacks: Vec::new(),
             checkpoint_dir: None,
             epoch: 0,
             step: 0,
+            skipped_steps: 0,
         }
     }
 
@@ -92,6 +104,29 @@ impl<M: Module<T>, T: Float> Learner<M, T> {
     pub fn with_scheduler(mut self, scheduler: Box<dyn LrScheduler<T>>) -> Self {
         self.scheduler = Some(scheduler);
         self
+    }
+
+    /// Enable automatic mixed precision via [`GradScaler`]. (#595)
+    ///
+    /// The training loop will:
+    /// 1. Scale the loss by `scaler.get_scale()` before backward.
+    /// 2. Unscale gradients and check for inf/NaN inside `scaler.step`.
+    /// 3. Skip the optimizer step on a non-finite gradient and lower the
+    ///    scale; otherwise apply the step at the regular learning rate.
+    /// 4. Call `scaler.update()` to dynamically tune the scale for the
+    ///    next iteration.
+    ///
+    /// The scaler is independent of the optimizer; pair it with whichever
+    /// optimizer was passed to [`Learner::new`].
+    pub fn with_grad_scaler(mut self, scaler: GradScaler<T>) -> Self {
+        self.grad_scaler = Some(scaler);
+        self
+    }
+
+    /// Number of optimizer steps the grad scaler skipped during the most
+    /// recent `fit` call. Resets to `0` at the start of every `fit`.
+    pub fn skipped_steps(&self) -> usize {
+        self.skipped_steps
     }
 
     /// Add a training metric.
@@ -183,6 +218,8 @@ impl<M: Module<T>, T: Float> Learner<M, T> {
         V: Iterator<Item = FerrotorchResult<(Tensor<T>, Tensor<T>)>>,
     {
         let mut history = TrainingHistory::new();
+        // Reset AMP step-skip counter at the start of every fit.
+        self.skipped_steps = 0;
 
         for _ in 0..num_epochs {
             let epoch_start = Instant::now();
@@ -215,12 +252,22 @@ impl<M: Module<T>, T: Float> Learner<M, T> {
                 let loss = (self.loss_fn)(&output, &target)?;
                 let loss_val = loss.item()?.to_f64().unwrap();
 
-                // Backward.
-                loss.backward()?;
-
-                // Optimizer step.
-                self.optimizer.step()?;
-                self.optimizer.zero_grad()?;
+                if let Some(ref mut scaler) = self.grad_scaler {
+                    // AMP path: scale loss, backward, scaler-driven step.
+                    let scaled = scaler.scale(&loss)?;
+                    scaled.backward()?;
+                    let stepped = scaler.step(self.optimizer.as_mut())?;
+                    if !stepped {
+                        self.skipped_steps += 1;
+                    }
+                    scaler.update();
+                    self.optimizer.zero_grad()?;
+                } else {
+                    // Standard path.
+                    loss.backward()?;
+                    self.optimizer.step()?;
+                    self.optimizer.zero_grad()?;
+                }
 
                 // Track loss.
                 train_loss_sum += loss_val;
@@ -528,5 +575,41 @@ mod tests {
         assert!(learner.model().is_training());
         learner.model_mut().eval();
         assert!(!learner.model().is_training());
+    }
+
+    // -----------------------------------------------------------------------
+    // GradScaler / AMP integration (#595)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_learner_grad_scaler_field_starts_none() {
+        let model = DummyModule::<f32>::new().unwrap();
+        let optimizer: Box<dyn Optimizer<f32>> = Box::new(DummyOptimizer { lr: 0.01 });
+        let loss_fn: LossFn<f32> = Box::new(|pred, _target| Ok(pred.clone()));
+        let learner = Learner::new(model, optimizer, loss_fn);
+        assert!(learner.grad_scaler.is_none());
+        assert_eq!(learner.skipped_steps(), 0);
+    }
+
+    #[test]
+    fn test_learner_with_grad_scaler_attaches() {
+        use ferrotorch_optim::grad_scaler::{GradScaler, GradScalerConfig};
+        let model = DummyModule::<f32>::new().unwrap();
+        let optimizer: Box<dyn Optimizer<f32>> = Box::new(DummyOptimizer { lr: 0.01 });
+        let loss_fn: LossFn<f32> = Box::new(|pred, _target| Ok(pred.clone()));
+        let scaler = GradScaler::<f32>::new(GradScalerConfig::default());
+        let learner = Learner::new(model, optimizer, loss_fn).with_grad_scaler(scaler);
+        assert!(learner.grad_scaler.is_some());
+    }
+
+    #[test]
+    fn test_learner_skipped_steps_counter_starts_zero() {
+        use ferrotorch_optim::grad_scaler::{GradScaler, GradScalerConfig};
+        let model = DummyModule::<f32>::new().unwrap();
+        let optimizer: Box<dyn Optimizer<f32>> = Box::new(DummyOptimizer { lr: 0.01 });
+        let loss_fn: LossFn<f32> = Box::new(|pred, _target| Ok(pred.clone()));
+        let scaler = GradScaler::<f32>::new(GradScalerConfig::default());
+        let learner = Learner::new(model, optimizer, loss_fn).with_grad_scaler(scaler);
+        assert_eq!(learner.skipped_steps(), 0);
     }
 }

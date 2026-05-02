@@ -139,6 +139,37 @@ impl<T: Float> TracedModule<T> {
     pub fn output_shape(&self) -> &[usize] {
         &self.output_shape
     }
+
+    /// Serialize the traced graph to a byte buffer. Mirrors
+    /// `torch.jit.save` for the in-memory case. (#620)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.graph.serialize()
+    }
+
+    /// Reconstruct a `TracedModule` from a byte buffer produced by
+    /// [`to_bytes`]. Mirrors `torch.jit.load` for the in-memory case.
+    pub fn from_bytes(data: &[u8]) -> FerrotorchResult<Self> {
+        let graph = IrGraph::deserialize(data)?;
+        Ok(Self::new(graph))
+    }
+
+    /// Save the traced graph to disk. (`torch.jit.save` analog.)
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> FerrotorchResult<()> {
+        let path = path.as_ref();
+        let bytes = self.to_bytes();
+        std::fs::write(path, bytes).map_err(|e| FerrotorchError::InvalidArgument {
+            message: format!("TracedModule::save: failed to write {}: {e}", path.display()),
+        })
+    }
+
+    /// Load a traced graph from disk. (`torch.jit.load` analog.)
+    pub fn load(path: impl AsRef<std::path::Path>) -> FerrotorchResult<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|e| FerrotorchError::InvalidArgument {
+            message: format!("TracedModule::load: failed to read {}: {e}", path.display()),
+        })?;
+        Self::from_bytes(&bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,5 +864,62 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TracedModule<f32>>();
         assert_send_sync::<TracedModule<f64>>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Save / load roundtrip (#620)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_traced_module_to_bytes_from_bytes_roundtrip() {
+        let a = grad_vec(vec![1.0, 2.0, 3.0]);
+        let b = grad_vec(vec![4.0, 5.0, 6.0]);
+        let graph = trace(
+            |inputs: &[Tensor<f32>]| -> FerrotorchResult<Tensor<f32>> {
+                let product = mul(&inputs[0], &inputs[1])?;
+                sum(&product)
+            },
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+        let module = TracedModule::<f32>::new(graph);
+        let bytes = module.to_bytes();
+        assert!(!bytes.is_empty());
+
+        let restored = TracedModule::<f32>::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.input_count(), module.input_count());
+        let a_in = tensor_1d(&[1.0, 2.0, 3.0]);
+        let b_in = tensor_1d(&[4.0, 5.0, 6.0]);
+        let r = restored.forward_multi(&[a_in, b_in]).unwrap();
+        assert_eq!(r.data().unwrap(), &[32.0]);
+    }
+
+    #[test]
+    fn test_traced_module_save_load_disk_roundtrip() {
+        let a = grad_vec(vec![1.0, 2.0]);
+        let b = grad_vec(vec![3.0, 4.0]);
+        let graph = trace(
+            |inputs: &[Tensor<f32>]| -> FerrotorchResult<Tensor<f32>> {
+                let product = mul(&inputs[0], &inputs[1])?;
+                sum(&product)
+            },
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+        let module = TracedModule::<f32>::new(graph);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        module.save(tmp.path()).unwrap();
+        let loaded = TracedModule::<f32>::load(tmp.path()).unwrap();
+        let a_in = tensor_1d(&[1.0, 2.0]);
+        let b_in = tensor_1d(&[3.0, 4.0]);
+        let r = loaded.forward_multi(&[a_in, b_in]).unwrap();
+        // 1*3 + 2*4 = 11
+        assert_eq!(r.data().unwrap(), &[11.0]);
+    }
+
+    #[test]
+    fn test_traced_module_from_bytes_garbage_input_errors() {
+        let r = TracedModule::<f32>::from_bytes(&[0xFF, 0xFE, 0xFD]);
+        assert!(r.is_err());
     }
 }

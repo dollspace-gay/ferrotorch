@@ -28,16 +28,23 @@
 
 pub mod config;
 pub mod attention;
+pub mod generation;
 pub mod mlp;
 pub mod layer;
 pub mod model;
 pub mod gguf_remap;
 pub mod grammar;
+pub mod quant_loaders;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 
 pub use attention::LlamaAttention;
 pub use config::{LlamaActivation, LlamaConfig};
+pub use generation::{
+    GenerationConfig, apply_repetition_penalty, apply_temperature, argmax, generate,
+    generate_with_streamer, sample_softmax, top_k_filter, top_p_filter,
+};
+pub use quant_loaders::{AwqQ4, GptqQ4, dequantize_awq_q4, dequantize_gptq_q4};
 pub use gguf_remap::{gguf_key_to_hf, gguf_to_hf_state_dict};
 pub use layer::LlamaDecoderLayer;
 pub use mlp::LlamaMLP;

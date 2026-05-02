@@ -7,7 +7,7 @@
 
 #![cfg(feature = "cuda")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ferrotorch_gpu::buffer::CudaBuffer;
 use ferrotorch_gpu::device::GpuDevice;
@@ -17,12 +17,29 @@ use ferrotorch_gpu::graph::{
 use ferrotorch_gpu::kernels::gpu_add_into;
 use ferrotorch_gpu::transfer::{alloc_zeros_f32, cpu_to_gpu};
 
+/// Serialise CUDA stream-capture sections across this test binary's
+/// thread pool. cargo runs tests within one binary in parallel, and
+/// CUDA's stream-capture state machine has process-wide invariants
+/// that can be violated by concurrent capture work on different
+/// threads/streams (manifests as `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`
+/// in `end_capture`). Holding this mutex across `begin_capture` …
+/// `end_capture` makes the tests deterministic. (#602)
+fn capture_lock() -> MutexGuard<'static, ()> {
+    static CAPTURE_MUTEX: Mutex<()> = Mutex::new(());
+    // Recover from a poisoned lock — a panic inside another test's
+    // capture section shouldn't poison the test that follows.
+    CAPTURE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn dev() -> GpuDevice {
     GpuDevice::new(0).expect("CUDA device 0 must be available for these tests")
 }
 
 #[test]
 fn captured_graph_holds_pool_buffers_alive() {
+    let _guard = capture_lock();
     // Build a tiny graph that adds two pre-allocated buffers into a
     // third. Register all three buffers with the pool so the
     // resulting CapturedGraph keeps them alive across replays.
@@ -66,6 +83,7 @@ fn captured_graph_holds_pool_buffers_alive() {
 
 #[test]
 fn dropping_graph_releases_pool_buffers() {
+    let _guard = capture_lock();
     // Use a sentinel Arc to detect when the buffer is actually
     // dropped after the graph is destroyed.
     let device = dev();
@@ -110,6 +128,7 @@ fn pool_seal_blocks_begin_capture_with_pool() {
 
 #[test]
 fn captured_graph_without_pool_has_zero_buffer_count() {
+    let _guard = capture_lock();
     // The legacy end_capture path produces a graph with no pool.
     let device = dev();
     let stream = device.context().new_stream().expect("non-blocking stream");

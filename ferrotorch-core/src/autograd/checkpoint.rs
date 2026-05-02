@@ -158,6 +158,7 @@ fn save_gpu_rng_state<T: Float>(tensor: &Tensor<T>) -> Option<GpuRngState> {
         // RNG. Treat XPU like CPU here. CL-452.
         crate::device::Device::Xpu(_)
         | crate::device::Device::Cpu
+        | crate::device::Device::Mps(_)
         | crate::device::Device::Meta => return None,
     };
     let backend = crate::gpu_dispatch::gpu_backend()?;

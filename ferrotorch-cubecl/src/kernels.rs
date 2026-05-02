@@ -130,6 +130,212 @@ pub fn kernel_sigmoid<F: Float>(x: &Array<F>, out: &mut Array<F>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Orthogonal polynomial kernels — three-term recurrences. (#577)
+//
+// Each thread handles one input element, runs the polynomial recurrence up
+// to degree `n`, and writes the final value. The CPU evaluators in
+// `ferrotorch-core::special` use the identical recurrences in f64; here we
+// stay in `F` (f32 today) so the result lives entirely on device.
+// ---------------------------------------------------------------------------
+
+/// Chebyshev T_n(x): T_0=1, T_1=x, T_{k+1} = 2x T_k - T_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_chebyshev_t<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let two_x = F::new(2.0) * xv;
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = xv;
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for _ in 2..=n_u {
+                let next = two_x * prev1 - prev2;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Chebyshev U_n(x): U_0=1, U_1=2x, U_{k+1} = 2x U_k - U_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_chebyshev_u<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let two_x = F::new(2.0) * xv;
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = two_x;
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for _ in 2..=n_u {
+                let next = two_x * prev1 - prev2;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Chebyshev V_n(x): V_0=1, V_1=2x-1, V_{k+1} = 2x V_k - V_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_chebyshev_v<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let two_x = F::new(2.0) * xv;
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = two_x - F::new(1.0);
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for _ in 2..=n_u {
+                let next = two_x * prev1 - prev2;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Chebyshev W_n(x): W_0=1, W_1=2x+1, W_{k+1} = 2x W_k - W_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_chebyshev_w<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let two_x = F::new(2.0) * xv;
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = two_x + F::new(1.0);
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for _ in 2..=n_u {
+                let next = two_x * prev1 - prev2;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Hermite (physicist) H_n(x): H_0=1, H_1=2x, H_{k+1} = 2x H_k - 2k H_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_hermite_h<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let two_x = F::new(2.0) * xv;
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = two_x;
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for k in 1..n_u {
+                let kf = F::cast_from(k as u32);
+                let next = two_x * prev1 - F::new(2.0) * kf * prev2;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Hermite (probabilist) He_n(x): He_0=1, He_1=x, He_{k+1} = x He_k - k He_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_hermite_he<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = xv;
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for k in 1..n_u {
+                let kf = F::cast_from(k as u32);
+                let next = xv * prev1 - kf * prev2;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Laguerre L_n(x): L_0=1, L_1=1-x, (k+1) L_{k+1} = (2k+1-x) L_k - k L_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_laguerre_l<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = F::new(1.0) - xv;
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for k in 1..n_u {
+                let kf = F::cast_from(k as u32);
+                let two_k_plus_one = F::new(2.0) * kf + F::new(1.0);
+                let denom = kf + F::new(1.0);
+                let next = ((two_k_plus_one - xv) * prev1 - kf * prev2) / denom;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
+/// Legendre P_n(x): P_0=1, P_1=x, (k+1) P_{k+1} = (2k+1) x P_k - k P_{k-1}.
+#[cube(launch_unchecked)]
+pub fn kernel_legendre_p<F: Float>(x: &Array<F>, out: &mut Array<F>, n: u32) {
+    if ABSOLUTE_POS < out.len() {
+        let xv = x[ABSOLUTE_POS];
+        let n_u = n as usize;
+        let mut prev2 = F::new(1.0);
+        let mut prev1 = xv;
+        if n_u == 0 {
+            out[ABSOLUTE_POS] = prev2;
+        } else if n_u == 1 {
+            out[ABSOLUTE_POS] = prev1;
+        } else {
+            for k in 1..n_u {
+                let kf = F::cast_from(k as u32);
+                let two_k_plus_one = F::new(2.0) * kf + F::new(1.0);
+                let denom = kf + F::new(1.0);
+                let next = (two_k_plus_one * xv * prev1 - kf * prev2) / denom;
+                prev2 = prev1;
+                prev1 = next;
+            }
+            out[ABSOLUTE_POS] = prev1;
+        }
+    }
+}
+
 /// Naive row-major matmul: `out[m, n] = sum_k a[m, k] * b[k, n]`.
 ///
 /// One cube-unit computes one output element. The `m`, `k`, and `n` scalars
@@ -274,6 +480,69 @@ define_unary_runner!(run_sin, kernel_sin);
 define_unary_runner!(run_cos, kernel_cos);
 define_unary_runner!(run_tanh, kernel_tanh);
 define_unary_runner!(run_sigmoid, kernel_sigmoid);
+
+// ---------------------------------------------------------------------------
+// Polynomial runners — unary + scalar `n` (degree). (#577)
+// ---------------------------------------------------------------------------
+
+/// Run a unary polynomial kernel taking an extra `n: u32` (degree) scalar.
+/// Same pattern as `run_unary` but threads through a single scalar argument.
+fn run_unary_with_n<R, L>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    n: u32,
+    launcher: L,
+) -> Vec<f32>
+where
+    R: Runtime,
+    L: FnOnce(&ComputeClient<R>, CubeCount, CubeDim, ArrayArg<R>, ArrayArg<R>, u32),
+{
+    let count_elems = x.len();
+    let size_bytes = std::mem::size_of_val(x);
+
+    let x_handle = client.create_from_slice(f32::as_bytes(x));
+    let out_handle = client.empty(size_bytes);
+
+    let (count, dim) = elementwise_launch_dims(count_elems as u32);
+    let in_arg = unsafe { ArrayArg::from_raw_parts(x_handle, count_elems) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), count_elems) };
+    launcher(client, count, dim, in_arg, out_arg, n);
+
+    let bytes = client.read_one(out_handle).expect("cubecl read_one failed");
+    f32::from_bytes(&bytes)[..count_elems].to_vec()
+}
+
+macro_rules! define_unary_with_n_runner {
+    ($run_fn:ident, $kernel:ident) => {
+        #[doc = concat!("Upload `x`, run `", stringify!($kernel), "` with degree `n`, read back the result.")]
+        pub fn $run_fn<R: Runtime>(client: &ComputeClient<R>, x: &[f32], n: u32) -> Vec<f32> {
+            run_unary_with_n::<R, _>(
+                client,
+                x,
+                n,
+                |client, count, dim, input, output, n_val| unsafe {
+                    $kernel::launch_unchecked::<f32, R>(
+                        client,
+                        count,
+                        dim,
+                        input,
+                        output,
+                        n_val,
+                    );
+                },
+            )
+        }
+    };
+}
+
+define_unary_with_n_runner!(run_chebyshev_t, kernel_chebyshev_t);
+define_unary_with_n_runner!(run_chebyshev_u, kernel_chebyshev_u);
+define_unary_with_n_runner!(run_chebyshev_v, kernel_chebyshev_v);
+define_unary_with_n_runner!(run_chebyshev_w, kernel_chebyshev_w);
+define_unary_with_n_runner!(run_hermite_h, kernel_hermite_h);
+define_unary_with_n_runner!(run_hermite_he, kernel_hermite_he);
+define_unary_with_n_runner!(run_laguerre_l, kernel_laguerre_l);
+define_unary_with_n_runner!(run_legendre_p, kernel_legendre_p);
 
 /// Upload `a` and `b`, run `kernel_matmul_naive`, read back the result.
 ///

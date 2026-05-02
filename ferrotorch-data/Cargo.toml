@@ -17,4 +17,20 @@ ferrotorch-core = { workspace = true }
 rayon = { workspace = true }
 num-traits = { workspace = true }
 
+# Feature-gated dependencies for Arrow / Polars interop.
+# Pulled in only when the `arrow` or `polars` features are enabled.
+# Versions pinned to ferray-numpy-interop 0.3.1's transitive deps to
+# avoid a duplicate-arrow / duplicate-polars resolution.
+ferray-numpy-interop = { workspace = true, optional = true }
+arrow = { version = "58", optional = true }
+polars = { version = "0.46", default-features = false, features = ["dtype-full"], optional = true }
+
+[features]
+default = []
+# Tabular data interop. `arrow` enables Apache Arrow conversions; `polars`
+# additionally pulls in DataFrame -> Tensor helpers (DataFrames depend on
+# Arrow internally, so `polars` implies `arrow`).
+arrow = ["dep:arrow", "dep:ferray-numpy-interop", "ferray-numpy-interop/arrow"]
+polars = ["arrow", "dep:polars", "ferray-numpy-interop/polars"]
+
 [dev-dependencies]

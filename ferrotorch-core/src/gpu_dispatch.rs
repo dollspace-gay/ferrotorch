@@ -1420,6 +1420,34 @@ pub trait GpuBackend: Send + Sync {
         })
     }
 
+    // Strided scatter: write a contiguous src into strided positions of
+    // dst (in-place). Inverse of strided_copy. Used by
+    // `Tensor::as_strided_scatter` for CUDA tensors. (#574)
+    fn strided_scatter_f32(
+        &self,
+        _src: &GpuBufferHandle,
+        _dst: &mut GpuBufferHandle,
+        _view_shape: &[usize],
+        _dst_strides: &[isize],
+        _dst_offset: usize,
+    ) -> FerrotorchResult<()> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "strided_scatter_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn strided_scatter_f64(
+        &self,
+        _src: &GpuBufferHandle,
+        _dst: &mut GpuBufferHandle,
+        _view_shape: &[usize],
+        _dst_strides: &[isize],
+        _dst_offset: usize,
+    ) -> FerrotorchResult<()> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "strided_scatter_f64 GPU op not yet implemented".into(),
+        })
+    }
+
     // Strided cat: write a sub-tensor into a larger buffer at an offset along one axis on GPU.
     #[allow(clippy::too_many_arguments)]
     fn strided_cat_f32(
@@ -1549,6 +1577,107 @@ pub trait GpuBackend: Send + Sync {
     ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
         Err(FerrotorchError::InvalidArgument {
             message: "qr_f64 GPU op not yet implemented".into(),
+        })
+    }
+    /// Symmetric eigendecomposition (eigenvalues + eigenvectors) of an
+    /// `n × n` real symmetric matrix. Returns `(eigenvalues, eigenvectors)`
+    /// where eigenvectors is row-major with column `j` the `j`-th eigenvector.
+    fn eigh_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "eigh_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn eigh_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, GpuBufferHandle)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "eigh_f64 GPU op not yet implemented".into(),
+        })
+    }
+    /// Eigenvalues only of an `n × n` real symmetric matrix.
+    fn eigvalsh_f32(&self, _a: &GpuBufferHandle, _n: usize) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "eigvalsh_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn eigvalsh_f64(&self, _a: &GpuBufferHandle, _n: usize) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "eigvalsh_f64 GPU op not yet implemented".into(),
+        })
+    }
+
+    // GPU 1-D FFT primitives via cuFFT. (#579)
+    //
+    // - C2C: input/output layout `[batch * n * 2]` interleaved (re, im).
+    // - R2C: input `[batch * n]` real → output `[batch * (n/2+1) * 2]` complex.
+    // - C2R: input `[batch * (n_out/2+1) * 2]` complex → output `[batch * n_out]` real.
+    // - Inverse transforms include 1/n normalization to match torch / numpy.
+    fn fft_c2c_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _batch: usize,
+        _n: usize,
+        _inverse: bool,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "fft_c2c_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn fft_c2c_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _batch: usize,
+        _n: usize,
+        _inverse: bool,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "fft_c2c_f64 GPU op not yet implemented".into(),
+        })
+    }
+    fn rfft_r2c_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _batch: usize,
+        _n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "rfft_r2c_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn rfft_r2c_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _batch: usize,
+        _n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "rfft_r2c_f64 GPU op not yet implemented".into(),
+        })
+    }
+    fn irfft_c2r_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _batch: usize,
+        _n_out: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "irfft_c2r_f32 GPU op not yet implemented".into(),
+        })
+    }
+    fn irfft_c2r_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _batch: usize,
+        _n_out: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "irfft_c2r_f64 GPU op not yet implemented".into(),
         })
     }
 

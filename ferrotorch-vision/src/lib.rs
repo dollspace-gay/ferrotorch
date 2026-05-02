@@ -1,6 +1,7 @@
 pub mod datasets;
 pub mod io;
 pub mod models;
+pub mod ops;
 pub mod transforms;
 
 pub use datasets::{Cifar10, Cifar100, CifarSample, Mnist, MnistSample, Split};

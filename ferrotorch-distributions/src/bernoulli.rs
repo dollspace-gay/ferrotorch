@@ -122,6 +122,85 @@ impl<T: Float> Distribution<T> for Bernoulli<T> {
             Ok(out)
         }
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // For x < 0: 0; for 0 <= x < 1: 1 - p; for x >= 1: 1.
+        let val = value.data_vec()?;
+        let probs_data = self.probs.data_vec()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = val
+            .iter()
+            .zip(probs_data.iter().cycle())
+            .map(|(&x, &p)| {
+                if x < zero {
+                    zero
+                } else if x < one {
+                    one - p
+                } else {
+                    one
+                }
+            })
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), value.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.probs.clone())
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mode is 1 if p > 0.5 else 0 (NaN for p == 0.5 is the strict
+        // convention; we use 0 to keep a valid finite answer).
+        let probs_data = self.probs.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = probs_data
+            .iter()
+            .map(|&p| if p > half { one } else { zero })
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.probs.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // p * (1 - p)
+        let probs_data = self.probs.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = probs_data.iter().map(|&p| p * (one - p)).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.probs.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // Generalized inverse of the step CDF: F^{-1}(p) = 1 if p > 1-prob,
+        // else 0 (matches torch's piecewise definition for discrete dists).
+        // Equivalently: 1 if p > 1 - prob.
+        let q_data = q.data_vec()?;
+        let probs_data = self.probs.data_vec()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = q_data
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let pi = if probs_data.len() == 1 {
+                    0
+                } else {
+                    i % probs_data.len()
+                };
+                if p > one - probs_data[pi] { one } else { zero }
+            })
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), q.shape().to_vec(), false)
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +368,53 @@ mod tests {
         let lp = dist.log_prob(&x).unwrap();
         let expected = 0.3f64.ln();
         assert!((lp.item().unwrap() - expected).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // CDF / mean / mode / variance (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bernoulli_mean_variance() {
+        let dist = Bernoulli::new(scalar(0.7f64).unwrap()).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 0.7).abs() < 1e-12);
+        assert!((dist.variance().unwrap().item().unwrap() - 0.21).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_bernoulli_mode_high_p() {
+        let dist = Bernoulli::new(scalar(0.8f64).unwrap()).unwrap();
+        assert!((dist.mode().unwrap().item().unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_bernoulli_mode_low_p() {
+        let dist = Bernoulli::new(scalar(0.2f64).unwrap()).unwrap();
+        assert!(dist.mode().unwrap().item().unwrap().abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_bernoulli_cdf() {
+        let dist = Bernoulli::new(scalar(0.3f64).unwrap()).unwrap();
+        let x = ferrotorch_core::creation::from_slice::<f64>(&[-1.0, 0.0, 0.5, 1.0, 2.0], &[5]).unwrap();
+        let c = dist.cdf(&x).unwrap();
+        let d = c.data().unwrap();
+        // CDF(<0)=0; CDF([0,1))=1-p=0.7; CDF(>=1)=1
+        assert!((d[0] - 0.0).abs() < 1e-12);
+        assert!((d[1] - 0.7).abs() < 1e-12);
+        assert!((d[2] - 0.7).abs() < 1e-12);
+        assert!((d[3] - 1.0).abs() < 1e-12);
+        assert!((d[4] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_bernoulli_icdf_step_at_one_minus_p() {
+        // p=0.3: F(x)=1 if p_q > 0.7, else 0.
+        let dist = Bernoulli::new(scalar(0.3f64).unwrap()).unwrap();
+        let q = ferrotorch_core::creation::from_slice::<f64>(&[0.5, 0.7, 0.71, 0.99], &[4]).unwrap();
+        let x = dist.icdf(&q).unwrap();
+        let d = x.data().unwrap();
+        // 0.5 -> 0; 0.7 -> 0 (boundary, strict gt); 0.71 -> 1; 0.99 -> 1.
+        assert_eq!(d, &[0.0, 0.0, 1.0, 1.0]);
     }
 }

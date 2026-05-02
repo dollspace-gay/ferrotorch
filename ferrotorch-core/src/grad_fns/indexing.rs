@@ -18,6 +18,9 @@ use crate::gpu_dispatch::gpu_backend;
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
 
+use crate::bool_tensor::BoolTensor;
+use crate::int_tensor::{IntElement, IntTensor};
+
 /// Upload a CPU `&[f32]` slice to a GPU buffer on the given device ordinal.
 fn upload_f32_to_gpu(
     data: &[f32],
@@ -663,6 +666,111 @@ impl<T: Float> GradFn<T> for WhereCondBackward<T> {
 
     fn name(&self) -> &'static str {
         "WhereCondBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// First-class IntTensor / BoolTensor wrappers (#615)
+// ---------------------------------------------------------------------------
+
+/// `masked_fill` taking a [`BoolTensor`] mask. Shape and numel must
+/// match `input`. Returns a new tensor; original unchanged. Mirrors
+/// torch's `tensor.masked_fill(mask, value)` with mask convention
+/// "true → fill" (same as the existing `&[bool]` variant).
+pub fn masked_fill_bt<T: Float>(
+    input: &Tensor<T>,
+    mask: &BoolTensor,
+    value: T,
+) -> FerrotorchResult<Tensor<T>> {
+    if mask.numel() != input.numel() {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "masked_fill_bt: mask numel={} != input numel={}",
+                mask.numel(),
+                input.numel()
+            ),
+        });
+    }
+    masked_fill(input, mask.data(), value)
+}
+
+/// `index_select_1d` taking an [`IntTensor`] of indices. The index tensor
+/// must be 1-D and contain non-negative values within range.
+pub fn index_select_1d_it<T: Float, I: IntElement>(
+    input: &Tensor<T>,
+    indices: &IntTensor<I>,
+) -> FerrotorchResult<Tensor<T>> {
+    if indices.ndim() != 1 {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "index_select_1d_it: indices must be 1-D, got shape {:?}",
+                indices.shape()
+            ),
+        });
+    }
+    let mut idx_usize: Vec<usize> = Vec::with_capacity(indices.numel());
+    for v in indices.data() {
+        let i = v.to_i64();
+        if i < 0 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!("index_select_1d_it: negative index {i} not allowed"),
+            });
+        }
+        idx_usize.push(i as usize);
+    }
+    index_select_1d(input, &idx_usize)
+}
+
+#[cfg(test)]
+mod first_class_wrappers_tests {
+    use super::*;
+
+    #[test]
+    fn masked_fill_bt_replaces_true_positions() {
+        let t =
+            Tensor::from_storage(TensorStorage::cpu(vec![1.0_f32, 2.0, 3.0, 4.0]), vec![4], false)
+                .unwrap();
+        let mask = BoolTensor::from_vec(vec![true, false, true, false], vec![4]).unwrap();
+        let out = masked_fill_bt(&t, &mask, -1.0).unwrap();
+        assert_eq!(out.data().unwrap(), &[-1.0, 2.0, -1.0, 4.0]);
+    }
+
+    #[test]
+    fn masked_fill_bt_rejects_shape_mismatch() {
+        let t =
+            Tensor::from_storage(TensorStorage::cpu(vec![1.0_f32, 2.0]), vec![2], false).unwrap();
+        let mask = BoolTensor::from_vec(vec![true, false, true], vec![3]).unwrap();
+        let err = masked_fill_bt(&t, &mask, 0.0).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn index_select_1d_it_picks_at_indices() {
+        let t = Tensor::from_storage(
+            TensorStorage::cpu(vec![10.0_f32, 20.0, 30.0, 40.0]),
+            vec![4],
+            false,
+        )
+        .unwrap();
+        let idx: IntTensor<i64> = IntTensor::from_vec(vec![3, 0, 2], vec![3]).unwrap();
+        let out = index_select_1d_it(&t, &idx).unwrap();
+        assert_eq!(out.data().unwrap(), &[40.0, 10.0, 30.0]);
+    }
+
+    #[test]
+    fn index_select_1d_it_rejects_2d_indices() {
+        let t = Tensor::from_storage(TensorStorage::cpu(vec![1.0_f32; 4]), vec![4], false).unwrap();
+        let idx: IntTensor<i64> = IntTensor::from_vec(vec![0, 1, 2, 3], vec![2, 2]).unwrap();
+        let err = index_select_1d_it(&t, &idx).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn index_select_1d_it_rejects_negative() {
+        let t = Tensor::from_storage(TensorStorage::cpu(vec![1.0_f32; 4]), vec![4], false).unwrap();
+        let idx: IntTensor<i64> = IntTensor::from_vec(vec![0, -1, 2], vec![3]).unwrap();
+        let err = index_select_1d_it(&t, &idx).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
     }
 }
 

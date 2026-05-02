@@ -172,6 +172,35 @@ impl<T: Float> Distribution<T> for HalfNormal<T> {
             Ok(out)
         }
     }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        let data = self.mean_value()?;
+        Tensor::from_storage(
+            TensorStorage::cpu(data),
+            self.scale.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mode of HalfNormal is 0.
+        let zero = <T as num_traits::Zero>::zero();
+        let n: usize = self.scale.shape().iter().product();
+        Tensor::from_storage(
+            TensorStorage::cpu(vec![zero; n.max(1)]),
+            self.scale.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        let data = self.variance_value()?;
+        Tensor::from_storage(
+            TensorStorage::cpu(data),
+            self.scale.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,5 +435,28 @@ mod tests {
         let lp = dist.log_prob(&x).unwrap();
         let expected = 0.5 * (2.0f64 / std::f64::consts::PI).ln();
         assert!((lp.item().unwrap() - expected).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // mean / mode / variance (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_half_normal_mean_mode_variance() {
+        let dist = HalfNormal::new(scalar(1.0f64).unwrap()).unwrap();
+        // mean = sqrt(2/pi)
+        assert!(
+            (dist.mean().unwrap().item().unwrap() - (2.0_f64 / std::f64::consts::PI).sqrt())
+                .abs()
+                < 1e-10
+        );
+        // mode = 0
+        assert!(dist.mode().unwrap().item().unwrap().abs() < 1e-12);
+        // var = 1 - 2/pi
+        assert!(
+            (dist.variance().unwrap().item().unwrap() - (1.0 - 2.0 / std::f64::consts::PI))
+                .abs()
+                < 1e-10
+        );
     }
 }

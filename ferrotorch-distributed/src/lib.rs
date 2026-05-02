@@ -57,8 +57,10 @@ pub mod backend;
 pub mod checkpoint;
 pub mod collective;
 pub mod ddp;
+pub mod device_mesh;
 pub mod error;
 pub mod fsdp;
+pub mod p2p;
 pub mod pipeline;
 pub mod rpc;
 pub mod sync_batch_norm;
@@ -90,8 +92,10 @@ pub use collective::{
     barrier, broadcast, reduce_scatter, reduce_scatter_tensor, reduce_scatter_with_timeout,
 };
 pub use ddp::DDP;
+pub use device_mesh::DeviceMesh;
 pub use error::DistributedError;
 pub use fsdp::FSDP;
+pub use p2p::{recv, recv_into, recv_into_with_timeout, recv_with_timeout, send, sendrecv};
 pub use sync_batch_norm::SyncBatchNorm2d;
 pub use pipeline::{Pipeline, PipelineSchedule};
 pub use rpc::{RpcAgent, RpcError, TcpRpcBackend};

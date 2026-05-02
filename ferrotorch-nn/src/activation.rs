@@ -604,31 +604,15 @@ impl<T: Float> PReLU<T> {
 
     /// Forward pass.
     ///
-    /// Computes `(1 - alpha) * relu(x) + alpha * x`.
+    /// Computes `prelu(x, alpha) = max(0, x) + alpha * min(0, x)` via the
+    /// native fused [`act::prelu`] op (single forward, single backward).
     pub fn forward(&self, input: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
-        // relu_x = relu(input)
-        let relu_x = act::relu(input)?;
-
-        // Get alpha value — must be on CPU.
         if self.alpha.tensor().is_cuda() {
             return Err(ferrotorch_core::error::FerrotorchError::NotImplementedOnCuda {
                 op: "PReLU",
             });
         }
-        let alpha_data = self.alpha.tensor().data()?;
-        let alpha_val = alpha_data[0];
-
-        let one_minus_alpha = T::from(1.0).unwrap() - alpha_val;
-
-        // scale_tensor = scalar(1 - alpha)
-        let scale_tensor = ferrotorch_core::scalar(one_minus_alpha)?;
-        // alpha_tensor = scalar(alpha)
-        let alpha_tensor = ferrotorch_core::scalar(alpha_val)?;
-
-        // result = (1 - alpha) * relu(x) + alpha * x
-        let scaled_relu = arithmetic::mul(&relu_x, &scale_tensor)?;
-        let scaled_x = arithmetic::mul(input, &alpha_tensor)?;
-        arithmetic::add(&scaled_relu, &scaled_x)
+        act::prelu(input, self.alpha.tensor())
     }
 }
 

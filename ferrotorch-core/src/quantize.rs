@@ -1698,9 +1698,20 @@ mod tests {
     }
 
     // ----- cuda_rng -----
+    //
+    // The cuda_rng module exposes a process-global `Mutex<u64>` state plus
+    // a fork/join stack. Both tests below mutate that state and read it
+    // back; under cargo's default parallel test runner they race with each
+    // other. Serialise via a local static mutex (same pattern as the
+    // capture-lock used in #602 for the GPU-graph tests).
+    fn cuda_rng_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn test_cuda_rng_fork_join() {
+        let _g = cuda_rng_test_lock();
         let initial = cuda_rng::get_state();
         cuda_rng::fork_rng(0x12345678);
         assert_eq!(cuda_rng::get_state(), 0x12345678);
@@ -1710,6 +1721,7 @@ mod tests {
 
     #[test]
     fn test_cuda_rng_next_seed() {
+        let _g = cuda_rng_test_lock();
         let s1 = cuda_rng::next_seed();
         let s2 = cuda_rng::next_seed();
         assert_ne!(s1, s2, "consecutive seeds should differ");

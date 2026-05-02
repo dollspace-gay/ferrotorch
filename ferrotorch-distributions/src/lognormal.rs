@@ -207,6 +207,40 @@ impl<T: Float> Distribution<T> for LogNormal<T> {
             Ok(out)
         }
     }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        let data = self.mean_value()?;
+        Tensor::from_storage(
+            TensorStorage::cpu(data),
+            self.loc.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        let data = self.variance_value()?;
+        Tensor::from_storage(
+            TensorStorage::cpu(data),
+            self.loc.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mode = exp(loc - scale^2)
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let result: Vec<T> = loc_data
+            .iter()
+            .zip(scale_data.iter())
+            .map(|(&mu, &sigma)| (mu - sigma * sigma).exp())
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.loc.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,5 +470,22 @@ mod tests {
         let lp = dist.log_prob(&x).unwrap();
         let expected = -0.5 * (2.0f64 * std::f64::consts::PI).ln();
         assert!((lp.item().unwrap() - expected).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // mean / mode / variance (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lognormal_mean_mode_variance() {
+        let dist = LogNormal::new(scalar(0.0f64).unwrap(), scalar(1.0f64).unwrap()).unwrap();
+        // mean = exp(0 + 0.5) = e^0.5
+        assert!((dist.mean().unwrap().item().unwrap() - 0.5_f64.exp()).abs() < 1e-10);
+        // mode = exp(0 - 1) = e^-1
+        assert!((dist.mode().unwrap().item().unwrap() - (-1.0_f64).exp()).abs() < 1e-10);
+        // var = (e - 1) * e
+        let v = dist.variance().unwrap().item().unwrap();
+        let expected = (1.0_f64.exp() - 1.0) * 1.0_f64.exp();
+        assert!((v - expected).abs() < 1e-10);
     }
 }

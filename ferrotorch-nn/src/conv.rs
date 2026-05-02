@@ -246,6 +246,54 @@ impl<T: Float> Conv2d<T> {
         };
         w + b
     }
+
+    /// Build a `Conv2d` from caller-supplied weight and optional bias tensors.
+    ///
+    /// `weight` must have shape `[out_channels, in_channels, kH, kW]`. If
+    /// `bias` is provided, it must be 1-D of length `out_channels`. The
+    /// stride and padding are passed through unchanged. This is the constructor
+    /// used by `nn::functional::conv2d` so callers can drive the existing
+    /// im2col + matmul forward path with their own parameters (e.g. for
+    /// stateless functional dispatch or weight sharing across modules).
+    pub fn from_parts(
+        weight: Tensor<T>,
+        bias: Option<Tensor<T>>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> FerrotorchResult<Self> {
+        if weight.ndim() != 4 {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "Conv2d::from_parts: weight must be 4-D [out, in, kH, kW], got {:?}",
+                    weight.shape()
+                ),
+            });
+        }
+        let out_channels = weight.shape()[0];
+        let in_channels = weight.shape()[1];
+        let kernel_size = (weight.shape()[2], weight.shape()[3]);
+        if let Some(b) = &bias {
+            if b.ndim() != 1 || b.shape()[0] != out_channels {
+                return Err(FerrotorchError::ShapeMismatch {
+                    message: format!(
+                        "Conv2d::from_parts: bias shape {:?} != [{}]",
+                        b.shape(),
+                        out_channels
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            weight: Parameter::new(weight),
+            bias: bias.map(Parameter::new),
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            training: true,
+        })
+    }
 }
 
 impl<T: Float> Module<T> for Conv2d<T> {
@@ -773,6 +821,50 @@ impl<T: Float> Conv1d<T> {
         };
         w + b
     }
+
+    /// Build a `Conv1d` from caller-supplied weight and optional bias tensors.
+    ///
+    /// `weight` must have shape `[out_channels, in_channels, kernel_size]`.
+    /// Used by `nn::functional::conv1d`.
+    pub fn from_parts(
+        weight: Tensor<T>,
+        bias: Option<Tensor<T>>,
+        stride: usize,
+        padding: usize,
+    ) -> FerrotorchResult<Self> {
+        if weight.ndim() != 3 {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "Conv1d::from_parts: weight must be 3-D [out, in, k], got {:?}",
+                    weight.shape()
+                ),
+            });
+        }
+        let out_channels = weight.shape()[0];
+        let in_channels = weight.shape()[1];
+        let kernel_size = weight.shape()[2];
+        if let Some(b) = &bias {
+            if b.ndim() != 1 || b.shape()[0] != out_channels {
+                return Err(FerrotorchError::ShapeMismatch {
+                    message: format!(
+                        "Conv1d::from_parts: bias shape {:?} != [{}]",
+                        b.shape(),
+                        out_channels
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            weight: Parameter::new(weight),
+            bias: bias.map(Parameter::new),
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            training: true,
+        })
+    }
 }
 
 impl<T: Float> Module<T> for Conv1d<T> {
@@ -1228,6 +1320,58 @@ impl<T: Float> ConvTranspose2d<T> {
             0
         };
         w + b
+    }
+
+    /// Build a `ConvTranspose2d` from caller-supplied weight and optional bias.
+    ///
+    /// `weight` must have shape `[in_channels, out_channels, kH, kW]` (note the
+    /// transposed channel ordering vs `Conv2d`). Used by
+    /// `nn::functional::conv_transpose2d`.
+    pub fn from_parts(
+        weight: Tensor<T>,
+        bias: Option<Tensor<T>>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        output_padding: (usize, usize),
+    ) -> FerrotorchResult<Self> {
+        if weight.ndim() != 4 {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "ConvTranspose2d::from_parts: weight must be 4-D [in, out, kH, kW], got {:?}",
+                    weight.shape()
+                ),
+            });
+        }
+        let in_channels = weight.shape()[0];
+        let out_channels = weight.shape()[1];
+        let kernel_size = (weight.shape()[2], weight.shape()[3]);
+        if output_padding.0 >= stride.0 || output_padding.1 >= stride.1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "output_padding must be strictly less than stride".into(),
+            });
+        }
+        if let Some(b) = &bias {
+            if b.ndim() != 1 || b.shape()[0] != out_channels {
+                return Err(FerrotorchError::ShapeMismatch {
+                    message: format!(
+                        "ConvTranspose2d::from_parts: bias shape {:?} != [{}]",
+                        b.shape(),
+                        out_channels
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            weight: Parameter::new(weight),
+            bias: bias.map(Parameter::new),
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            training: true,
+        })
     }
 }
 
@@ -1952,6 +2096,50 @@ impl<T: Float> Conv3d<T> {
         };
         w + b
     }
+
+    /// Build a `Conv3d` from caller-supplied weight and optional bias tensors.
+    ///
+    /// `weight` must have shape `[out_channels, in_channels, kD, kH, kW]`.
+    /// Used by `nn::functional::conv3d`.
+    pub fn from_parts(
+        weight: Tensor<T>,
+        bias: Option<Tensor<T>>,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+    ) -> FerrotorchResult<Self> {
+        if weight.ndim() != 5 {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "Conv3d::from_parts: weight must be 5-D [out, in, kD, kH, kW], got {:?}",
+                    weight.shape()
+                ),
+            });
+        }
+        let out_channels = weight.shape()[0];
+        let in_channels = weight.shape()[1];
+        let kernel_size = (weight.shape()[2], weight.shape()[3], weight.shape()[4]);
+        if let Some(b) = &bias {
+            if b.ndim() != 1 || b.shape()[0] != out_channels {
+                return Err(FerrotorchError::ShapeMismatch {
+                    message: format!(
+                        "Conv3d::from_parts: bias shape {:?} != [{}]",
+                        b.shape(),
+                        out_channels
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            weight: Parameter::new(weight),
+            bias: bias.map(Parameter::new),
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            training: true,
+        })
+    }
 }
 
 impl<T: Float> Module<T> for Conv3d<T> {
@@ -2438,6 +2626,58 @@ impl<T: Float> ConvTranspose1d<T> {
             0
         };
         w + b
+    }
+
+    /// Build a `ConvTranspose1d` from caller-supplied weight and optional bias.
+    ///
+    /// `weight` must have shape `[in_channels, out_channels, kernel_size]`
+    /// (transposed channel ordering vs `Conv1d`). Used by
+    /// `nn::functional::conv_transpose1d`.
+    pub fn from_parts(
+        weight: Tensor<T>,
+        bias: Option<Tensor<T>>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+    ) -> FerrotorchResult<Self> {
+        if weight.ndim() != 3 {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "ConvTranspose1d::from_parts: weight must be 3-D [in, out, k], got {:?}",
+                    weight.shape()
+                ),
+            });
+        }
+        let in_channels = weight.shape()[0];
+        let out_channels = weight.shape()[1];
+        let kernel_size = weight.shape()[2];
+        if output_padding >= stride {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "output_padding must be strictly less than stride".into(),
+            });
+        }
+        if let Some(b) = &bias {
+            if b.ndim() != 1 || b.shape()[0] != out_channels {
+                return Err(FerrotorchError::ShapeMismatch {
+                    message: format!(
+                        "ConvTranspose1d::from_parts: bias shape {:?} != [{}]",
+                        b.shape(),
+                        out_channels
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            weight: Parameter::new(weight),
+            bias: bias.map(Parameter::new),
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            training: true,
+        })
     }
 }
 
@@ -2926,6 +3166,62 @@ impl<T: Float> ConvTranspose3d<T> {
             0
         };
         w + b
+    }
+
+    /// Build a `ConvTranspose3d` from caller-supplied weight and optional bias.
+    ///
+    /// `weight` must have shape `[in_channels, out_channels, kD, kH, kW]`
+    /// (transposed channel ordering vs `Conv3d`). Used by
+    /// `nn::functional::conv_transpose3d`.
+    pub fn from_parts(
+        weight: Tensor<T>,
+        bias: Option<Tensor<T>>,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        output_padding: (usize, usize, usize),
+    ) -> FerrotorchResult<Self> {
+        if weight.ndim() != 5 {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "ConvTranspose3d::from_parts: weight must be 5-D [in, out, kD, kH, kW], got {:?}",
+                    weight.shape()
+                ),
+            });
+        }
+        let in_channels = weight.shape()[0];
+        let out_channels = weight.shape()[1];
+        let kernel_size = (weight.shape()[2], weight.shape()[3], weight.shape()[4]);
+        if output_padding.0 >= stride.0
+            || output_padding.1 >= stride.1
+            || output_padding.2 >= stride.2
+        {
+            return Err(FerrotorchError::InvalidArgument {
+                message: "output_padding must be strictly less than stride in all dimensions"
+                    .into(),
+            });
+        }
+        if let Some(b) = &bias {
+            if b.ndim() != 1 || b.shape()[0] != out_channels {
+                return Err(FerrotorchError::ShapeMismatch {
+                    message: format!(
+                        "ConvTranspose3d::from_parts: bias shape {:?} != [{}]",
+                        b.shape(),
+                        out_channels
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            weight: Parameter::new(weight),
+            bias: bias.map(Parameter::new),
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            training: true,
+        })
     }
 }
 

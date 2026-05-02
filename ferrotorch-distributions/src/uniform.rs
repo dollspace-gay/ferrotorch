@@ -175,6 +175,101 @@ impl<T: Float> Distribution<T> for Uniform<T> {
             Ok(out)
         }
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // cdf(x) = 0 if x < low; (x - low) / (high - low) if low <= x < high; 1 if x >= high.
+        let val = value.data_vec()?;
+        let lo = self.low.data_vec()?;
+        let hi = self.high.data_vec()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = val
+            .iter()
+            .zip(lo.iter().cycle())
+            .zip(hi.iter().cycle())
+            .map(|((&x, &low), &high)| {
+                if x < low {
+                    zero
+                } else if x >= high {
+                    one
+                } else {
+                    (x - low) / (high - low)
+                }
+            })
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), value.shape().to_vec(), false)
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // icdf(p) = low + (high - low) * p (assumes p in [0, 1])
+        let q_data = q.data_vec()?;
+        let lo = self.low.data_vec()?;
+        let hi = self.high.data_vec()?;
+        let result: Vec<T> = q_data
+            .iter()
+            .zip(lo.iter().cycle())
+            .zip(hi.iter().cycle())
+            .map(|((&p, &low), &high)| low + (high - low) * p)
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), q.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        // (low + high) / 2
+        let lo = self.low.data_vec()?;
+        let hi = self.high.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let result: Vec<T> = lo.iter().zip(hi.iter()).map(|(&l, &h)| half * (l + h)).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.low.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // (high - low)^2 / 12
+        let lo = self.low.data_vec()?;
+        let hi = self.high.data_vec()?;
+        let twelfth = T::from(1.0 / 12.0).unwrap();
+        let result: Vec<T> = lo
+            .iter()
+            .zip(hi.iter())
+            .map(|(&l, &h)| {
+                let d = h - l;
+                d * d * twelfth
+            })
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.low.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // The Uniform PDF is constant — every point in [low, high] is a
+        // mode. We return the midpoint as a representative value (matches
+        // the convention in `torch.distributions.Uniform.mode`).
+        self.mean()
+    }
+
+    fn stddev(&self) -> FerrotorchResult<Tensor<T>> {
+        // sqrt(Var) = (high - low) / sqrt(12)
+        let lo = self.low.data_vec()?;
+        let hi = self.high.data_vec()?;
+        let inv_sqrt_12 = T::from(1.0 / (12.0_f64).sqrt()).unwrap();
+        let result: Vec<T> = lo
+            .iter()
+            .zip(hi.iter())
+            .map(|(&l, &h)| (h - l) * inv_sqrt_12)
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.low.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -525,5 +620,53 @@ mod tests {
         let x = scalar(0.5f64).unwrap();
         let lp = dist.log_prob(&x).unwrap();
         assert!((lp.item().unwrap() - 0.0).abs() < 1e-12);
+    }
+
+    // -----------------------------------------------------------------------
+    // CDF / ICDF / mean / variance / stddev (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_uniform_mean_variance_stddev() {
+        // Uniform(0, 4) → mean=2, var=16/12, stddev=sqrt(16/12)
+        let dist = Uniform::new(scalar(0.0f64).unwrap(), scalar(4.0f64).unwrap()).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 2.0).abs() < 1e-10);
+        assert!((dist.variance().unwrap().item().unwrap() - 16.0 / 12.0).abs() < 1e-10);
+        let std = dist.stddev().unwrap().item().unwrap();
+        assert!((std - (16.0_f64 / 12.0).sqrt()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_uniform_cdf_endpoints() {
+        let dist = Uniform::new(scalar(0.0f64).unwrap(), scalar(2.0f64).unwrap()).unwrap();
+        let x = from_slice::<f64>(&[-1.0, 0.0, 1.0, 2.0, 3.0], &[5]).unwrap();
+        let c = dist.cdf(&x).unwrap();
+        let d = c.data().unwrap();
+        assert_eq!(d, &[0.0, 0.0, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_uniform_icdf_linear() {
+        let dist = Uniform::new(scalar(10.0f64).unwrap(), scalar(20.0f64).unwrap()).unwrap();
+        let q = from_slice::<f64>(&[0.0, 0.25, 0.5, 1.0], &[4]).unwrap();
+        let x = dist.icdf(&q).unwrap();
+        let d = x.data().unwrap();
+        assert_eq!(d, &[10.0, 12.5, 15.0, 20.0]);
+    }
+
+    // ---- properties (#608) ----
+
+    #[test]
+    fn test_uniform_mode_is_midpoint() {
+        let dist = Uniform::new(scalar(0.0f64).unwrap(), scalar(4.0f64).unwrap()).unwrap();
+        let m = dist.mode().unwrap();
+        assert!((m.item().unwrap() - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_uniform_stddev_is_range_over_sqrt12() {
+        let dist = Uniform::new(scalar(0.0f64).unwrap(), scalar(12.0f64).unwrap()).unwrap();
+        let s = dist.stddev().unwrap();
+        assert!((s.item().unwrap() - 12.0 / (12.0_f64).sqrt()).abs() < 1e-12);
     }
 }

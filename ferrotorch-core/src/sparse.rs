@@ -986,6 +986,321 @@ pub fn sparse_matmul_24<T: Float>(
     Tensor::from_storage(TensorStorage::cpu(out), vec![m, n], false)
 }
 
+// ===========================================================================
+// CscTensor: Compressed Sparse Column (#619)
+// ===========================================================================
+
+/// 2-D sparse tensor in CSC (Compressed Sparse Column) format. Dual of
+/// [`CsrTensor`]: instead of storing row pointers + column indices,
+/// stores column pointers (`col_ptrs`, length `ncols + 1`) and row
+/// indices for each non-zero. Efficient for column slicing and
+/// `A^T x` style ops.
+#[derive(Debug, Clone)]
+pub struct CscTensor<T: Float> {
+    col_ptrs: Vec<usize>,
+    row_indices: Vec<usize>,
+    values: Vec<T>,
+    nrows: usize,
+    ncols: usize,
+}
+
+impl<T: Float> CscTensor<T> {
+    /// Build directly from components.
+    pub fn new(
+        col_ptrs: Vec<usize>,
+        row_indices: Vec<usize>,
+        values: Vec<T>,
+        nrows: usize,
+        ncols: usize,
+    ) -> FerrotorchResult<Self> {
+        if col_ptrs.len() != ncols + 1 {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "CscTensor: col_ptrs length ({}) must be ncols + 1 ({})",
+                    col_ptrs.len(),
+                    ncols + 1
+                ),
+            });
+        }
+        if row_indices.len() != values.len() {
+            return Err(FerrotorchError::InvalidArgument {
+                message: format!(
+                    "CscTensor: row_indices length ({}) must equal values length ({})",
+                    row_indices.len(),
+                    values.len()
+                ),
+            });
+        }
+        for &r in &row_indices {
+            if r >= nrows {
+                return Err(FerrotorchError::InvalidArgument {
+                    message: format!("CscTensor: row index {r} >= nrows {nrows}"),
+                });
+            }
+        }
+        Ok(Self {
+            col_ptrs,
+            row_indices,
+            values,
+            nrows,
+            ncols,
+        })
+    }
+
+    /// Convert from CSR: transpose the row/col axis. CSR stores by rows,
+    /// CSC stores by columns — we walk the CSR entries column-by-column
+    /// and bucket them.
+    pub fn from_csr(csr: &CsrTensor<T>) -> Self {
+        let nrows = csr.nrows;
+        let ncols = csr.ncols;
+
+        // Count entries per column.
+        let mut counts = vec![0usize; ncols];
+        for &c in &csr.col_indices {
+            counts[c] += 1;
+        }
+        // Prefix-sum into col_ptrs.
+        let mut col_ptrs = vec![0usize; ncols + 1];
+        for j in 0..ncols {
+            col_ptrs[j + 1] = col_ptrs[j] + counts[j];
+        }
+        let nnz = csr.values.len();
+        let mut row_indices = vec![0usize; nnz];
+        let mut values = vec![<T as num_traits::Zero>::zero(); nnz];
+        // Per-column write cursors.
+        let mut cursor = col_ptrs.clone();
+        for r in 0..nrows {
+            let start = csr.row_ptrs[r];
+            let end = csr.row_ptrs[r + 1];
+            for k in start..end {
+                let c = csr.col_indices[k];
+                let dst = cursor[c];
+                row_indices[dst] = r;
+                values[dst] = csr.values[k];
+                cursor[c] += 1;
+            }
+        }
+
+        Self {
+            col_ptrs,
+            row_indices,
+            values,
+            nrows,
+            ncols,
+        }
+    }
+
+    /// Convert to CSR via the dual conversion.
+    pub fn to_csr(&self) -> CsrTensor<T> {
+        // Mirror the same algorithm with rows/cols swapped.
+        let mut counts = vec![0usize; self.nrows];
+        for &r in &self.row_indices {
+            counts[r] += 1;
+        }
+        let mut row_ptrs = vec![0usize; self.nrows + 1];
+        for i in 0..self.nrows {
+            row_ptrs[i + 1] = row_ptrs[i] + counts[i];
+        }
+        let nnz = self.values.len();
+        let mut col_indices = vec![0usize; nnz];
+        let mut values = vec![<T as num_traits::Zero>::zero(); nnz];
+        let mut cursor = row_ptrs.clone();
+        for c in 0..self.ncols {
+            let start = self.col_ptrs[c];
+            let end = self.col_ptrs[c + 1];
+            for k in start..end {
+                let r = self.row_indices[k];
+                let dst = cursor[r];
+                col_indices[dst] = c;
+                values[dst] = self.values[k];
+                cursor[r] += 1;
+            }
+        }
+        CsrTensor::new(row_ptrs, col_indices, values, self.nrows, self.ncols)
+            .expect("CSR rebuild from CSC always satisfies invariants")
+    }
+
+    /// Materialize as a dense 2-D `Tensor`.
+    pub fn to_dense(&self) -> FerrotorchResult<Tensor<T>> {
+        let mut data = vec![<T as num_traits::Zero>::zero(); self.nrows * self.ncols];
+        for c in 0..self.ncols {
+            let start = self.col_ptrs[c];
+            let end = self.col_ptrs[c + 1];
+            for k in start..end {
+                let r = self.row_indices[k];
+                data[r * self.ncols + c] = self.values[k];
+            }
+        }
+        Tensor::from_storage(TensorStorage::cpu(data), vec![self.nrows, self.ncols], false)
+    }
+
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
+    pub fn nrows(&self) -> usize {
+        self.nrows
+    }
+    pub fn ncols(&self) -> usize {
+        self.ncols
+    }
+    pub fn col_ptrs(&self) -> &[usize] {
+        &self.col_ptrs
+    }
+    pub fn row_indices(&self) -> &[usize] {
+        &self.row_indices
+    }
+    pub fn values(&self) -> &[T] {
+        &self.values
+    }
+}
+
+// ===========================================================================
+// SparseGrad: index/value pairs for sparse-gradient optimizer steps (#619)
+// ===========================================================================
+
+/// A sparse gradient: a list of (index, value) pairs that an optimizer
+/// applies to a dense parameter tensor. Mirrors the `coalesce`d form of
+/// `torch.Tensor.is_sparse` gradients used by `nn.Embedding(sparse=True)`
+/// and consumed by `optim.SparseAdam` / `optim.SGD`.
+///
+/// `indices` and `values` describe a sparse update along the leading
+/// dimension of the parameter (e.g. for an embedding of shape `[V, D]`,
+/// each `index` is a row in `[0, V)` and the corresponding `value` is
+/// the gradient row of shape `[D]`).
+#[derive(Debug, Clone)]
+pub struct SparseGrad<T: Float> {
+    /// Affected leading-dim positions (length = nnz).
+    indices: Vec<usize>,
+    /// Per-affected-position gradient slabs, flat row-major: each slab
+    /// is `slab_size` elements and corresponds to `indices[i]`.
+    /// Length = `nnz * slab_size`.
+    values: Vec<T>,
+    /// Trailing-dim shape (everything past the leading dim).
+    slab_shape: Vec<usize>,
+}
+
+impl<T: Float> SparseGrad<T> {
+    /// Build from indices + per-index value slabs.
+    ///
+    /// `values.len()` must equal `indices.len() * prod(slab_shape)`.
+    pub fn new(
+        indices: Vec<usize>,
+        values: Vec<T>,
+        slab_shape: Vec<usize>,
+    ) -> FerrotorchResult<Self> {
+        let slab_size: usize = slab_shape.iter().product::<usize>().max(1);
+        if values.len() != indices.len() * slab_size {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "SparseGrad: values.len()={} != indices.len()={} * slab_size={}",
+                    values.len(),
+                    indices.len(),
+                    slab_size
+                ),
+            });
+        }
+        Ok(Self {
+            indices,
+            values,
+            slab_shape,
+        })
+    }
+
+    /// Number of distinct sparse rows (may include duplicates if the
+    /// caller didn't coalesce).
+    pub fn nnz(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn indices(&self) -> &[usize] {
+        &self.indices
+    }
+
+    /// Flat per-slab buffer; length `nnz * slab_size`. Use [`slab_shape`]
+    /// to interpret each slab.
+    pub fn values(&self) -> &[T] {
+        &self.values
+    }
+
+    pub fn slab_shape(&self) -> &[usize] {
+        &self.slab_shape
+    }
+
+    pub fn slab_size(&self) -> usize {
+        self.slab_shape.iter().product::<usize>().max(1)
+    }
+
+    /// Coalesce: sum slabs that share the same index, returning a new
+    /// `SparseGrad` whose `indices` are unique (and sorted ascending).
+    pub fn coalesce(&self) -> Self {
+        let slab_size = self.slab_size();
+        let mut groups: std::collections::BTreeMap<usize, Vec<T>> =
+            std::collections::BTreeMap::new();
+        for (k, &idx) in self.indices.iter().enumerate() {
+            let slab_start = k * slab_size;
+            let entry = groups
+                .entry(idx)
+                .or_insert_with(|| vec![<T as num_traits::Zero>::zero(); slab_size]);
+            for (j, dst) in entry.iter_mut().enumerate() {
+                *dst = *dst + self.values[slab_start + j];
+            }
+        }
+        let new_nnz = groups.len();
+        let mut new_indices = Vec::with_capacity(new_nnz);
+        let mut new_values = Vec::with_capacity(new_nnz * slab_size);
+        for (idx, slab) in groups {
+            new_indices.push(idx);
+            new_values.extend(slab);
+        }
+        Self {
+            indices: new_indices,
+            values: new_values,
+            slab_shape: self.slab_shape.clone(),
+        }
+    }
+
+    /// Apply this sparse gradient to a dense parameter tensor: update
+    /// `param[indices[i]] -= lr * values[i]` for every i. The leading
+    /// dim of `param` is the indexed dim; the rest must match `slab_shape`.
+    pub fn apply_sgd(&self, param: &mut Tensor<T>, lr: T) -> FerrotorchResult<()> {
+        let shape = param.shape().to_vec();
+        if shape.len() != 1 + self.slab_shape.len() {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "SparseGrad::apply_sgd: param shape {:?} incompatible with slab shape {:?}",
+                    shape, self.slab_shape
+                ),
+            });
+        }
+        if shape[1..] != self.slab_shape[..] {
+            return Err(FerrotorchError::ShapeMismatch {
+                message: format!(
+                    "SparseGrad::apply_sgd: param trailing dims {:?} != slab_shape {:?}",
+                    &shape[1..],
+                    self.slab_shape
+                ),
+            });
+        }
+        let slab_size = self.slab_size();
+        let leading = shape[0];
+        let mut data = param.data_vec()?;
+        for (k, &idx) in self.indices.iter().enumerate() {
+            if idx >= leading {
+                return Err(FerrotorchError::InvalidArgument {
+                    message: format!("SparseGrad::apply_sgd: index {idx} >= {leading}"),
+                });
+            }
+            let row_start = idx * slab_size;
+            let val_start = k * slab_size;
+            for j in 0..slab_size {
+                data[row_start + j] = data[row_start + j] - lr * self.values[val_start + j];
+            }
+        }
+        *param = Tensor::from_storage(TensorStorage::cpu(data), shape, param.requires_grad())?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,5 +1967,141 @@ mod tests {
         let dense = sp.decompress().unwrap();
         let data = dense.data().unwrap();
         assert_eq!(data, &[0.0, 4.0, 0.0, 3.0, -5.0, 2.0, 0.0, 0.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // CscTensor (#619)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn csc_from_csr_roundtrip() {
+        // Build a CSR matrix:
+        //   [[1, 0, 2],
+        //    [0, 0, 3],
+        //    [4, 5, 0]]
+        // CSR: row_ptrs = [0, 2, 3, 5]; col_idx = [0, 2, 2, 0, 1]; vals = [1, 2, 3, 4, 5]
+        let csr = CsrTensor::new(
+            vec![0, 2, 3, 5],
+            vec![0, 2, 2, 0, 1],
+            vec![1.0_f32, 2.0, 3.0, 4.0, 5.0],
+            3,
+            3,
+        )
+        .unwrap();
+        let csc = CscTensor::from_csr(&csr);
+        assert_eq!(csc.nrows(), 3);
+        assert_eq!(csc.ncols(), 3);
+        assert_eq!(csc.nnz(), 5);
+        // Round-trip back to CSR.
+        let csr2 = csc.to_csr();
+        assert_eq!(csr2.values().to_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn csc_to_dense_matches_csr() {
+        let csr = CsrTensor::new(
+            vec![0, 2, 3, 5],
+            vec![0, 2, 2, 0, 1],
+            vec![1.0_f32, 2.0, 3.0, 4.0, 5.0],
+            3,
+            3,
+        )
+        .unwrap();
+        let csc = CscTensor::from_csr(&csr);
+        let dense = csc.to_dense().unwrap();
+        let d = dense.data().unwrap();
+        assert_eq!(d, &[1.0, 0.0, 2.0, 0.0, 0.0, 3.0, 4.0, 5.0, 0.0]);
+    }
+
+    #[test]
+    fn csc_rejects_bad_col_ptrs_length() {
+        let err = CscTensor::new(vec![0, 1], vec![0], vec![1.0_f32], 2, 3).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn csc_rejects_oob_row_index() {
+        let err = CscTensor::new(vec![0, 1], vec![5], vec![1.0_f32], 2, 1).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // SparseGrad (#619)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sparse_grad_construction_validates_size() {
+        // 2 indices, slab_shape [3] → expects 6 values.
+        let err = SparseGrad::<f32>::new(vec![0, 2], vec![1.0; 5], vec![3]).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn sparse_grad_coalesce_sums_duplicate_indices() {
+        // index 0 appears twice with slabs [1, 2] and [3, 4] → coalesced [4, 6].
+        // index 1 once with [5, 6].
+        let g = SparseGrad::<f32>::new(
+            vec![0, 1, 0],
+            vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0],
+            vec![2],
+        )
+        .unwrap();
+        let c = g.coalesce();
+        assert_eq!(c.indices(), &[0, 1]);
+        assert_eq!(c.values(), &[4.0, 6.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn sparse_grad_apply_sgd_updates_only_affected_rows() {
+        // Embedding [4, 3] init zeros; sparse grad at rows 1, 3 with lr=1.
+        let mut param = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![0.0; 12]),
+            vec![4, 3],
+            false,
+        )
+        .unwrap();
+        let grad = SparseGrad::<f32>::new(
+            vec![1, 3],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![3],
+        )
+        .unwrap();
+        grad.apply_sgd(&mut param, 1.0).unwrap();
+        let d = param.data().unwrap();
+        // Row 0: untouched
+        assert_eq!(&d[0..3], &[0.0, 0.0, 0.0]);
+        // Row 1: -[1, 2, 3] = [-1, -2, -3]
+        assert_eq!(&d[3..6], &[-1.0, -2.0, -3.0]);
+        // Row 2: untouched
+        assert_eq!(&d[6..9], &[0.0, 0.0, 0.0]);
+        // Row 3: -[4, 5, 6] = [-4, -5, -6]
+        assert_eq!(&d[9..12], &[-4.0, -5.0, -6.0]);
+    }
+
+    #[test]
+    fn sparse_grad_apply_sgd_rejects_oob_index() {
+        let mut param = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![0.0; 6]),
+            vec![2, 3],
+            false,
+        )
+        .unwrap();
+        let grad = SparseGrad::<f32>::new(vec![5], vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        let err = grad.apply_sgd(&mut param, 1.0).unwrap_err();
+        assert!(matches!(err, FerrotorchError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn sparse_grad_apply_sgd_rejects_shape_mismatch() {
+        let mut param = Tensor::<f32>::from_storage(
+            TensorStorage::cpu(vec![0.0; 6]),
+            vec![2, 3],
+            false,
+        )
+        .unwrap();
+        // slab_shape [4] != param trailing [3]
+        let grad = SparseGrad::<f32>::new(vec![0], vec![1.0; 4], vec![4]).unwrap();
+        let err = grad.apply_sgd(&mut param, 1.0).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
     }
 }

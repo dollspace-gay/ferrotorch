@@ -51,6 +51,10 @@ pub enum GpuError {
     #[cfg(feature = "cuda")]
     Solver(cudarc::cusolver::result::CusolverError),
 
+    /// cuFFT error forwarded from cudarc.
+    #[cfg(feature = "cuda")]
+    Fft(cudarc::cufft::result::CufftError),
+
     /// PTX kernel compilation failed (e.g. unsupported GPU architecture).
     PtxCompileFailed { kernel: &'static str },
 
@@ -124,6 +128,9 @@ impl fmt::Display for GpuError {
             #[cfg(feature = "cuda")]
             GpuError::Solver(e) => write!(f, "cuSOLVER error: {e}"),
 
+            #[cfg(feature = "cuda")]
+            GpuError::Fft(e) => write!(f, "cuFFT error: {e}"),
+
             GpuError::PtxCompileFailed { kernel } => {
                 write!(f, "PTX kernel compilation failed: {kernel}")
             }
@@ -144,6 +151,8 @@ impl std::error::Error for GpuError {
             GpuError::Blas(e) => Some(e),
             #[cfg(feature = "cuda")]
             GpuError::Solver(e) => Some(e),
+            #[cfg(feature = "cuda")]
+            GpuError::Fft(e) => Some(e),
             _ => None,
         }
     }
@@ -167,6 +176,13 @@ impl From<cudarc::cublas::result::CublasError> for GpuError {
 impl From<cudarc::cusolver::result::CusolverError> for GpuError {
     fn from(e: cudarc::cusolver::result::CusolverError) -> Self {
         GpuError::Solver(e)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::cufft::result::CufftError> for GpuError {
+    fn from(e: cudarc::cufft::result::CufftError) -> Self {
+        GpuError::Fft(e)
     }
 }
 

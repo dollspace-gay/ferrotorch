@@ -81,8 +81,14 @@ pub(crate) fn ptx_f32_to_f64(f32_ptx: &str, f32_kernel_name: &str, f64_kernel_na
         .replace("cvt.rn.f32.s32", "cvt.rn.f64.s32")
         // Bit reinterpretation (for NaN/inf checks)
         .replace("mov.b32", "mov.b64")
-        // Byte offset: 4 bytes per f32 → 8 bytes per f64
+        // Byte offset: 4 bytes per f32 → 8 bytes per f64.
+        // Cover both the canonical `%off` register and the `%off_in`/`%off_out`
+        // pair used by gather/scatter/transpose-style kernels. Missing one of
+        // these caused `gpu_transpose_2d_f64` to issue f32-stride loads against
+        // an f64 buffer, hitting CUDA_ERROR_MISALIGNED_ADDRESS. (#575)
         .replace("shl.b64 %off, %off, 2", "shl.b64 %off, %off, 3")
+        .replace("shl.b64 %off_in, %off_in, 2", "shl.b64 %off_in, %off_in, 3")
+        .replace("shl.b64 %off_out, %off_out, 2", "shl.b64 %off_out, %off_out, 3")
         // Atomics
         .replace("atom.global.add.f32", "atom.global.add.f64")
         // Common float hex literals
@@ -8332,6 +8338,262 @@ DONE:
 ";
 
 
+/// PTX source for `strided_scatter_kernel`: inverse of `strided_copy_kernel`.
+///
+/// Each thread `tid` corresponds to one position in the contiguous source
+/// buffer `in`. The kernel decodes `tid` into per-dimension coordinates
+/// using the source-shape products `is0..is7`, accumulates a destination
+/// element index `dst_idx = dst_offset + Σ_d coord_d * ds_d` using the
+/// strided-view strides `ds0..ds7`, and writes `in[tid]` into
+/// `out[dst_idx]`.
+///
+/// Mirrors the f32 strided-copy kernel structurally; only the final
+/// load/store pair is reversed.
+#[cfg(feature = "cuda")]
+pub(crate) const STRIDED_SCATTER_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry strided_scatter_kernel(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 dst_offset_base,
+    .param .u32 n,
+    .param .u32 is0, .param .u32 is1, .param .u32 is2, .param .u32 is3,
+    .param .u32 is4, .param .u32 is5, .param .u32 is6, .param .u32 is7,
+    .param .u32 ds0, .param .u32 ds1, .param .u32 ds2, .param .u32 ds3,
+    .param .u32 ds4, .param .u32 ds5, .param .u32 ds6, .param .u32 ds7
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u32 %flat, %dst_idx, %coord, %tmp, %is, %ds;
+    .reg .u64 %in, %out, %off;
+    .reg .f32 %val;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [input_ptr];
+    ld.param.u64 %out, [output_ptr];
+    ld.param.u32 %dst_idx, [dst_offset_base];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    mov.u32 %flat, %r_tid;
+
+    // Dim 0
+    ld.param.u32 %is, [is0];
+    ld.param.u32 %ds, [ds0];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 1
+    ld.param.u32 %is, [is1];
+    ld.param.u32 %ds, [ds1];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 2
+    ld.param.u32 %is, [is2];
+    ld.param.u32 %ds, [ds2];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 3
+    ld.param.u32 %is, [is3];
+    ld.param.u32 %ds, [ds3];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 4
+    ld.param.u32 %is, [is4];
+    ld.param.u32 %ds, [ds4];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 5
+    ld.param.u32 %is, [is5];
+    ld.param.u32 %ds, [ds5];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 6
+    ld.param.u32 %is, [is6];
+    ld.param.u32 %ds, [ds6];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Dim 7
+    ld.param.u32 %is, [is7];
+    ld.param.u32 %ds, [ds7];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    // Load from in[r_tid]
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %in, %off;
+    ld.global.f32 %val, [%off];
+
+    // Store to out[dst_idx]
+    cvt.u64.u32 %off, %dst_idx;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %out, %off;
+    st.global.f32 [%off], %val;
+
+DONE:
+    ret;
+}
+";
+
+/// PTX source for `strided_scatter_f64_kernel` — same shape as the f32
+/// kernel but with `f64` element loads and `<<3` byte-offset shifts
+/// (instead of `<<2`).
+#[cfg(feature = "cuda")]
+pub(crate) const STRIDED_SCATTER_F64_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry strided_scatter_f64_kernel(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 dst_offset_base,
+    .param .u32 n,
+    .param .u32 is0, .param .u32 is1, .param .u32 is2, .param .u32 is3,
+    .param .u32 is4, .param .u32 is5, .param .u32 is6, .param .u32 is7,
+    .param .u32 ds0, .param .u32 ds1, .param .u32 ds2, .param .u32 ds3,
+    .param .u32 ds4, .param .u32 ds5, .param .u32 ds6, .param .u32 ds7
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %n_reg;
+    .reg .u32 %flat, %dst_idx, %coord, %tmp, %is, %ds;
+    .reg .u64 %in, %out, %off;
+    .reg .f64 %val;
+    .reg .pred %p;
+
+    ld.param.u64 %in, [input_ptr];
+    ld.param.u64 %out, [output_ptr];
+    ld.param.u32 %dst_idx, [dst_offset_base];
+    ld.param.u32 %n_reg, [n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    setp.ge.u32 %p, %r_tid, %n_reg;
+    @%p bra DONE;
+
+    mov.u32 %flat, %r_tid;
+
+    ld.param.u32 %is, [is0];
+    ld.param.u32 %ds, [ds0];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is1];
+    ld.param.u32 %ds, [ds1];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is2];
+    ld.param.u32 %ds, [ds2];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is3];
+    ld.param.u32 %ds, [ds3];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is4];
+    ld.param.u32 %ds, [ds4];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is5];
+    ld.param.u32 %ds, [ds5];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is6];
+    ld.param.u32 %ds, [ds6];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    ld.param.u32 %is, [is7];
+    ld.param.u32 %ds, [ds7];
+    div.u32 %coord, %flat, %is;
+    mul.lo.u32 %tmp, %coord, %is;
+    sub.u32 %flat, %flat, %tmp;
+    mul.lo.u32 %tmp, %coord, %ds;
+    add.u32 %dst_idx, %dst_idx, %tmp;
+
+    cvt.u64.u32 %off, %r_tid;
+    shl.b64 %off, %off, 3;
+    add.u64 %off, %in, %off;
+    ld.global.f64 %val, [%off];
+
+    cvt.u64.u32 %off, %dst_idx;
+    shl.b64 %off, %off, 3;
+    add.u64 %off, %out, %off;
+    st.global.f64 [%off], %val;
+
+DONE:
+    ret;
+}
+";
+
 /// PTX source for `div_kernel`: `out[i] = a[i] / b[i]`.
 #[cfg(feature = "cuda")]
 pub(crate) const DIV_PTX: &str = "\
@@ -12159,6 +12421,214 @@ pub fn gpu_strided_copy_f64(
     }
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Strided scatter (inverse of strided_copy)
+// ---------------------------------------------------------------------------
+
+/// Scatter a contiguous source buffer into a strided view of `dst`,
+/// in-place. Inverse of [`gpu_strided_copy`].
+///
+/// `dst` must already contain the "base" data (typically a clone of the
+/// caller's `self` tensor — `as_strided_scatter` semantics retain
+/// non-view positions). After the kernel, every position addressed by
+/// `(view_shape, dst_strides, dst_offset)` will hold the corresponding
+/// value from `src`; non-view positions stay unchanged.
+///
+/// # Arguments
+///
+/// * `src`         — contiguous values to scatter, length `product(view_shape)`.
+/// * `dst`         — destination buffer, mutated in place.
+/// * `view_shape`  — shape of the strided view (and of `src`).
+///   `view_shape.len() <= STRIDED_COPY_MAX_DIMS`.
+/// * `dst_strides` — element strides of the strided view, aligned with
+///   `view_shape`. Must be non-negative (matches the kernel's u32
+///   stride encoding).
+/// * `dst_offset`  — base element offset into `dst` for the view.
+/// * `device`      — CUDA device.
+///
+/// # Errors
+/// - [`GpuError::DeviceMismatch`] if `src`, `dst`, and `device` differ.
+/// - [`GpuError::ShapeMismatch`] on rank mismatch, too many dims, or
+///   negative strides.
+/// - [`GpuError::Driver`] on CUDA runtime errors.
+#[cfg(feature = "cuda")]
+pub fn gpu_strided_scatter(
+    src: &CudaBuffer<f32>,
+    dst: &mut CudaBuffer<f32>,
+    view_shape: &[usize],
+    dst_strides: &[isize],
+    dst_offset: usize,
+    device: &GpuDevice,
+) -> GpuResult<()> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_device(src, device)?;
+    validate_device(dst, device)?;
+
+    let n: usize = view_shape.iter().product();
+    if n == 0 {
+        return Ok(());
+    }
+    // Reuse `pad_strided_copy_params`: it produces shape-product strides
+    // for the contiguous side (`view_shape` here) and pads the
+    // user-supplied strides for the strided side (`dst_strides` here).
+    let (in_decode_stride, dst_stride_padded) =
+        pad_strided_copy_params(view_shape, dst_strides, n)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        STRIDED_SCATTER_PTX,
+        "strided_scatter_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // CPU fallback — pull both buffers to host, scatter, push dst back.
+            // Matches the strided_copy fallback so behaviour is identical when
+            // PTX compilation is unavailable.
+            let host_src = gpu_to_cpu(src, device)?;
+            let mut host_dst = gpu_to_cpu(dst, device)?;
+            for (i, &v) in host_src.iter().enumerate().take(n) {
+                let mut flat = i as u32;
+                let mut dst_idx = dst_offset as u32;
+                for d in 0..STRIDED_COPY_MAX_DIMS {
+                    let is = in_decode_stride[d];
+                    let ds = dst_stride_padded[d];
+                    let coord = flat / is;
+                    flat -= coord * is;
+                    dst_idx += coord * ds;
+                }
+                host_dst[dst_idx as usize] = v;
+            }
+            let new_dst = cpu_to_gpu(&host_dst, device)?;
+            // Copy the new contents into the caller-supplied `dst` slot.
+            stream.memcpy_dtod(new_dst.inner(), dst.inner_mut())?;
+            return Ok(());
+        }
+    };
+
+    let cfg = launch_cfg(n)?;
+    let dst_offset_u32 = dst_offset as u32;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(src.inner())
+            .arg(dst.inner_mut())
+            .arg(&dst_offset_u32)
+            .arg(&n_u32)
+            .arg(&in_decode_stride[0])
+            .arg(&in_decode_stride[1])
+            .arg(&in_decode_stride[2])
+            .arg(&in_decode_stride[3])
+            .arg(&in_decode_stride[4])
+            .arg(&in_decode_stride[5])
+            .arg(&in_decode_stride[6])
+            .arg(&in_decode_stride[7])
+            .arg(&dst_stride_padded[0])
+            .arg(&dst_stride_padded[1])
+            .arg(&dst_stride_padded[2])
+            .arg(&dst_stride_padded[3])
+            .arg(&dst_stride_padded[4])
+            .arg(&dst_stride_padded[5])
+            .arg(&dst_stride_padded[6])
+            .arg(&dst_stride_padded[7])
+            .launch(cfg)?;
+    }
+
+    Ok(())
+}
+
+/// f64 variant of [`gpu_strided_scatter`].
+#[cfg(feature = "cuda")]
+pub fn gpu_strided_scatter_f64(
+    src: &CudaBuffer<f64>,
+    dst: &mut CudaBuffer<f64>,
+    view_shape: &[usize],
+    dst_strides: &[isize],
+    dst_offset: usize,
+    device: &GpuDevice,
+) -> GpuResult<()> {
+    use cudarc::driver::PushKernelArg;
+
+    validate_device(src, device)?;
+    validate_device(dst, device)?;
+
+    let n: usize = view_shape.iter().product();
+    if n == 0 {
+        return Ok(());
+    }
+    let (in_decode_stride, dst_stride_padded) =
+        pad_strided_copy_params(view_shape, dst_strides, n)?;
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        STRIDED_SCATTER_F64_PTX,
+        "strided_scatter_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host_src = gpu_to_cpu(src, device)?;
+            let mut host_dst = gpu_to_cpu(dst, device)?;
+            for (i, &v) in host_src.iter().enumerate().take(n) {
+                let mut flat = i as u32;
+                let mut dst_idx = dst_offset as u32;
+                for d in 0..STRIDED_COPY_MAX_DIMS {
+                    let is = in_decode_stride[d];
+                    let ds = dst_stride_padded[d];
+                    let coord = flat / is;
+                    flat -= coord * is;
+                    dst_idx += coord * ds;
+                }
+                host_dst[dst_idx as usize] = v;
+            }
+            let new_dst = cpu_to_gpu(&host_dst, device)?;
+            stream.memcpy_dtod(new_dst.inner(), dst.inner_mut())?;
+            return Ok(());
+        }
+    };
+
+    let cfg = launch_cfg(n)?;
+    let dst_offset_u32 = dst_offset as u32;
+    let n_u32 = n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(src.inner())
+            .arg(dst.inner_mut())
+            .arg(&dst_offset_u32)
+            .arg(&n_u32)
+            .arg(&in_decode_stride[0])
+            .arg(&in_decode_stride[1])
+            .arg(&in_decode_stride[2])
+            .arg(&in_decode_stride[3])
+            .arg(&in_decode_stride[4])
+            .arg(&in_decode_stride[5])
+            .arg(&in_decode_stride[6])
+            .arg(&in_decode_stride[7])
+            .arg(&dst_stride_padded[0])
+            .arg(&dst_stride_padded[1])
+            .arg(&dst_stride_padded[2])
+            .arg(&dst_stride_padded[3])
+            .arg(&dst_stride_padded[4])
+            .arg(&dst_stride_padded[5])
+            .arg(&dst_stride_padded[6])
+            .arg(&dst_stride_padded[7])
+            .launch(cfg)?;
+    }
+
+    Ok(())
 }
 
 /// Scalar multiply: `out[i] = a[i] * scalar`.

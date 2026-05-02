@@ -1,0 +1,29 @@
+[package]
+name = "ferrotorch-ml"
+description = "Sklearn-compatible adapter for ferrotorch — Tensor ↔ ndarray + curated ferrolearn re-exports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+ferrotorch-core = { workspace = true }
+ndarray = "0.17"
+num-traits = { workspace = true }
+thiserror = { workspace = true }
+
+# ferrolearn ecosystem (CPU-only sklearn-equivalent).
+ferrolearn-core = "0.3"
+ferrolearn-metrics = "0.3"
+ferrolearn-preprocess = "0.3"
+ferrolearn-model-sel = "0.3"
+ferrolearn-decomp = "0.3"
+ferrolearn-datasets = "0.3"
+
+[dev-dependencies]

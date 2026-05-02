@@ -267,6 +267,52 @@ impl<T: Float> Distribution<T> for Gamma<T> {
             Ok(out)
         }
     }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        // mean = concentration / rate
+        let conc = self.concentration.data_vec()?;
+        let rate = self.rate.data_vec()?;
+        let result: Vec<T> = conc.iter().zip(rate.iter()).map(|(&a, &b)| a / b).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.concentration.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // mode = (concentration - 1) / rate when concentration >= 1, else NaN.
+        let conc = self.concentration.data_vec()?;
+        let rate = self.rate.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let nan = T::from(f64::NAN).unwrap();
+        let result: Vec<T> = conc
+            .iter()
+            .zip(rate.iter())
+            .map(|(&a, &b)| if a >= one { (a - one) / b } else { nan })
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.concentration.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // var = concentration / rate^2
+        let conc = self.concentration.data_vec()?;
+        let rate = self.rate.data_vec()?;
+        let result: Vec<T> = conc
+            .iter()
+            .zip(rate.iter())
+            .map(|(&a, &b)| a / (b * b))
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.concentration.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,5 +540,25 @@ mod tests {
         let x = scalar(1.0f64).unwrap();
         let lp = dist.log_prob(&x).unwrap();
         assert!((lp.item().unwrap() - (-1.0f64)).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // mean / mode / variance (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gamma_mean_variance() {
+        // Gamma(concentration=4, rate=2) → mean=2, var=1
+        let dist = Gamma::new(scalar(4.0f64).unwrap(), scalar(2.0f64).unwrap()).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 2.0).abs() < 1e-10);
+        assert!((dist.variance().unwrap().item().unwrap() - 1.0).abs() < 1e-10);
+        // mode = (4 - 1) / 2 = 1.5
+        assert!((dist.mode().unwrap().item().unwrap() - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gamma_mode_nan_for_concentration_below_one() {
+        let dist = Gamma::new(scalar(0.5f64).unwrap(), scalar(2.0f64).unwrap()).unwrap();
+        assert!(dist.mode().unwrap().item().unwrap().is_nan());
     }
 }

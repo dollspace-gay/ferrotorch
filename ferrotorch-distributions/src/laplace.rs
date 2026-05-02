@@ -182,6 +182,81 @@ impl<T: Float> Distribution<T> for Laplace<T> {
             Ok(out)
         }
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // cdf(x) = 0.5 + 0.5 * sign(x - loc) * (1 - exp(-|x - loc| / scale))
+        let val = value.data_vec()?;
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let one = <T as num_traits::One>::one();
+        let zero = <T as num_traits::Zero>::zero();
+        let result: Vec<T> = val
+            .iter()
+            .zip(loc_data.iter().cycle())
+            .zip(scale_data.iter().cycle())
+            .map(|((&x, &l), &s)| {
+                let z = x - l;
+                let sign = if z > zero {
+                    one
+                } else if z < zero {
+                    -one
+                } else {
+                    zero
+                };
+                half + half * sign * (one - (-z.abs() / s).exp())
+            })
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), value.shape().to_vec(), false)
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // icdf(p) = loc - scale * sign(p - 0.5) * ln(1 - 2|p - 0.5|)
+        let q_data = q.data_vec()?;
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let half = T::from(0.5).unwrap();
+        let one = <T as num_traits::One>::one();
+        let two = T::from(2.0).unwrap();
+        let zero = <T as num_traits::Zero>::zero();
+        let result: Vec<T> = q_data
+            .iter()
+            .zip(loc_data.iter().cycle())
+            .zip(scale_data.iter().cycle())
+            .map(|((&p, &l), &s)| {
+                let d = p - half;
+                let sign = if d > zero {
+                    one
+                } else if d < zero {
+                    -one
+                } else {
+                    zero
+                };
+                l - s * sign * (one - two * d.abs()).ln()
+            })
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), q.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.loc.clone())
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.loc.clone())
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // 2 * scale^2
+        let scale_data = self.scale.data_vec()?;
+        let two = T::from(2.0).unwrap();
+        let result: Vec<T> = scale_data.iter().map(|&s| two * s * s).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.scale.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -411,5 +486,37 @@ mod tests {
         let lp = dist.log_prob(&x).unwrap();
         let expected = -(2.0f64).ln();
         assert!((lp.item().unwrap() - expected).abs() < 1e-12);
+    }
+
+    // -----------------------------------------------------------------------
+    // CDF / ICDF / mean / mode / variance (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_laplace_mean_mode_variance() {
+        let dist = Laplace::new(scalar(3.0f64).unwrap(), scalar(2.0f64).unwrap()).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 3.0).abs() < 1e-10);
+        assert!((dist.mode().unwrap().item().unwrap() - 3.0).abs() < 1e-10);
+        // var = 2 * scale^2 = 8
+        assert!((dist.variance().unwrap().item().unwrap() - 8.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_laplace_cdf_at_loc_is_half() {
+        let dist = Laplace::new(scalar(1.0f64).unwrap(), scalar(2.0f64).unwrap()).unwrap();
+        let x = scalar(1.0f64).unwrap();
+        let c = dist.cdf(&x).unwrap();
+        assert!((c.item().unwrap() - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_laplace_icdf_roundtrip() {
+        let dist = Laplace::new(scalar(0.0f64).unwrap(), scalar(1.0f64).unwrap()).unwrap();
+        for p in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let q = scalar(p).unwrap();
+            let x = dist.icdf(&q).unwrap();
+            let p2 = dist.cdf(&x).unwrap();
+            assert!((p2.item().unwrap() - p).abs() < 1e-10);
+        }
     }
 }

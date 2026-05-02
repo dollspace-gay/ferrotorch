@@ -307,6 +307,505 @@ pub fn irfft_differentiable<T: Float>(
 }
 
 // ---------------------------------------------------------------------------
+// FftnBackward / IfftnBackward — N-D complex FFT backward.
+// ---------------------------------------------------------------------------
+//
+// Math (FftNorm::Backward convention, matches torch.fft):
+//   y = fftn(x, s, axes)   → grad_x = prod(s) * ifftn(grad_y, s, axes)
+//   y = ifftn(x, s, axes)  → grad_x = fftn(grad_y, s, axes) / prod(s)
+//
+// The shape of the transform output along each transform axis is the value
+// in `s` (or the input length if `s` is `None`). We persist `s` and `axes`
+// from the forward to keep the backward shape-stable.
+
+#[derive(Debug)]
+pub struct FftnBackward<T: Float> {
+    input: Tensor<T>,
+    s: Option<Vec<usize>>,
+    axes: Option<Vec<isize>>,
+    /// Product of the transform-axis lengths in the forward output.
+    norm_n: usize,
+}
+
+impl<T: Float> FftnBackward<T> {
+    pub fn new(
+        input: Tensor<T>,
+        s: Option<Vec<usize>>,
+        axes: Option<Vec<isize>>,
+        norm_n: usize,
+    ) -> Self {
+        Self {
+            input,
+            s,
+            axes,
+            norm_n,
+        }
+    }
+}
+
+impl<T: Float> GradFn<T> for FftnBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let grad_input = if self.input.requires_grad() {
+            let device = grad_output.device();
+            let inv = fft::ifftn(grad_output, self.s.as_deref(), self.axes.as_deref())?;
+            let scale = T::from(self.norm_n).unwrap();
+            let inv_data = inv.data_vec()?;
+            let scaled: Vec<T> = inv_data.iter().map(|&v| v * scale).collect();
+            let t = Tensor::from_storage(TensorStorage::cpu(scaled), inv.shape().to_vec(), false)?;
+            Some(if device.is_cuda() { t.to(device)? } else { t })
+        } else {
+            None
+        };
+        Ok(vec![grad_input])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "FftnBackward"
+    }
+}
+
+#[derive(Debug)]
+pub struct IfftnBackward<T: Float> {
+    input: Tensor<T>,
+    s: Option<Vec<usize>>,
+    axes: Option<Vec<isize>>,
+    /// Product of the transform-axis lengths.
+    norm_n: usize,
+}
+
+impl<T: Float> IfftnBackward<T> {
+    pub fn new(
+        input: Tensor<T>,
+        s: Option<Vec<usize>>,
+        axes: Option<Vec<isize>>,
+        norm_n: usize,
+    ) -> Self {
+        Self {
+            input,
+            s,
+            axes,
+            norm_n,
+        }
+    }
+}
+
+impl<T: Float> GradFn<T> for IfftnBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let grad_input = if self.input.requires_grad() {
+            let device = grad_output.device();
+            let fwd = fft::fftn(grad_output, self.s.as_deref(), self.axes.as_deref())?;
+            let scale = T::from(1.0).unwrap() / T::from(self.norm_n).unwrap();
+            let fwd_data = fwd.data_vec()?;
+            let scaled: Vec<T> = fwd_data.iter().map(|&v| v * scale).collect();
+            let t = Tensor::from_storage(TensorStorage::cpu(scaled), fwd.shape().to_vec(), false)?;
+            Some(if device.is_cuda() { t.to(device)? } else { t })
+        } else {
+            None
+        };
+        Ok(vec![grad_input])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "IfftnBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RfftnBackward / IrfftnBackward — N-D real FFT backward.
+// ---------------------------------------------------------------------------
+//
+// VJPs:
+//   y = rfftn(x, s, axes) (real → Hermitian complex)
+//     → grad_x = irfftn(grad_y, s=original_real_shape, axes)
+//   y = irfftn(x, s, axes) (Hermitian complex → real)
+//     → grad_x = rfftn(grad_y, s=original_real_shape, axes)
+
+#[derive(Debug)]
+pub struct RfftnBackward<T: Float> {
+    input: Tensor<T>,
+    /// Output sizes along the transform axes (passed to irfftn for backward).
+    s: Option<Vec<usize>>,
+    axes: Option<Vec<isize>>,
+}
+
+impl<T: Float> RfftnBackward<T> {
+    pub fn new(input: Tensor<T>, s: Option<Vec<usize>>, axes: Option<Vec<isize>>) -> Self {
+        Self { input, s, axes }
+    }
+}
+
+impl<T: Float> GradFn<T> for RfftnBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let grad_input = if self.input.requires_grad() {
+            Some(fft::irfftn(
+                grad_output,
+                self.s.as_deref(),
+                self.axes.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        Ok(vec![grad_input])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "RfftnBackward"
+    }
+}
+
+#[derive(Debug)]
+pub struct IrfftnBackward<T: Float> {
+    input: Tensor<T>,
+    s: Option<Vec<usize>>,
+    axes: Option<Vec<isize>>,
+}
+
+impl<T: Float> IrfftnBackward<T> {
+    pub fn new(input: Tensor<T>, s: Option<Vec<usize>>, axes: Option<Vec<isize>>) -> Self {
+        Self { input, s, axes }
+    }
+}
+
+impl<T: Float> GradFn<T> for IrfftnBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let grad_input = if self.input.requires_grad() {
+            Some(fft::rfftn(
+                grad_output,
+                self.s.as_deref(),
+                self.axes.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        Ok(vec![grad_input])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "IrfftnBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HfftBackward / IhfftBackward — Hermitian FFT backward.
+// ---------------------------------------------------------------------------
+//
+// hfft maps Hermitian-symmetric complex `[..., n/2+1, 2]` → real `[..., n]`.
+// ihfft is the inverse: real `[..., n]` → Hermitian complex `[..., n/2+1, 2]`.
+//
+// VJPs (matching torch.fft.hfft / ihfft):
+//   y = hfft(x, n)  → grad_x = ihfft(grad_y, n=input_n)
+//   y = ihfft(x, n) → grad_x = hfft(grad_y, n=input_n)
+
+#[derive(Debug)]
+pub struct HfftBackward<T: Float> {
+    input: Tensor<T>,
+    /// Length of the original Hermitian spectrum (input's second-to-last dim).
+    input_n: usize,
+}
+
+impl<T: Float> HfftBackward<T> {
+    pub fn new(input: Tensor<T>, input_n: usize) -> Self {
+        Self { input, input_n }
+    }
+}
+
+impl<T: Float> GradFn<T> for HfftBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let grad_input = if self.input.requires_grad() {
+            // ihfft expects a real-valued input, returns Hermitian complex of
+            // length `n/2+1`. Using `n=2*(input_n-1)` recovers the original
+            // spectrum length `input_n`.
+            let n_forward = 2 * (self.input_n - 1);
+            Some(fft::ihfft(grad_output, Some(n_forward))?)
+        } else {
+            None
+        };
+        Ok(vec![grad_input])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "HfftBackward"
+    }
+}
+
+#[derive(Debug)]
+pub struct IhfftBackward<T: Float> {
+    input: Tensor<T>,
+    /// Length of the original real signal (input's last dim).
+    input_n: usize,
+}
+
+impl<T: Float> IhfftBackward<T> {
+    pub fn new(input: Tensor<T>, input_n: usize) -> Self {
+        Self { input, input_n }
+    }
+}
+
+impl<T: Float> GradFn<T> for IhfftBackward<T> {
+    fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let grad_input = if self.input.requires_grad() {
+            // hfft maps Hermitian complex `[..., n/2+1, 2]` → real `[..., n]`.
+            // grad_y has shape `[..., n/2+1, 2]`; we want grad_x of shape
+            // `[..., input_n]`. Pass `n=input_n` so hfft outputs that length.
+            Some(fft::hfft(grad_output, Some(self.input_n))?)
+        } else {
+            None
+        };
+        Ok(vec![grad_input])
+    }
+
+    fn inputs(&self) -> Vec<&Tensor<T>> {
+        vec![&self.input]
+    }
+
+    fn name(&self) -> &'static str {
+        "IhfftBackward"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Differentiable forward wrappers — N-D + Hermitian (#580)
+// ---------------------------------------------------------------------------
+
+/// Compute the product of transform-axis lengths used for normalization.
+/// Mirrors how the forward pass would interpret `s` / `axes`:
+///   - If `s` is given, multiply its entries.
+///   - Else if `axes` is given, multiply the input's lengths along those axes.
+///   - Else multiply the inner dims (excluding the trailing complex pair).
+fn fftn_norm_n<T: Float>(input: &Tensor<T>, s: Option<&[usize]>, axes: Option<&[isize]>) -> usize {
+    if let Some(s_slice) = s {
+        return s_slice.iter().copied().product::<usize>().max(1);
+    }
+    let shape = input.shape();
+    let ndim = shape.len();
+    if let Some(axes_slice) = axes {
+        let mut prod: usize = 1;
+        for &a in axes_slice {
+            // Resolve negative axes against `ndim - 1` (excluding trailing
+            // complex pair).
+            let logical_ndim = ndim.saturating_sub(1);
+            let resolved = if a < 0 {
+                (logical_ndim as isize + a) as usize
+            } else {
+                a as usize
+            };
+            prod = prod.saturating_mul(shape[resolved]);
+        }
+        return prod.max(1);
+    }
+    // Default: all inner dims (skip the trailing 2).
+    if ndim < 2 {
+        1
+    } else {
+        shape[..ndim - 1].iter().product::<usize>().max(1)
+    }
+}
+
+/// Same as [`fftn_norm_n`] but for real inputs: there is no trailing complex
+/// pair, so all dims except the leading batch are candidates.
+fn rfftn_norm_n<T: Float>(input: &Tensor<T>, s: Option<&[usize]>, axes: Option<&[isize]>) -> usize {
+    if let Some(s_slice) = s {
+        return s_slice.iter().copied().product::<usize>().max(1);
+    }
+    let shape = input.shape();
+    let ndim = shape.len();
+    if let Some(axes_slice) = axes {
+        let mut prod: usize = 1;
+        for &a in axes_slice {
+            let resolved = if a < 0 {
+                (ndim as isize + a) as usize
+            } else {
+                a as usize
+            };
+            prod = prod.saturating_mul(shape[resolved]);
+        }
+        return prod.max(1);
+    }
+    shape.iter().product::<usize>().max(1)
+}
+
+/// Differentiable N-D FFT. Attaches `FftnBackward` when grad is needed.
+pub fn fftn_differentiable<T: Float>(
+    input: &Tensor<T>,
+    s: Option<&[usize]>,
+    axes: Option<&[isize]>,
+) -> FerrotorchResult<Tensor<T>> {
+    let device = input.device();
+    let result = fft::fftn(input, s, axes)?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        let norm_n = fftn_norm_n(input, s, axes);
+        let grad_fn = Arc::new(FftnBackward::new(
+            input.clone(),
+            s.map(|v| v.to_vec()),
+            axes.map(|v| v.to_vec()),
+            norm_n,
+        ));
+        let storage = TensorStorage::on_device(result.data_vec()?, device)?;
+        Tensor::from_operation(storage, result.shape().to_vec(), grad_fn)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Differentiable N-D inverse FFT. Attaches `IfftnBackward` when grad is needed.
+pub fn ifftn_differentiable<T: Float>(
+    input: &Tensor<T>,
+    s: Option<&[usize]>,
+    axes: Option<&[isize]>,
+) -> FerrotorchResult<Tensor<T>> {
+    let device = input.device();
+    let result = fft::ifftn(input, s, axes)?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        let norm_n = fftn_norm_n(input, s, axes);
+        let grad_fn = Arc::new(IfftnBackward::new(
+            input.clone(),
+            s.map(|v| v.to_vec()),
+            axes.map(|v| v.to_vec()),
+            norm_n,
+        ));
+        let storage = TensorStorage::on_device(result.data_vec()?, device)?;
+        Tensor::from_operation(storage, result.shape().to_vec(), grad_fn)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Differentiable N-D real FFT. Attaches `RfftnBackward` when grad is needed.
+pub fn rfftn_differentiable<T: Float>(
+    input: &Tensor<T>,
+    s: Option<&[usize]>,
+    axes: Option<&[isize]>,
+) -> FerrotorchResult<Tensor<T>> {
+    let device = input.device();
+    let _ = rfftn_norm_n::<T>; // keep helper available for symmetry; not needed in fwd
+    let result = fft::rfftn(input, s, axes)?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        // Backward needs the original real-input shape along the transform
+        // axes. We pass the input's shape segment so irfftn can reconstruct.
+        let s_back: Vec<usize> = match (s, axes) {
+            (Some(s_slice), _) => s_slice.to_vec(),
+            (None, Some(axes_slice)) => {
+                let shape = input.shape();
+                axes_slice
+                    .iter()
+                    .map(|&a| {
+                        let resolved = if a < 0 {
+                            (shape.len() as isize + a) as usize
+                        } else {
+                            a as usize
+                        };
+                        shape[resolved]
+                    })
+                    .collect()
+            }
+            (None, None) => input.shape().to_vec(),
+        };
+        let grad_fn = Arc::new(RfftnBackward::new(
+            input.clone(),
+            Some(s_back),
+            axes.map(|v| v.to_vec()),
+        ));
+        let storage = TensorStorage::on_device(result.data_vec()?, device)?;
+        Tensor::from_operation(storage, result.shape().to_vec(), grad_fn)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Differentiable N-D inverse real FFT. Attaches `IrfftnBackward` when grad is needed.
+pub fn irfftn_differentiable<T: Float>(
+    input: &Tensor<T>,
+    s: Option<&[usize]>,
+    axes: Option<&[isize]>,
+) -> FerrotorchResult<Tensor<T>> {
+    let device = input.device();
+    let result = fft::irfftn(input, s, axes)?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        // The forward output length along each transform axis becomes the
+        // original real shape; back-pass uses the same `s` to reconstruct.
+        let s_back: Vec<usize> = match s {
+            Some(s_slice) => s_slice.to_vec(),
+            None => result.shape().to_vec(),
+        };
+        let grad_fn = Arc::new(IrfftnBackward::new(
+            input.clone(),
+            Some(s_back),
+            axes.map(|v| v.to_vec()),
+        ));
+        let storage = TensorStorage::on_device(result.data_vec()?, device)?;
+        Tensor::from_operation(storage, result.shape().to_vec(), grad_fn)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Differentiable Hermitian FFT (complex spectrum → real signal). Attaches
+/// `HfftBackward` when grad is needed.
+pub fn hfft_differentiable<T: Float>(
+    input: &Tensor<T>,
+    n: Option<usize>,
+) -> FerrotorchResult<Tensor<T>> {
+    let device = input.device();
+    let shape = input.shape();
+    let input_n = shape[shape.len() - 2];
+    let _ = n; // (used at fwd call); backward derives spectrum length from input_n
+    let result = fft::hfft(input, n)?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        let grad_fn = Arc::new(HfftBackward::new(input.clone(), input_n));
+        let storage = TensorStorage::on_device(result.data_vec()?, device)?;
+        Tensor::from_operation(storage, result.shape().to_vec(), grad_fn)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Differentiable inverse Hermitian FFT (real signal → Hermitian spectrum).
+/// Attaches `IhfftBackward` when grad is needed.
+pub fn ihfft_differentiable<T: Float>(
+    input: &Tensor<T>,
+    n: Option<usize>,
+) -> FerrotorchResult<Tensor<T>> {
+    let device = input.device();
+    let shape = input.shape();
+    let input_n = *shape.last().unwrap();
+    let _ = n;
+    let result = fft::ihfft(input, n)?;
+
+    if is_grad_enabled() && input.requires_grad() {
+        let grad_fn = Arc::new(IhfftBackward::new(input.clone(), input_n));
+        let storage = TensorStorage::on_device(result.data_vec()?, device)?;
+        Tensor::from_operation(storage, result.shape().to_vec(), grad_fn)
+    } else {
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -420,5 +919,129 @@ mod tests {
         let result =
             crate::autograd::no_grad::no_grad(|| fft_differentiable(&input, None).unwrap());
         assert!(result.grad_fn().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // N-D FFT differentiable wrappers (#580)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fftn_differentiable_attaches_grad_fn() {
+        // 2x2 complex input: [[1+0i, 0+0i], [0+0i, 0+0i]] → flat [2, 2, 2].
+        let input = leaf(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[2, 2, 2],
+        );
+        let result = fftn_differentiable(&input, None, None).unwrap();
+        assert!(result.grad_fn().is_some());
+        assert_eq!(result.grad_fn().unwrap().name(), "FftnBackward");
+    }
+
+    #[test]
+    fn ifftn_differentiable_attaches_grad_fn() {
+        let input = leaf(
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            &[2, 2, 2],
+        );
+        let result = ifftn_differentiable(&input, None, None).unwrap();
+        assert!(result.grad_fn().is_some());
+        assert_eq!(result.grad_fn().unwrap().name(), "IfftnBackward");
+    }
+
+    #[test]
+    fn fftn_no_grad_when_not_needed() {
+        let input = no_grad_leaf(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[2, 2, 2],
+        );
+        let result = fftn_differentiable(&input, None, None).unwrap();
+        assert!(result.grad_fn().is_none());
+    }
+
+    #[test]
+    fn fftn_backward_returns_real_grad_for_impulse() {
+        // 2x2 impulse: real [[1,0],[0,0]] (encoded complex as
+        // [[1+0i, 0+0i], [0+0i, 0+0i]]). fftn → all-ones 2x2 complex
+        // (DFT-2D of a corner impulse). grad_y = ones → grad_x =
+        // prod_s * ifftn(ones) = 4 * impulse / 4 → impulse_complex.
+        let input = leaf(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[2, 2, 2],
+        );
+        let result = fftn_differentiable(&input, None, None).unwrap();
+        // grad_y = ones (4 complex pairs).
+        let grad_out = no_grad_leaf(
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            &[2, 2, 2],
+        );
+        let grads = result.grad_fn().unwrap().backward(&grad_out).unwrap();
+        let g = grads[0].as_ref().unwrap();
+        // Expected: 4 * ifftn(ones) over a 2x2 grid → 4 * impulse / 4 = impulse.
+        assert_close(
+            g.data().unwrap(),
+            &[4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn rfftn_differentiable_attaches_grad_fn() {
+        // Real 2x2 input → rfftn → [2, 2, 2] complex (n/2+1 along last).
+        let input = leaf(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let result = rfftn_differentiable(&input, None, None).unwrap();
+        assert!(result.grad_fn().is_some());
+        assert_eq!(result.grad_fn().unwrap().name(), "RfftnBackward");
+    }
+
+    #[test]
+    fn irfftn_differentiable_attaches_grad_fn() {
+        // Hermitian-shaped complex input [2, 2, 2]: 2 batch × 2 freq × complex.
+        let input = leaf(
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            &[2, 2, 2],
+        );
+        let result = irfftn_differentiable(&input, Some(&[2, 2]), None).unwrap();
+        assert!(result.grad_fn().is_some());
+        assert_eq!(result.grad_fn().unwrap().name(), "IrfftnBackward");
+    }
+
+    #[test]
+    fn hfft_differentiable_attaches_grad_fn() {
+        // Hermitian spectrum [3, 2] → real [4]. n=4 means input_n=3 (n/2+1).
+        let input = leaf(&[10.0, 0.0, -2.0, 2.0, -2.0, 0.0], &[3, 2]);
+        let result = hfft_differentiable(&input, Some(4)).unwrap();
+        assert!(result.grad_fn().is_some());
+        assert_eq!(result.grad_fn().unwrap().name(), "HfftBackward");
+    }
+
+    #[test]
+    fn ihfft_differentiable_attaches_grad_fn() {
+        let input = leaf(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let result = ihfft_differentiable(&input, None).unwrap();
+        assert!(result.grad_fn().is_some());
+        assert_eq!(result.grad_fn().unwrap().name(), "IhfftBackward");
+    }
+
+    #[test]
+    fn fftn_norm_n_default_inner_dims() {
+        // shape [2, 3, 4, 2] (last dim is complex pair) → norm_n = 2*3*4 = 24.
+        let input = no_grad_leaf(&vec![0.0; 2 * 3 * 4 * 2], &[2, 3, 4, 2]);
+        let n = fftn_norm_n(&input, None, None);
+        assert_eq!(n, 2 * 3 * 4);
+    }
+
+    #[test]
+    fn fftn_norm_n_with_explicit_s() {
+        let input = no_grad_leaf(&vec![0.0; 8 * 2], &[2, 2, 2, 2]);
+        let n = fftn_norm_n(&input, Some(&[3, 5]), None);
+        assert_eq!(n, 15);
+    }
+
+    #[test]
+    fn fftn_norm_n_with_axes() {
+        // Axes = [1, 2] → norm_n = shape[1] * shape[2] = 3 * 4 = 12.
+        let input = no_grad_leaf(&vec![0.0; 2 * 3 * 4 * 2], &[2, 3, 4, 2]);
+        let n = fftn_norm_n(&input, None, Some(&[1, 2]));
+        assert_eq!(n, 12);
     }
 }

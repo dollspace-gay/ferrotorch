@@ -138,6 +138,74 @@ impl<T: Float> Distribution<T> for Exponential<T> {
             Ok(out)
         }
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // cdf(x) = 1 - exp(-rate * x) for x >= 0; 0 for x < 0.
+        let val = value.data_vec()?;
+        let rate_data = self.rate.data_vec()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = val
+            .iter()
+            .zip(rate_data.iter().cycle())
+            .map(|(&x, &r)| {
+                if x < zero {
+                    zero
+                } else {
+                    one - (-r * x).exp()
+                }
+            })
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), value.shape().to_vec(), false)
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // icdf(p) = -ln(1 - p) / rate, for p in [0, 1).
+        let q_data = q.data_vec()?;
+        let rate_data = self.rate.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = q_data
+            .iter()
+            .zip(rate_data.iter().cycle())
+            .map(|(&p, &r)| -((one - p).ln()) / r)
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), q.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        // 1 / rate
+        let rate_data = self.rate.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = rate_data.iter().map(|&r| one / r).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.rate.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mode of exponential is 0.
+        let zero = <T as num_traits::Zero>::zero();
+        let n: usize = self.rate.shape().iter().product();
+        Tensor::from_storage(
+            TensorStorage::cpu(vec![zero; n.max(1)]),
+            self.rate.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // 1 / rate^2
+        let rate_data = self.rate.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = rate_data.iter().map(|&r| one / (r * r)).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.rate.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +269,7 @@ impl<T: Float> GradFn<T> for ExponentialRsampleBackward<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrotorch_core::creation::scalar;
+    use ferrotorch_core::creation::{from_slice, scalar};
 
     #[test]
     fn test_exponential_sample_shape() {
@@ -338,5 +406,41 @@ mod tests {
         let x = scalar(1.0f64).unwrap();
         let lp = dist.log_prob(&x).unwrap();
         assert!((lp.item().unwrap() - (-1.0f64)).abs() < 1e-12);
+    }
+
+    // -----------------------------------------------------------------------
+    // CDF / ICDF / mean / mode / variance / stddev (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exponential_mean_mode_variance() {
+        // rate=2 → mean=0.5, mode=0, var=0.25
+        let dist = Exponential::new(scalar(2.0f64).unwrap()).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 0.5).abs() < 1e-10);
+        assert!(dist.mode().unwrap().item().unwrap().abs() < 1e-12);
+        assert!((dist.variance().unwrap().item().unwrap() - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_exponential_cdf() {
+        let dist = Exponential::new(scalar(1.0f64).unwrap()).unwrap();
+        // cdf(0) = 0; cdf(1) = 1 - 1/e
+        let x = from_slice::<f64>(&[-1.0, 0.0, 1.0], &[3]).unwrap();
+        let c = dist.cdf(&x).unwrap();
+        let d = c.data().unwrap();
+        assert!(d[0].abs() < 1e-12);
+        assert!(d[1].abs() < 1e-12);
+        assert!((d[2] - (1.0 - (-1.0_f64).exp())).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_exponential_icdf_roundtrip() {
+        let dist = Exponential::new(scalar(2.5f64).unwrap()).unwrap();
+        for p in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let q = scalar(p).unwrap();
+            let x = dist.icdf(&q).unwrap();
+            let p2 = dist.cdf(&x).unwrap();
+            assert!((p2.item().unwrap() - p).abs() < 1e-10);
+        }
     }
 }

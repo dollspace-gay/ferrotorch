@@ -1,4 +1,6 @@
 pub mod autograd;
+pub mod bool_tensor;
+pub mod complex_tensor;
 pub mod cpu_pool;
 pub mod creation;
 pub mod device;
@@ -12,9 +14,12 @@ pub mod fft;
 pub mod flex_attention;
 pub mod gpu_dispatch;
 pub mod grad_fns;
+pub mod int_tensor;
 mod inplace;
 pub mod linalg;
+pub mod masked;
 mod methods;
+pub mod named_tensor;
 pub mod nested;
 pub mod meta_propagate;
 pub mod ops;
@@ -24,8 +29,10 @@ pub mod pruning;
 pub mod quantize;
 pub mod shape;
 pub mod sparse;
+pub mod signal;
 pub mod special;
 pub mod storage;
+pub mod stride_tricks;
 pub mod tensor;
 pub mod vmap;
 
@@ -48,12 +55,23 @@ pub use creation::{
     arange, eye, from_slice, from_vec, full, full_like, linspace, ones, ones_like, rand, rand_like,
     randn, randn_like, scalar, tensor, zeros, zeros_like,
 };
+pub use bool_tensor::BoolTensor;
+pub use complex_tensor::ComplexTensor;
 pub use device::Device;
 pub use dtype::{DType, Element, Float};
+pub use int_tensor::{IntElement, IntTensor};
+pub use named_tensor::NamedTensor;
 pub use einops::{EinopsReduction, rearrange, rearrange_with, reduce, repeat};
 pub use einsum::{einsum, einsum_differentiable};
 pub use error::{FerrotorchError, FerrotorchResult};
-pub use fft::{fft, fft2, ifft, ifft2, irfft, rfft};
+// Linalg ops are accessed via the `linalg` module namespace
+// (e.g. `ferrotorch_core::linalg::svd`) to mirror `torch.linalg.*` and avoid
+// shadowing top-level identifiers (autograd::cond, etc.). The whole module is
+// already declared `pub mod linalg;` above.
+pub use fft::{
+    fft, fft2, fftfreq, fftn, fftshift, hfft, ifft, ifft2, ifftn, ifftshift, ihfft, irfft, irfftn,
+    rfft, rfftfreq, rfftn,
+};
 pub use flex_attention::flex_attention;
 pub use grad_fns::activation::{GeluApproximate, gelu, gelu_with, sigmoid, tanh};
 pub use grad_fns::cumulative::{cummax, cummin, cumprod, cumsum, logcumsumexp};
@@ -79,8 +97,13 @@ pub use quantize::{
     prepare_qat, quantize, quantize_named_tensors, quantized_matmul,
 };
 pub use shape::{broadcast_shapes, normalize_axis};
-pub use sparse::{CooTensor, CsrTensor, SparseTensor};
+pub use sparse::{CooTensor, CscTensor, CsrTensor, SparseGrad, SparseTensor};
 pub use special::{digamma, erf, erfc, erfinv, expm1, lgamma, log1p, sinc, xlogy};
 pub use storage::{StorageBuffer, TensorStorage};
+pub use masked::{
+    MaskedTensor, masked_count, masked_equal, masked_invalid, masked_max, masked_mean, masked_min,
+    masked_sum, masked_where,
+};
+pub use stride_tricks::{AsStridedBackward, as_strided, as_strided_copy, as_strided_scatter};
 pub use tensor::{GradFn, MemoryFormat, Tensor, TensorId};
 pub use vmap::{select, stack, vmap, vmap2};

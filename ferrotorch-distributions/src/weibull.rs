@@ -110,6 +110,103 @@ impl<T: Float> Distribution<T> for Weibull<T> {
 
         Tensor::from_storage(TensorStorage::cpu(out), self.scale.shape().to_vec(), false)
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // F(x; lambda, k) = 1 - exp(-(x/lambda)^k) for x >= 0
+        let v = value.data()?;
+        let s = self.scale.data()?;
+        let k = self.concentration.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let mut out = Vec::with_capacity(v.len());
+        for i in 0..v.len() {
+            let si = if s.len() == 1 { 0 } else { i % s.len() };
+            let ki = if k.len() == 1 { 0 } else { i % k.len() };
+            if v[i] < zero {
+                out.push(zero);
+            } else {
+                let x_over_l = v[i] / s[si];
+                out.push(one - (zero - x_over_l.powf(k[ki])).exp());
+            }
+        }
+        Tensor::from_storage(TensorStorage::cpu(out), value.shape().to_vec(), false)
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // F^{-1}(p) = lambda * (-log(1 - p))^(1/k)
+        let p = q.data()?;
+        let s = self.scale.data()?;
+        let k = self.concentration.data()?;
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+        let mut out = Vec::with_capacity(p.len());
+        for i in 0..p.len() {
+            let si = if s.len() == 1 { 0 } else { i % s.len() };
+            let ki = if k.len() == 1 { 0 } else { i % k.len() };
+            let log_term = (one - p[i]).max(T::from(1e-30).unwrap()).ln();
+            out.push(s[si] * (zero - log_term).powf(one / k[ki]));
+        }
+        Tensor::from_storage(TensorStorage::cpu(out), q.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        // E[X] = lambda * Gamma(1 + 1/k)
+        let s = self.scale.data()?;
+        let k = self.concentration.data()?;
+        let one = <T as num_traits::One>::one();
+        let mut out = Vec::with_capacity(s.len());
+        for i in 0..s.len() {
+            // Gamma(1 + 1/k) via exp(lgamma(...)) — supports fractional k.
+            let lg = lgamma_scalar(one + one / k[i]);
+            out.push(s[i] * lg.exp());
+        }
+        Tensor::from_storage(TensorStorage::cpu(out), self.scale.shape().to_vec(), false)
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // mode = lambda * ((k-1)/k)^(1/k) for k > 1, else 0.
+        let s = self.scale.data()?;
+        let k = self.concentration.data()?;
+        let one = <T as num_traits::One>::one();
+        let zero = <T as num_traits::Zero>::zero();
+        let mut out = Vec::with_capacity(s.len());
+        for i in 0..s.len() {
+            if k[i] > one {
+                out.push(s[i] * ((k[i] - one) / k[i]).powf(one / k[i]));
+            } else {
+                out.push(zero);
+            }
+        }
+        Tensor::from_storage(TensorStorage::cpu(out), self.scale.shape().to_vec(), false)
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // Var[X] = lambda^2 * (Gamma(1 + 2/k) - Gamma(1 + 1/k)^2)
+        let s = self.scale.data()?;
+        let k = self.concentration.data()?;
+        let one = <T as num_traits::One>::one();
+        let two = T::from(2.0).unwrap();
+        let mut out = Vec::with_capacity(s.len());
+        for i in 0..s.len() {
+            let g1 = lgamma_scalar(one + one / k[i]).exp();
+            let g2 = lgamma_scalar(one + two / k[i]).exp();
+            out.push(s[i] * s[i] * (g2 - g1 * g1));
+        }
+        Tensor::from_storage(TensorStorage::cpu(out), self.scale.shape().to_vec(), false)
+    }
+}
+
+/// Scalar lgamma — Lanczos approximation. Mirrors the impl in
+/// `ferrotorch_core::special::lgamma_scalar` but kept inline here so this
+/// crate doesn't need an extra dependency hop just for property closures.
+fn lgamma_scalar<T: Float>(x: T) -> T {
+    // Use ferrotorch_core's special-fn surface via a tiny Tensor wrapper.
+    // This is the simplest path that stays correct and avoids reimplementing
+    // Lanczos here.
+    let t = Tensor::from_storage(TensorStorage::cpu(vec![x]), vec![1], false)
+        .expect("lgamma_scalar: scalar tensor build");
+    let r = ferrotorch_core::special::lgamma(&t).expect("lgamma_scalar: lgamma op");
+    r.data().expect("lgamma_scalar: lgamma data")[0]
 }
 
 #[cfg(test)]
@@ -145,5 +242,52 @@ mod tests {
         let h = d.entropy().unwrap();
         // For k=1, lambda=1: H = euler*(1-1/1) + ln(1/1) + 1 = 0 + 0 + 1 = 1.0
         assert!((h.data().unwrap()[0] - 1.0).abs() < 0.01);
+    }
+
+    // ---- properties (#608) ----
+
+    #[test]
+    fn test_weibull_cdf_at_scale_is_one_minus_e_inv() {
+        // F(lambda; lambda, k) = 1 - exp(-1) for any k.
+        let d = Weibull::new(scalar(2.0), scalar(3.0)).unwrap();
+        let v = scalar(2.0);
+        let c = d.cdf(&v).unwrap();
+        let expected = 1.0 - (-1.0_f64).exp();
+        assert!((c.data().unwrap()[0] - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_weibull_cdf_icdf_roundtrip() {
+        let d = Weibull::new(scalar(1.5), scalar(2.5)).unwrap();
+        for p in [0.1, 0.3, 0.7, 0.9] {
+            let q = scalar(p);
+            let x = d.icdf(&q).unwrap();
+            let p2 = d.cdf(&x).unwrap();
+            assert!((p2.data().unwrap()[0] - p).abs() < 1e-6, "p={p}");
+        }
+    }
+
+    #[test]
+    fn test_weibull_mean_k_one_equals_lambda() {
+        // For k=1, mean = lambda * Gamma(2) = lambda * 1 = lambda.
+        let d = Weibull::new(scalar(3.5), scalar(1.0)).unwrap();
+        let m = d.mean().unwrap();
+        assert!((m.data().unwrap()[0] - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_weibull_mode_k_below_one_is_zero() {
+        // For k <= 1, mode = 0.
+        let d = Weibull::new(scalar(2.0), scalar(0.7)).unwrap();
+        let m = d.mode().unwrap();
+        assert!(m.data().unwrap()[0].abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_weibull_variance_k_one_equals_lambda_sq() {
+        // For k=1, Var = lambda^2 * (Gamma(3) - Gamma(2)^2) = lambda^2 * (2 - 1) = lambda^2.
+        let d = Weibull::new(scalar(2.0), scalar(1.0)).unwrap();
+        let v = d.variance().unwrap();
+        assert!((v.data().unwrap()[0] - 4.0).abs() < 1e-9);
     }
 }

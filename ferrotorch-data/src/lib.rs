@@ -1,6 +1,8 @@
 pub mod collate;
 pub mod dataloader;
 pub mod dataset;
+#[cfg(feature = "arrow")]
+pub mod interop;
 pub mod sampler;
 pub mod transforms;
 

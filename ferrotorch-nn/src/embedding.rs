@@ -195,6 +195,18 @@ pub struct Embedding<T: Float> {
     pub padding_idx: Option<usize>,
     /// Whether the module is in training mode.
     training: bool,
+    /// If true, advertise a sparse gradient pattern (the only rows touched
+    /// are the ones actually indexed in the most recent forward call).
+    /// This is purely a flag — autograd still populates a dense grad on
+    /// the weight; callers can extract a `SparseGrad` view via
+    /// [`Self::sparse_grad`] to feed `optim::SparseAdam` or
+    /// `SparseGrad::apply_sgd` without scanning the full dense matrix.
+    /// Mirrors `torch.nn.Embedding(sparse=True)`. (#623)
+    pub sparse: bool,
+    /// Cached unique indices touched by the most recent forward pass. None
+    /// if `sparse == false` or no forward has run yet. We dedupe here so
+    /// callers don't have to coalesce the SparseGrad themselves.
+    last_indices: std::sync::Mutex<Option<Vec<usize>>>,
 }
 
 impl<T: Float> Embedding<T> {
@@ -247,6 +259,8 @@ impl<T: Float> Embedding<T> {
             embedding_dim,
             padding_idx,
             training: true,
+            sparse: false,
+            last_indices: std::sync::Mutex::new(None),
         })
     }
 
@@ -284,7 +298,74 @@ impl<T: Float> Embedding<T> {
             embedding_dim,
             padding_idx,
             training: true,
+            sparse: false,
+            last_indices: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Toggle the sparse-grad mode. When enabled, [`Self::sparse_grad`]
+    /// returns a `SparseGrad<T>` populated only with the rows actually
+    /// touched by the most recent forward pass. Off by default. Returns
+    /// `&mut self` for chaining.
+    pub fn with_sparse(mut self, sparse: bool) -> Self {
+        self.sparse = sparse;
+        self
+    }
+
+    /// Record the unique row indices touched by the most recent forward pass.
+    /// No-op when sparse mode is off — keeps the hot path zero-overhead for
+    /// the common dense-grad case.
+    fn cache_touched_rows(&self, indices: &[usize]) {
+        if !self.sparse {
+            return;
+        }
+        // Dedupe (sorted) so callers don't have to coalesce later.
+        let mut uniq: Vec<usize> = indices.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        if let Ok(mut g) = self.last_indices.lock() {
+            *g = Some(uniq);
+        }
+    }
+
+    /// Materialize a [`SparseGrad`] from the current dense weight gradient,
+    /// keyed on the indices touched by the most recent forward pass.
+    ///
+    /// Returns `None` when sparse mode is off, no forward has been run yet,
+    /// or the parameter has no gradient (e.g. before the first backward
+    /// call). The returned grad is already coalesced (each touched row
+    /// appears once with its full gradient slab) — feed it directly into
+    /// [`SparseGrad::apply_sgd`] or `optim::SparseAdam`.
+    ///
+    /// Mirrors PyTorch's `embedding_bag(..., sparse=True)` → `SparseAdam`
+    /// flow. The dense grad is unchanged; `sparse_grad` just provides a
+    /// compact view for optimizers that benefit from skipping zero rows.
+    pub fn sparse_grad(&self) -> FerrotorchResult<Option<ferrotorch_core::SparseGrad<T>>> {
+        if !self.sparse {
+            return Ok(None);
+        }
+        let last = match self.last_indices.lock() {
+            Ok(g) => g,
+            Err(_) => return Ok(None),
+        };
+        let indices = match last.as_ref() {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        };
+        let grad = match self.weight.tensor().grad()? {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+        let grad_data = grad.data_vec()?;
+        let dim = self.embedding_dim;
+        let mut values = Vec::with_capacity(indices.len() * dim);
+        for &idx in &indices {
+            let row_start = idx * dim;
+            let row_end = row_start + dim;
+            values.extend_from_slice(&grad_data[row_start..row_end]);
+        }
+        let sg = ferrotorch_core::SparseGrad::new(indices, values, vec![dim])?;
+        Ok(Some(sg))
     }
 }
 
@@ -338,6 +419,8 @@ impl<T: Float> Module<T> for Embedding<T> {
                 indices.push(idx);
                 indices_f32.push(idx as f32);
             }
+
+            self.cache_touched_rows(&indices);
 
             let idx_handle = upload_f32_to_gpu(&indices_f32, ordinal)?;
             let weight_handle = self.weight.tensor().gpu_handle()?;
@@ -401,6 +484,8 @@ impl<T: Float> Module<T> for Embedding<T> {
             }
             indices.push(idx);
         }
+
+        self.cache_touched_rows(&indices);
 
         // Gather rows from weight.
         let mut output_data = Vec::with_capacity(n * dim);
@@ -1116,5 +1201,104 @@ mod tests {
                 .unwrap();
         let output = emb.forward(&indices).unwrap();
         assert_eq!(output.shape(), &[3, 3]);
+    }
+
+    // -------------------------------------------------------------------
+    // SparseGrad integration (#623)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sparse_grad_returns_none_when_sparse_off() {
+        let emb = Embedding::<f32>::new(8, 4, None).unwrap();
+        // Default ctor leaves sparse off.
+        assert!(!emb.sparse);
+        let idx =
+            Tensor::from_storage(TensorStorage::cpu(vec![0.0f32, 1.0]), vec![2], false).unwrap();
+        let _ = emb.forward(&idx).unwrap();
+        assert!(emb.sparse_grad().unwrap().is_none());
+    }
+
+    #[test]
+    fn sparse_grad_returns_none_before_first_forward() {
+        let emb = Embedding::<f32>::new(8, 4, None).unwrap().with_sparse(true);
+        // No forward run yet -> no last_indices recorded.
+        assert!(emb.sparse_grad().unwrap().is_none());
+    }
+
+    #[test]
+    fn sparse_grad_emits_only_touched_rows() {
+        // Vocabulary 8, dim 4. Touch only rows 1, 3, 5.
+        let emb = Embedding::<f32>::new(8, 4, None).unwrap().with_sparse(true);
+        let idx = Tensor::from_storage(
+            TensorStorage::cpu(vec![1.0f32, 3.0, 5.0, 1.0]),
+            vec![4],
+            false,
+        )
+        .unwrap();
+        let _out = emb.forward(&idx).unwrap();
+
+        // Manually attach a synthetic dense gradient to weight, simulating
+        // post-backward state. The gradient has known per-row values so we
+        // can verify slab extraction.
+        let grad_data: Vec<f32> = (0..8 * 4).map(|i| i as f32).collect();
+        let grad_tensor =
+            Tensor::from_storage(TensorStorage::cpu(grad_data), vec![8, 4], false).unwrap();
+        emb.weight.tensor().set_grad(Some(grad_tensor)).unwrap();
+
+        let sg = emb.sparse_grad().unwrap().expect("sparse grad");
+        // Touched rows are deduped + sorted: {1, 3, 5}.
+        assert_eq!(sg.indices(), &[1, 3, 5]);
+        assert_eq!(sg.slab_shape(), &[4]);
+        // Row 1 of grad: indices 4..8 -> values [4,5,6,7]
+        // Row 3 -> [12,13,14,15]
+        // Row 5 -> [20,21,22,23]
+        assert_eq!(
+            sg.values(),
+            &[4.0, 5.0, 6.0, 7.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0]
+        );
+    }
+
+    #[test]
+    fn sparse_grad_apply_sgd_updates_only_touched_rows() {
+        // End-to-end: forward → set synthetic grad → sparse_grad → apply_sgd.
+        // Verifies that untouched rows stay at their original values.
+        let mut emb = Embedding::<f32>::new(4, 2, None).unwrap().with_sparse(true);
+        // Pin weight to known values for a tractable assertion.
+        let init: Vec<f32> = (0..4 * 2).map(|i| i as f32 * 10.0).collect();
+        emb.weight = Parameter::new(
+            Tensor::from_storage(TensorStorage::cpu(init.clone()), vec![4, 2], true).unwrap(),
+        );
+
+        let idx = Tensor::from_storage(
+            TensorStorage::cpu(vec![0.0f32, 2.0]),
+            vec![2],
+            false,
+        )
+        .unwrap();
+        let _ = emb.forward(&idx).unwrap();
+
+        // Synthetic gradient: each row is its index repeated.
+        let grad_vec: Vec<f32> =
+            (0..4_usize).flat_map(|r| vec![r as f32, r as f32]).collect();
+        let grad_tensor =
+            Tensor::from_storage(TensorStorage::cpu(grad_vec), vec![4, 2], false).unwrap();
+        emb.weight.tensor().set_grad(Some(grad_tensor)).unwrap();
+
+        let sg = emb.sparse_grad().unwrap().unwrap();
+        let mut weight = emb.weight.tensor().clone();
+        sg.apply_sgd(&mut weight, 0.5_f32).unwrap();
+
+        // init pattern is `i*10` row-major over [4, 2] → rows
+        //   r0=[0, 10], r1=[20, 30], r2=[40, 50], r3=[60, 70].
+        // Touched rows: {0, 2} (deduped). Synthetic per-row grad slabs:
+        //   r0=[0,0], r1=[1,1], r2=[2,2], r3=[3,3].
+        // SparseGrad pulls only touched rows -> {0: [0,0], 2: [2,2]}.
+        // apply_sgd(lr=0.5):
+        //   r0 -= 0.5 * [0, 0]  → [0, 10]      (no change, grad zero)
+        //   r1                  → [20, 30]     (untouched, no update)
+        //   r2 -= 0.5 * [2, 2]  → [40-1, 50-1] = [39, 49]
+        //   r3                  → [60, 70]     (untouched)
+        let updated = weight.data().unwrap().to_vec();
+        assert_eq!(updated, vec![0.0, 10.0, 20.0, 30.0, 39.0, 49.0, 60.0, 70.0]);
     }
 }

@@ -444,7 +444,10 @@ mod tests {
         assert_eq!(sample.len(), 2);
         assert_eq!(sample[0].shape(), &[2]);
         assert_eq!(sample[0].data_vec().unwrap(), vec![1.0, 2.0]);
-        assert_eq!(sample[1].shape(), &[]);
+        // Empty-shape literal needs an explicit element type when the
+        // serde_json transitive (via polars in `arrow`-feature builds)
+        // adds a competing `PartialEq<Value> for usize` impl.
+        assert_eq!(sample[1].shape(), &[] as &[usize]);
         assert_eq!(sample[1].data_vec().unwrap(), vec![10.0]);
 
         let sample2 = ds.get(2).unwrap();

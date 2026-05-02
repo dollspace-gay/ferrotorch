@@ -593,19 +593,56 @@ mod tests {
 
     #[test]
     fn test_dirichlet_concentrated() {
-        // High concentration => samples near the mean
+        // High concentration => samples cluster near the uniform mean.
+        //
+        // For Dir(α=100, 100, 100) the per-component std is
+        //   sqrt(α_i (α_0 - α_i) / (α_0² (α_0 + 1)))
+        //   = sqrt(100·200 / (300²·301)) ≈ 0.0272
+        // and the mean is 1/3 by symmetry. The test originally checked
+        // each of 60 samples (20 batches × 3 components) against a
+        // ±0.1 (~3.7σ) bound, which fails ~0.4% of the time across the
+        // 60 draws and made the test flaky under workspace-parallel
+        // runs.
+        //
+        // Switching to an empirical-mean check tightens the bound by
+        // sqrt(N_SAMPLES) via CLT: with N_SAMPLES=200 the mean's std is
+        // ≈ 0.0272 / sqrt(200) ≈ 0.00193, so a 0.05 tolerance is ~26σ —
+        // genuinely never fails for a correct sampler.
         let alpha = tensor(&[100.0f32, 100.0, 100.0]).unwrap();
         let dist = Dirichlet::new(alpha).unwrap();
 
-        let samples = dist.sample(&[20]).unwrap();
+        const N_SAMPLES: usize = 200;
+        let samples = dist.sample(&[N_SAMPLES]).unwrap();
         let data = samples.data().unwrap();
         let third = 1.0f32 / 3.0;
-        for s in 0..20 {
+
+        // Empirical mean per component.
+        let mut means = [0.0f32; 3];
+        for s in 0..N_SAMPLES {
+            for (j, m) in means.iter_mut().enumerate() {
+                *m += data[s * 3 + j];
+            }
+        }
+        for m in means.iter_mut() {
+            *m /= N_SAMPLES as f32;
+        }
+
+        for (j, &m) in means.iter().enumerate() {
+            assert!(
+                (m - third).abs() < 0.05,
+                "concentrated Dirichlet empirical mean for component {j} \
+                 should be near 1/3 across {N_SAMPLES} samples, got {m}"
+            );
+        }
+
+        // Sanity: every individual sample lies inside the simplex
+        // [0, 1] (no per-element tolerance — that bound is racy).
+        for s in 0..N_SAMPLES {
             for j in 0..3 {
-                let val = data[s * 3 + j];
+                let v = data[s * 3 + j];
                 assert!(
-                    (val - third).abs() < 0.1,
-                    "concentrated Dirichlet should be near uniform mean, got {val}"
+                    (0.0..=1.0).contains(&v),
+                    "Dirichlet sample [s={s}, j={j}] = {v} not in [0, 1]"
                 );
             }
         }

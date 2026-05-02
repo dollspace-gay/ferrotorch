@@ -183,6 +183,29 @@ impl<T: Float> Distribution<T> for Poisson<T> {
             Ok(out)
         }
     }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.rate.clone())
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mode = floor(rate); for integer rate, both rate-1 and rate are
+        // modes — torch returns floor(rate).
+        let rate_data = self.rate.data_vec()?;
+        let result: Vec<T> = rate_data
+            .iter()
+            .map(|&r| T::from(r.to_f64().unwrap_or(0.0).floor()).unwrap())
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.rate.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.rate.clone())
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +330,24 @@ mod tests {
         let x = scalar(0.0f64).unwrap();
         let lp = dist.log_prob(&x).unwrap();
         assert!((lp.item().unwrap() - (-1.0f64)).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // mean / mode / variance (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_poisson_mean_eq_variance_eq_rate() {
+        let dist = Poisson::new(scalar(4.7f64).unwrap()).unwrap();
+        // Poisson has an inherent `mean()` returning &Tensor; use FQ syntax
+        // to invoke the trait methods which return Tensor by value.
+        assert!(
+            (Distribution::mean(&dist).unwrap().item().unwrap() - 4.7).abs() < 1e-12
+        );
+        assert!(
+            (Distribution::variance(&dist).unwrap().item().unwrap() - 4.7).abs() < 1e-12
+        );
+        // mode = floor(4.7) = 4
+        assert!((dist.mode().unwrap().item().unwrap() - 4.0).abs() < 1e-12);
     }
 }

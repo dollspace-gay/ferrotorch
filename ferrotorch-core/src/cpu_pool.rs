@@ -242,9 +242,11 @@ mod tests {
         assert!(v.iter().all(|&x| x == 0.0));
 
         // Snapshot stats AFTER the miss, BEFORE the return+reuse.
-        let (hits_before, misses_before, _) = cpu_pool_stats();
+        let (hits_before, _misses_before, _) = cpu_pool_stats();
 
-        // Return it.
+        // Return it. Pool is thread-local, so this lands in the same
+        // bucket the next alloc will read from — no cross-thread
+        // contention can steal it.
         pool_return_cpu(v);
 
         // Second alloc should be a hit (reuse from pool).
@@ -252,24 +254,21 @@ mod tests {
         assert_eq!(v2.len(), 1000);
         assert!(v2.iter().all(|&x| x == 0.0)); // Zeroed on checkout.
 
-        let (hits_after, misses_after, _) = cpu_pool_stats();
+        let (hits_after, _misses_after, _) = cpu_pool_stats();
 
-        // Our reuse must have produced exactly one new hit.
-        assert!(
-            hits_after > hits_before,
-            "expected a new pool hit, but hits stayed at {hits_before}"
-        );
-        // Hits should have grown by at least 1 (ours) and misses should
-        // have grown by at most the number of hits growth minus 1 (i.e.,
-        // any extra activity is from parallel tests, not from our reuse).
-        // Concretely: our alloc was a hit, so the hit delta is >= 1.
-        // If misses grew, it wasn't us — but we verify that the hit
-        // count grew more than the miss count, proving a real reuse.
+        // Our second alloc was guaranteed to hit because (a) the pool is
+        // thread-local and (b) `pool_return_cpu` ran on this thread
+        // immediately before `pool_alloc_cpu`. So the global hits
+        // counter must have grown by at least one.
+        //
+        // We deliberately do NOT compare against `misses_after - misses_before`:
+        // POOL_MISSES is a global atomic and parallel tests on other
+        // threads bump it concurrently. Comparing hit-delta against a
+        // racy miss-delta caused intermittent CI failures.
         let hit_delta = hits_after - hits_before;
-        let miss_delta = misses_after - misses_before;
         assert!(
-            hit_delta > miss_delta,
-            "pool reuse should produce more hits than misses, got +{hit_delta} hits +{miss_delta} misses"
+            hit_delta >= 1,
+            "expected at least one new pool hit, but hits stayed at {hits_before}"
         );
 
         drop(v2);

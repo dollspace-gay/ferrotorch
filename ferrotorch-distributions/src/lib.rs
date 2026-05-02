@@ -106,7 +106,7 @@ pub use pareto::Pareto;
 pub use uniform::Uniform;
 
 use ferrotorch_core::dtype::Float;
-use ferrotorch_core::error::FerrotorchResult;
+use ferrotorch_core::error::{FerrotorchError, FerrotorchResult};
 use ferrotorch_core::tensor::Tensor;
 
 /// A probability distribution over tensors.
@@ -154,4 +154,59 @@ pub trait Distribution<T: Float>: Send + Sync {
     /// Returns a scalar tensor (or a tensor matching the batch shape of the
     /// distribution parameters).
     fn entropy(&self) -> FerrotorchResult<Tensor<T>>;
+
+    // -----------------------------------------------------------------------
+    // Distribution properties (#585) — default implementations return
+    // NotImplementedOnCuda-style errors. Concrete distributions override
+    // what they can express in closed form.
+    // -----------------------------------------------------------------------
+
+    /// Cumulative distribution function: `P(X <= value)`. Default returns an
+    /// `InvalidArgument` error for distributions without a closed-form CDF.
+    fn cdf(&self, _value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "cdf not implemented for this distribution".into(),
+        })
+    }
+
+    /// Inverse CDF (quantile function): the value `x` such that
+    /// `P(X <= x) = q`. Default returns an `InvalidArgument` error.
+    fn icdf(&self, _q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "icdf not implemented for this distribution".into(),
+        })
+    }
+
+    /// Distribution mean. Default returns an `InvalidArgument` error.
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "mean not implemented for this distribution".into(),
+        })
+    }
+
+    /// Distribution mode. Default returns an `InvalidArgument` error.
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "mode not implemented for this distribution".into(),
+        })
+    }
+
+    /// Distribution variance. Default returns an `InvalidArgument` error.
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "variance not implemented for this distribution".into(),
+        })
+    }
+
+    /// Distribution standard deviation. Default: `sqrt(variance)`.
+    fn stddev(&self) -> FerrotorchResult<Tensor<T>> {
+        let v = self.variance()?;
+        let data = v.data_vec()?;
+        let out: Vec<T> = data.iter().map(|x| x.sqrt()).collect();
+        Tensor::from_storage(
+            ferrotorch_core::storage::TensorStorage::cpu(out),
+            v.shape().to_vec(),
+            false,
+        )
+    }
 }

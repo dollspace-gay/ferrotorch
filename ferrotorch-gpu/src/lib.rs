@@ -29,6 +29,8 @@ pub mod bf16;
 pub mod blas;
 pub mod buffer;
 pub mod conv;
+#[cfg(feature = "cuda")]
+pub mod cufft;
 pub mod cusolver;
 pub mod device;
 pub mod error;

@@ -62,6 +62,17 @@ impl<T: Float> Parameter<T> {
         self.data = tensor.requires_grad_(true);
     }
 
+    /// Toggle whether this parameter participates in autograd (#583).
+    ///
+    /// Setting `false` "freezes" the parameter — backward passes will not
+    /// produce a gradient for it; optimizer steps that consult
+    /// `requires_grad` will skip it. Mirrors `torch.nn.Parameter.requires_grad_`.
+    pub fn set_requires_grad(&mut self, requires_grad: bool) {
+        // Tensor::requires_grad_ takes self by value, so clone once.
+        let cloned = self.data.clone();
+        self.data = cloned.requires_grad_(requires_grad);
+    }
+
     /// Move this parameter to a device.
     pub fn to(&self, device: Device) -> FerrotorchResult<Self> {
         Ok(Self::new(self.data.to(device)?))

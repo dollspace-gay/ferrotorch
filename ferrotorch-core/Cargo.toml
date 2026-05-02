@@ -17,6 +17,10 @@ ferray-core = { workspace = true }
 ferray-ufunc = { workspace = true }
 ferray-linalg = { workspace = true }
 ferray-random = { workspace = true }
+ferray-fft = { workspace = true }
+ferray-stride-tricks = { workspace = true }
+ferray-window = { workspace = true }
+ferray-ma = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }

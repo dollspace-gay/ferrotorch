@@ -12,6 +12,9 @@ use crate::error::FerrotorchResult;
 use crate::storage::TensorStorage;
 use crate::tensor::{GradFn, Tensor};
 
+use crate::bool_tensor::BoolTensor;
+use crate::error::FerrotorchError;
+
 /// Backward node for `where_(condition, x, y)`.
 ///
 /// Stores the boolean condition mask and references to both input tensors
@@ -105,6 +108,62 @@ pub fn where_<T: Float>(
         Tensor::from_operation(storage, x.shape().to_vec(), grad_fn)
     } else {
         Tensor::from_storage(storage, x.shape().to_vec(), false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// First-class BoolTensor wrapper (#615)
+// ---------------------------------------------------------------------------
+
+/// Pointwise ternary `where(cond, x, y)` taking a [`BoolTensor`] for
+/// the condition. Mirrors `torch.where(cond, x, y)`. The mask must
+/// have the same numel as `x` / `y`.
+pub fn where_bt<T: Float>(
+    cond: &BoolTensor,
+    x: &Tensor<T>,
+    y: &Tensor<T>,
+) -> FerrotorchResult<Tensor<T>> {
+    if cond.numel() != x.numel() {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "where_bt: cond numel={} != x numel={}",
+                cond.numel(),
+                x.numel()
+            ),
+        });
+    }
+    if x.shape() != y.shape() {
+        return Err(FerrotorchError::ShapeMismatch {
+            message: format!(
+                "where_bt: x shape {:?} != y shape {:?}",
+                x.shape(),
+                y.shape()
+            ),
+        });
+    }
+    where_(cond.data(), x, y)
+}
+
+#[cfg(test)]
+mod first_class_tests {
+    use super::*;
+
+    #[test]
+    fn where_bt_picks_correctly() {
+        let x = Tensor::from_storage(TensorStorage::cpu(vec![1.0_f32, 2.0, 3.0, 4.0]), vec![4], false).unwrap();
+        let y = Tensor::from_storage(TensorStorage::cpu(vec![10.0_f32, 20.0, 30.0, 40.0]), vec![4], false).unwrap();
+        let cond = BoolTensor::from_vec(vec![true, false, true, false], vec![4]).unwrap();
+        let out = where_bt(&cond, &x, &y).unwrap();
+        assert_eq!(out.data().unwrap(), &[1.0, 20.0, 3.0, 40.0]);
+    }
+
+    #[test]
+    fn where_bt_rejects_shape_mismatch() {
+        let x = Tensor::from_storage(TensorStorage::cpu(vec![1.0_f32; 4]), vec![4], false).unwrap();
+        let y = Tensor::from_storage(TensorStorage::cpu(vec![0.0_f32; 4]), vec![4], false).unwrap();
+        let cond = BoolTensor::from_vec(vec![true; 3], vec![3]).unwrap();
+        let err = where_bt(&cond, &x, &y).unwrap_err();
+        assert!(matches!(err, FerrotorchError::ShapeMismatch { .. }));
     }
 }
 

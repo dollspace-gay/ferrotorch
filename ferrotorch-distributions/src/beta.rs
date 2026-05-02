@@ -203,6 +203,67 @@ impl<T: Float> Distribution<T> for Beta<T> {
             Ok(out)
         }
     }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        // mean = c1 / (c1 + c0)
+        let a = self.concentration1.data_vec()?;
+        let b = self.concentration0.data_vec()?;
+        let result: Vec<T> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| x / (x + y))
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.concentration1.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        // Mode = (c1 - 1) / (c1 + c0 - 2) when c1, c0 > 1; NaN otherwise.
+        let a = self.concentration1.data_vec()?;
+        let b = self.concentration0.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let two = T::from(2.0).unwrap();
+        let nan = T::from(f64::NAN).unwrap();
+        let result: Vec<T> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| {
+                if x > one && y > one {
+                    (x - one) / (x + y - two)
+                } else {
+                    nan
+                }
+            })
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.concentration1.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        // var = c1 * c0 / ((c1 + c0)^2 * (c1 + c0 + 1))
+        let a = self.concentration1.data_vec()?;
+        let b = self.concentration0.data_vec()?;
+        let one = <T as num_traits::One>::one();
+        let result: Vec<T> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| {
+                let s = x + y;
+                (x * y) / (s * s * (s + one))
+            })
+            .collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(result),
+            self.concentration1.shape().to_vec(),
+            false,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,5 +490,25 @@ mod tests {
 
         let samples = dist.sample(&[50]).unwrap();
         assert_eq!(samples.shape(), &[50]);
+    }
+
+    // -----------------------------------------------------------------------
+    // mean / mode / variance (#585) — no closed-form CDF
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_beta_mean_variance_mode() {
+        // Beta(2, 5): mean = 2/7, var = 10/(49*8), mode = 1/5
+        let dist = Beta::new(scalar(2.0f64).unwrap(), scalar(5.0f64).unwrap()).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 2.0 / 7.0).abs() < 1e-10);
+        assert!((dist.variance().unwrap().item().unwrap() - 10.0 / (49.0 * 8.0)).abs() < 1e-10);
+        assert!((dist.mode().unwrap().item().unwrap() - 1.0 / 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_beta_mode_undefined_for_alpha_le_one() {
+        // alpha=1, beta=1 → mode is undefined → NaN per torch.
+        let dist = Beta::new(scalar(1.0f64).unwrap(), scalar(1.0f64).unwrap()).unwrap();
+        assert!(dist.mode().unwrap().item().unwrap().is_nan());
     }
 }

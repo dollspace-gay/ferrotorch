@@ -688,7 +688,7 @@ pub fn barrier(backend: &dyn Backend) -> FerrotorchResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Reinterpret a float slice as raw bytes, copying into a new `Vec<u8>`.
-fn floats_to_bytes<T: Float>(data: &[T]) -> Vec<u8> {
+pub(crate) fn floats_to_bytes<T: Float>(data: &[T]) -> Vec<u8> {
     let byte_len = std::mem::size_of_val(data);
     let ptr = data.as_ptr() as *const u8;
     // SAFETY: T is f32 or f64, both are POD types with no padding.
@@ -697,7 +697,7 @@ fn floats_to_bytes<T: Float>(data: &[T]) -> Vec<u8> {
 }
 
 /// Reinterpret raw bytes back into a Vec of floats.
-fn bytes_to_floats<T: Float>(bytes: &[u8]) -> Vec<T> {
+pub(crate) fn bytes_to_floats<T: Float>(bytes: &[u8]) -> Vec<T> {
     let t_size = std::mem::size_of::<T>();
     assert!(
         bytes.len() % t_size == 0,

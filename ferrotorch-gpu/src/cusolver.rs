@@ -1144,6 +1144,357 @@ pub fn gpu_qr_f64(
     Ok((q_host, r_host))
 }
 
+// ===========================================================================
+// Symmetric / Hermitian eigendecomposition (eigh / eigvalsh)
+//
+// `cusolverDn{S,D}syevd` computes eigenvalues + eigenvectors of a real
+// symmetric matrix. The routine works in-place on `A` (overwriting it
+// with the eigenvectors) and writes eigenvalues into a separate buffer.
+//
+// Memory layout note: cuSOLVER expects column-major. For a real
+// **symmetric** matrix the row-major and column-major layouts are
+// byte-identical (transpose of a symmetric matrix is itself), so we can
+// pass a row-major buffer to cuSOLVER without an explicit transpose.
+// The OUTPUT eigenvector matrix is general (non-symmetric), so we
+// transpose it back to row-major using `gpu_transpose_2d_*` —
+// fully on-device.
+//
+// /rust-gpu-discipline: every step here either runs on GPU memory (cuSOLVER
+// / strided_copy / memcpy_dtod) or is metadata bookkeeping. No host
+// bounce of the matrix data.
+// ===========================================================================
+
+/// Eigendecomposition of an `n × n` real symmetric matrix (f32).
+///
+/// Takes a GPU-resident row-major buffer and returns
+/// `(eigenvalues_ascending, eigenvectors_row_major)` both on-device. The
+/// caller's input buffer is **not** mutated — we clone it before the
+/// in-place cuSOLVER call.
+///
+/// Eigenvalues are sorted ascending. Eigenvectors are returned with
+/// column `j` of the result tensor equal to the `j`-th eigenvector,
+/// matching the row-major convention used by `ferrotorch_core::linalg::eigh`.
+#[cfg(feature = "cuda")]
+pub fn gpu_eigh_f32(
+    input: &CudaBuffer<f32>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<f32>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        // Empty matrix — return empty eigenvalue + zero-sized eigenvector
+        // buffers rather than calling cuSOLVER.
+        return Ok((
+            crate::transfer::alloc_zeros_f32(0, device)?,
+            crate::transfer::alloc_zeros_f32(0, device)?,
+        ));
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Clone input on GPU (cuSOLVER syevd writes in-place over A).
+    let mut d_a = crate::transfer::alloc_zeros_f32(n * n, device)?;
+    stream.memcpy_dtod(input.inner(), d_a.inner_mut())?;
+
+    // Output eigenvalue buffer + devInfo.
+    let mut d_w = crate::transfer::alloc_zeros_f32(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    // Workspace size query.
+    let jobz = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
+    let uplo = csys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER;
+    let mut lwork: i32 = 0;
+    unsafe {
+        csys::cusolverDnSsyevd_bufferSize(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            d_a.inner().device_ptr(&stream).0 as *const f32,
+            n as i32,
+            d_w.inner().device_ptr(&stream).0 as *const f32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f32(lwork.max(1) as usize, device)?;
+
+    // Run syevd.
+    unsafe {
+        let (a_ptr, _) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnSsyevd(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            a_ptr as *mut f32,
+            n as i32,
+            w_ptr as *mut f32,
+            work_ptr as *mut f32,
+            lwork,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eigh_f32",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    // d_a now holds the eigenvectors in column-major (each column is an
+    // eigenvector). Transpose back to row-major so column `j` of the
+    // returned tensor (in row-major) is the `j`-th eigenvector.
+    let v_rm = crate::kernels::gpu_transpose_2d(&d_a, n, n, device)?;
+
+    Ok((d_w, v_rm))
+}
+
+/// f64 variant of [`gpu_eigh_f32`].
+#[cfg(feature = "cuda")]
+pub fn gpu_eigh_f64(
+    input: &CudaBuffer<f64>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<f64>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return Ok((
+            crate::transfer::alloc_zeros_f64(0, device)?,
+            crate::transfer::alloc_zeros_f64(0, device)?,
+        ));
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    let mut d_a = crate::transfer::alloc_zeros_f64(n * n, device)?;
+    stream.memcpy_dtod(input.inner(), d_a.inner_mut())?;
+
+    let mut d_w = crate::transfer::alloc_zeros_f64(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let jobz = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
+    let uplo = csys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER;
+    let mut lwork: i32 = 0;
+    unsafe {
+        csys::cusolverDnDsyevd_bufferSize(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            d_a.inner().device_ptr(&stream).0 as *const f64,
+            n as i32,
+            d_w.inner().device_ptr(&stream).0 as *const f64,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    unsafe {
+        let (a_ptr, _) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDsyevd(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            w_ptr as *mut f64,
+            work_ptr as *mut f64,
+            lwork,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eigh_f64",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    let v_rm = crate::kernels::gpu_transpose_2d_f64(&d_a, n, n, device)?;
+    Ok((d_w, v_rm))
+}
+
+/// Eigenvalues only of an `n × n` real symmetric matrix (f32).
+///
+/// Same as [`gpu_eigh_f32`] but skips the eigenvector computation —
+/// faster, and avoids the row/column-major transpose at the end.
+#[cfg(feature = "cuda")]
+pub fn gpu_eigvalsh_f32(
+    input: &CudaBuffer<f32>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return crate::transfer::alloc_zeros_f32(0, device);
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Even with NoVector, syevd writes garbage to A — clone to protect input.
+    let mut d_a = crate::transfer::alloc_zeros_f32(n * n, device)?;
+    stream.memcpy_dtod(input.inner(), d_a.inner_mut())?;
+
+    let mut d_w = crate::transfer::alloc_zeros_f32(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let jobz = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_NOVECTOR;
+    let uplo = csys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER;
+    let mut lwork: i32 = 0;
+    unsafe {
+        csys::cusolverDnSsyevd_bufferSize(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            d_a.inner().device_ptr(&stream).0 as *const f32,
+            n as i32,
+            d_w.inner().device_ptr(&stream).0 as *const f32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f32(lwork.max(1) as usize, device)?;
+
+    unsafe {
+        let (a_ptr, _) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnSsyevd(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            a_ptr as *mut f32,
+            n as i32,
+            w_ptr as *mut f32,
+            work_ptr as *mut f32,
+            lwork,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eigvalsh_f32",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    Ok(d_w)
+}
+
+/// f64 variant of [`gpu_eigvalsh_f32`].
+#[cfg(feature = "cuda")]
+pub fn gpu_eigvalsh_f64(
+    input: &CudaBuffer<f64>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return crate::transfer::alloc_zeros_f64(0, device);
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    let mut d_a = crate::transfer::alloc_zeros_f64(n * n, device)?;
+    stream.memcpy_dtod(input.inner(), d_a.inner_mut())?;
+
+    let mut d_w = crate::transfer::alloc_zeros_f64(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let jobz = csys::cusolverEigMode_t::CUSOLVER_EIG_MODE_NOVECTOR;
+    let uplo = csys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER;
+    let mut lwork: i32 = 0;
+    unsafe {
+        csys::cusolverDnDsyevd_bufferSize(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            d_a.inner().device_ptr(&stream).0 as *const f64,
+            n as i32,
+            d_w.inner().device_ptr(&stream).0 as *const f64,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    unsafe {
+        let (a_ptr, _) = d_a.inner_mut().device_ptr_mut(&stream);
+        let (w_ptr, _) = d_w.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDsyevd(
+            dn.cu(),
+            jobz,
+            uplo,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            w_ptr as *mut f64,
+            work_ptr as *mut f64,
+            lwork,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_eigvalsh_f64",
+            expected: vec![0],
+            got: vec![info_val.unsigned_abs() as usize],
+        });
+    }
+
+    Ok(d_w)
+}
+
 // ---------------------------------------------------------------------------
 // Stubs — always return [`GpuError::NoCudaFeature`] when `cuda` is disabled.
 // ---------------------------------------------------------------------------

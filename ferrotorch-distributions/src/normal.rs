@@ -179,6 +179,73 @@ impl<T: Float> Distribution<T> for Normal<T> {
             Ok(out)
         }
     }
+
+    fn cdf(&self, value: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // cdf(x) = 0.5 * (1 + erf((x - loc) / (scale * sqrt(2))))
+        let val_data = value.data_vec()?;
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let sqrt2 = T::from(std::f64::consts::SQRT_2).unwrap();
+        let half = T::from(0.5).unwrap();
+        let one = <T as num_traits::One>::one();
+
+        let z: Vec<T> = val_data
+            .iter()
+            .zip(loc_data.iter().cycle())
+            .zip(scale_data.iter().cycle())
+            .map(|((&x, &l), &s)| (x - l) / (s * sqrt2))
+            .collect();
+        let z_tensor =
+            Tensor::from_storage(TensorStorage::cpu(z), value.shape().to_vec(), false)?;
+        let erf_z = ferrotorch_core::special::erf(&z_tensor)?;
+        let erf_data = erf_z.data_vec()?;
+        let result: Vec<T> = erf_data.iter().map(|&e| half * (one + e)).collect();
+        Tensor::from_storage(TensorStorage::cpu(result), value.shape().to_vec(), false)
+    }
+
+    fn icdf(&self, q: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {
+        // icdf(p) = loc + scale * sqrt(2) * erfinv(2p - 1)
+        let q_data = q.data_vec()?;
+        let two = T::from(2.0).unwrap();
+        let one = <T as num_traits::One>::one();
+        let arg: Vec<T> = q_data.iter().map(|&p| two * p - one).collect();
+        let arg_tensor =
+            Tensor::from_storage(TensorStorage::cpu(arg), q.shape().to_vec(), false)?;
+        let erfinv_arg = ferrotorch_core::special::erfinv(&arg_tensor)?;
+        let erfinv_data = erfinv_arg.data_vec()?;
+        let loc_data = self.loc.data_vec()?;
+        let scale_data = self.scale.data_vec()?;
+        let sqrt2 = T::from(std::f64::consts::SQRT_2).unwrap();
+        let result: Vec<T> = erfinv_data
+            .iter()
+            .zip(loc_data.iter().cycle())
+            .zip(scale_data.iter().cycle())
+            .map(|((&e, &l), &s)| l + s * sqrt2 * e)
+            .collect();
+        Tensor::from_storage(TensorStorage::cpu(result), q.shape().to_vec(), false)
+    }
+
+    fn mean(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.loc.clone())
+    }
+
+    fn mode(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.loc.clone())
+    }
+
+    fn variance(&self) -> FerrotorchResult<Tensor<T>> {
+        let scale_data = self.scale.data_vec()?;
+        let out: Vec<T> = scale_data.iter().map(|&s| s * s).collect();
+        Tensor::from_storage(
+            TensorStorage::cpu(out),
+            self.scale.shape().to_vec(),
+            false,
+        )
+    }
+
+    fn stddev(&self) -> FerrotorchResult<Tensor<T>> {
+        Ok(self.scale.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -548,5 +615,48 @@ mod tests {
         let lp = dist.log_prob(&x).unwrap();
         let expected = -0.5 * (2.0f64 * std::f64::consts::PI).ln();
         assert!((lp.item().unwrap() - expected).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // CDF / ICDF / mean / mode / variance / stddev (#585)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normal_mean_mode_variance_stddev() {
+        let loc = scalar(2.5f64).unwrap();
+        let scale = scalar(1.5f64).unwrap();
+        let dist = Normal::new(loc, scale).unwrap();
+        assert!((dist.mean().unwrap().item().unwrap() - 2.5).abs() < 1e-10);
+        assert!((dist.mode().unwrap().item().unwrap() - 2.5).abs() < 1e-10);
+        assert!((dist.variance().unwrap().item().unwrap() - 2.25).abs() < 1e-10);
+        assert!((dist.stddev().unwrap().item().unwrap() - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normal_cdf_at_mean_is_half() {
+        let loc = scalar(0.0f64).unwrap();
+        let scale = scalar(1.0f64).unwrap();
+        let dist = Normal::new(loc, scale).unwrap();
+        let x = scalar(0.0f64).unwrap();
+        let c = dist.cdf(&x).unwrap();
+        assert!((c.item().unwrap() - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_normal_cdf_icdf_roundtrip() {
+        let loc = scalar(0.0f64).unwrap();
+        let scale = scalar(1.0f64).unwrap();
+        let dist = Normal::new(loc, scale).unwrap();
+        // cdf(icdf(p)) ≈ p
+        for p in [0.1, 0.25, 0.5, 0.75, 0.9] {
+            let q = scalar(p).unwrap();
+            let x = dist.icdf(&q).unwrap();
+            let p2 = dist.cdf(&x).unwrap();
+            assert!(
+                (p2.item().unwrap() - p).abs() < 5e-3,
+                "p={p}, recovered={}",
+                p2.item().unwrap()
+            );
+        }
     }
 }

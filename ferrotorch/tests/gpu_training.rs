@@ -31,10 +31,15 @@ fn test_mlp_training_cpu() {
     let mut first_loss = 0.0f32;
     let mut last_loss = 0.0f32;
 
-    for step in 0..10 {
-        let x = rand::<f32>(&[32, 784]).unwrap();
-        let t = from_vec((0..32).map(|i| (i % 10) as f32).collect(), &[32]).unwrap();
+    // Hold the batch fixed across steps so loss is guaranteed to
+    // decrease for a sane optimiser. Sampling a fresh batch each step
+    // (which the original version did) lets loss legitimately oscillate
+    // with only 10 SGD steps and made the test intermittently fail
+    // under workspace-parallel runs.
+    let x = rand::<f32>(&[32, 784]).unwrap();
+    let t = from_vec((0..32).map(|i| (i % 10) as f32).collect(), &[32]).unwrap();
 
+    for step in 0..10 {
         optimizer.zero_grad().unwrap();
         let output = model.forward(&x).unwrap();
         let loss = ce_loss.forward(&output, &t).unwrap();
@@ -99,10 +104,11 @@ fn test_transformer_training_cpu() {
     let mut first_loss = 0.0f32;
     let mut last_loss = 0.0f32;
 
-    for step in 0..10 {
-        let x = randn::<f32>(&[batch, seq, d_model]).unwrap();
-        let target = randn::<f32>(&[batch, seq, d_model]).unwrap();
+    // Fix the batch across steps — see comment in test_mlp_training_cpu.
+    let x = randn::<f32>(&[batch, seq, d_model]).unwrap();
+    let target = randn::<f32>(&[batch, seq, d_model]).unwrap();
 
+    for step in 0..10 {
         optimizer.zero_grad().unwrap();
 
         // QKV projection

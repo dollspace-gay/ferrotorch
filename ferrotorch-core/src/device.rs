@@ -20,6 +20,10 @@ pub enum Device {
     /// Accessed via `ferrotorch-xpu` which wraps a CubeCL wgpu runtime.
     /// CL-452.
     Xpu(usize),
+    /// Apple Silicon Metal Performance Shaders. The `usize` is the Metal
+    /// device index (`0` is the system default GPU). Mirrors
+    /// `torch.device("mps")`. Implemented via `ferrotorch-mps`. (#451)
+    Mps(usize),
     /// Meta device — shape-only, no backing storage. Operations that need
     /// data return an error; operations that only manipulate metadata
     /// (reshape, view, permute, narrow, transpose, …) work normally and
@@ -46,6 +50,12 @@ impl Device {
         matches!(self, Device::Xpu(_))
     }
 
+    /// Returns `true` if this is an Apple MPS device. (#451)
+    #[inline]
+    pub fn is_mps(&self) -> bool {
+        matches!(self, Device::Mps(_))
+    }
+
     /// Returns `true` if this is the meta device (shape-only, no data).
     #[inline]
     pub fn is_meta(&self) -> bool {
@@ -59,6 +69,7 @@ impl core::fmt::Display for Device {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
             Device::Xpu(id) => write!(f, "xpu:{id}"),
+            Device::Mps(id) => write!(f, "mps:{id}"),
             Device::Meta => write!(f, "meta"),
         }
     }
