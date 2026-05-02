@@ -1,0 +1,10 @@
+{
+  "uuid": "b14952ba-8632-4ed3-aa3a-089762ba4749",
+  "issue_uuid": "b3463afb-9643-4ce3-9b5a-41fe76640651",
+  "author": "y4rr",
+  "content": "Done. tracing = 0.1 added to [workspace.dependencies] in /home/doll/ferrotorch/Cargo.toml between tokenizers and zip (alphabetical). Did NOT propagate tracing.workspace = true to any individual crate's [dependencies] — each Phase 2 fix dispatch adds it as part of its own work. Verification: cargo build --workspace --all-targets PASS, 22 workspace members unchanged. ~5 min wallclock.",
+  "created_at": "2026-05-02T22:18:35.191478809Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAle3J5IupeT5GYL5Yk923v3rMVyPR1AdioR659vimMtk8tY9sNqQI90za/mhxBLCCRPiRPAax20mQZ3CtykBVCA=="
+}
