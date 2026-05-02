@@ -1,0 +1,10 @@
+{
+  "uuid": "d9385445-f56c-4dbf-b90a-f4b57347c904",
+  "issue_uuid": "d44cc11c-efa1-424e-a5a2-c05219db4a63",
+  "author": "y4rr",
+  "content": "ADR delivered with probe-and-revert experiment. Tweaked baseline: (1) unsafe_code='warn' not 'deny' — ferrotorch-gpu probe revealed 272 unsafe blocks would all fail; recommended path is warn-baseline + crate-root #![allow(unsafe_code)] in 6 FFI crates (gpu, cubecl, distributed, jit, llama is empty, mps is empty), then escalate to deny later. (2) Discovered rust_2018_idioms='deny' triggers clippy::lint_groups_priority hard error — must be { level='deny', priority=-1 }. (3) Added print_stderr='warn' (audit had print_stdout only). Damage estimate: 7,500-12,000 warnings workspace-wide. Probed: tokenize (32 warnings) + gpu (272 errors + 2,644 warnings IF deny). Rollout: 1.dbg/todo/unimplemented/print_stdout/print_stderr (zero false-positive, deny from day one); 2.unsafe_code=warn + crate-root allows; 3.clippy::all correctness; 4.unwrap_used/expect_used per-crate; 5.missing_docs/missing_errors_doc per-crate (last, biggest flood). Revert verified: workspace Cargo.toml clean, both probe crates Cargo.toml clean, cargo build --workspace --all-targets PASS. 5 open questions, biggest: 527 cast_possible_truncation hits in ferrotorch-gpu (usize→u32 in launch grids) — separate triage ticket needed.",
+  "created_at": "2026-05-02T21:40:04.524211565Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASCdqs1ep+hwJsLz/dn1vUF+qR79px5ervRjB6MENCt1mBLRSvdqbgaukvCcOHL2YH3jYzSyJNWqA9socJ7nmDw=="
+}
