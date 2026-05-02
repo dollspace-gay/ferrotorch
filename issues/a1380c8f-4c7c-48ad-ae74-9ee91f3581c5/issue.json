@@ -2,11 +2,12 @@
   "uuid": "a1380c8f-4c7c-48ad-ae74-9ee91f3581c5",
   "display_id": 638,
   "title": "Copy crosslink-porting skills into ~/.claude/skills",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-05-02T16:08:24.561110671Z",
-  "updated_at": "2026-05-02T16:08:26.527332681Z",
+  "updated_at": "2026-05-02T16:08:45.714239331Z",
+  "closed_at": "2026-05-02T16:08:45.714239331Z",
   "labels": [
     "chore"
   ]
