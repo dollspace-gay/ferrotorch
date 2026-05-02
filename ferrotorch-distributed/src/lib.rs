@@ -58,6 +58,7 @@ pub mod checkpoint;
 pub mod collective;
 pub mod ddp;
 pub mod device_mesh;
+pub mod dtensor;
 pub mod error;
 pub mod fsdp;
 pub mod gloo_backend;
@@ -96,6 +97,7 @@ pub use collective::{
 };
 pub use ddp::DDP;
 pub use device_mesh::DeviceMesh;
+pub use dtensor::{DTensor, Placement};
 pub use error::DistributedError;
 pub use fsdp::FSDP;
 pub use gloo_backend::{GlooBackend, is_gloo_available};
