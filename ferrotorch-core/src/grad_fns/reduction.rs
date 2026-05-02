@@ -585,11 +585,35 @@ pub struct SumDimBackward<T: Float> {
 
 impl<T: Float> GradFn<T> for SumDimBackward<T> {
     fn backward(&self, grad_output: &Tensor<T>) -> FerrotorchResult<Vec<Option<Tensor<T>>>> {
+        let input_shape = self.input.shape();
+        let outer: usize = input_shape[..self.dim].iter().product::<usize>().max(1);
+        let inner: usize = input_shape[(self.dim + 1)..]
+            .iter()
+            .product::<usize>()
+            .max(1);
+        let repeat_count = input_shape[self.dim];
+
+        // GPU-native path: expand-along-dim via the dedicated kernel (#524).
+        let t_is_f32 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>();
+        let t_is_f64 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
+        if grad_output.is_cuda() && (t_is_f32 || t_is_f64) {
+            let backend =
+                crate::gpu_dispatch::gpu_backend().ok_or(FerrotorchError::DeviceUnavailable)?;
+            let result_h = if t_is_f32 {
+                backend.repeat_along_dim_f32(grad_output.gpu_handle()?, outer, repeat_count, inner)?
+            } else {
+                backend.repeat_along_dim_f64(grad_output.gpu_handle()?, outer, repeat_count, inner)?
+            };
+            let grad_input = Tensor::from_storage(
+                TensorStorage::gpu(result_h),
+                input_shape.to_vec(),
+                false,
+            )?;
+            return Ok(vec![Some(grad_input)]);
+        }
         if grad_output.is_cuda() {
             return Err(FerrotorchError::NotImplementedOnCuda { op: "sum_dim backward" });
         }
-
-        let input_shape = self.input.shape();
 
         // If keepdim was false, reinsert the reduced dimension as size 1.
         let grad = if self.keepdim {

@@ -5570,6 +5570,84 @@ END_MMAX:
 ";
 
 
+/// PTX source for `repeat_along_dim_kernel` (#524). Expands a `[outer,
+/// inner]` tensor into `[outer, repeat_count, inner]` by broadcasting
+/// along the inserted middle axis. Used for the backward of `sum_dim` /
+/// `mean_dim` where the gradient needs to be replicated along the
+/// previously-reduced dim. For mean_dim, the caller multiplies by
+/// `1/repeat_count` separately to preserve a clean kernel boundary.
+///
+/// Each thread writes one output element. Output index decomposes as:
+///   `t = o * (repeat_count * inner) + r * inner + i`
+/// and reads from `input[o * inner + i]`.
+#[cfg(feature = "cuda")]
+pub(crate) const REPEAT_ALONG_DIM_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry repeat_along_dim_kernel(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 outer,
+    .param .u32 repeat_count,
+    .param .u32 inner
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %t, %total, %o, %r, %i, %tmp_ri, %tmp_ri2, %ri_extent;
+    .reg .u32 %src_idx, %re_x_in;
+    .reg .u64 %inp, %out, %off;
+    .reg .f32 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %inp, [in_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %tmp_ri, [outer];
+    ld.param.u32 %tmp_ri2, [repeat_count];
+    ld.param.u32 %ri_extent, [inner];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %t, %bid, %bdim, %r_tid;
+
+    // total = outer * repeat_count * inner
+    mul.lo.u32 %re_x_in, %tmp_ri2, %ri_extent;
+    mul.lo.u32 %total, %tmp_ri, %re_x_in;
+
+    setp.ge.u32 %p, %t, %total;
+    @%p bra DONE_RAD;
+
+    // o = t / (repeat_count * inner)
+    div.u32 %o, %t, %re_x_in;
+    // tmp = t % (repeat_count * inner)
+    rem.u32 %tmp_ri, %t, %re_x_in;
+    // r = tmp / inner; i = tmp % inner
+    div.u32 %r, %tmp_ri, %ri_extent;
+    rem.u32 %i, %tmp_ri, %ri_extent;
+    // src_idx = o * inner + i
+    mad.lo.u32 %src_idx, %o, %ri_extent, %i;
+
+    // Load src
+    cvt.u64.u32 %off, %src_idx;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %inp, %off;
+    ld.global.f32 %v, [%off];
+
+    // Store to dst[t]
+    cvt.u64.u32 %off, %t;
+    shl.b64 %off, %off, 2;
+    add.u64 %off, %out, %off;
+    st.global.f32 [%off], %v;
+
+    // suppress unused warning
+    mov.u32 %r, %r;
+
+DONE_RAD:
+    ret;
+}
+";
+
+
 /// PTX source for `clamp_backward_kernel` (#524).
 /// VJP for `clamp(x, min, max)`: `out[i] = grad[i]` when `min <= x[i] <= max`,
 /// else `0`. Single-pass elementwise — no shared memory.
@@ -14693,6 +14771,152 @@ pub fn gpu_clamp_backward(
 ) -> GpuResult<CudaBuffer<f32>> {
     Err(GpuError::NoCudaFeature)
 }
+
+/// f32 broadcast-along-middle-dim kernel (#524). Expands a
+/// `[outer, inner]` source into `[outer, repeat_count, inner]`. Used for
+/// sum_dim / mean_dim backward to replicate the gradient along the
+/// reduced dim.
+#[cfg(feature = "cuda")]
+pub fn gpu_repeat_along_dim(
+    input: &CudaBuffer<f32>,
+    outer: usize,
+    repeat_count: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    if input.len() != outer * inner {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_repeat_along_dim",
+            expected: vec![outer * inner],
+            got: vec![input.len()],
+        });
+    }
+    let total = outer * repeat_count * inner;
+    if total == 0 {
+        return alloc_zeros_f32(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        REPEAT_ALONG_DIM_PTX,
+        "repeat_along_dim_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            // PTX-compile-failure fallback: walk on host.
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0_f32; total];
+            for o in 0..outer {
+                for r in 0..repeat_count {
+                    for i in 0..inner {
+                        out[o * (repeat_count * inner) + r * inner + i] =
+                            host[o * inner + i];
+                    }
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(total, device)?;
+    let cfg = launch_cfg(total)?;
+    let outer_u32 = outer as u32;
+    let rep_u32 = repeat_count as u32;
+    let inner_u32 = inner as u32;
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&outer_u32)
+            .arg(&rep_u32)
+            .arg(&inner_u32)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+/// f64 counterpart of [`gpu_repeat_along_dim`].
+#[cfg(feature = "cuda")]
+pub fn gpu_repeat_along_dim_f64(
+    input: &CudaBuffer<f64>,
+    outer: usize,
+    repeat_count: usize,
+    inner: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    if input.len() != outer * inner {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_repeat_along_dim_f64",
+            expected: vec![outer * inner],
+            got: vec![input.len()],
+        });
+    }
+    let total = outer * repeat_count * inner;
+    if total == 0 {
+        return alloc_zeros_f64(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+    let ptx = get_f64_ptx(
+        &CACHE,
+        REPEAT_ALONG_DIM_PTX,
+        "repeat_along_dim_kernel",
+        "repeat_along_dim_f64_kernel",
+    );
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "repeat_along_dim_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(input, device)?;
+            let mut out = vec![0.0_f64; total];
+            for o in 0..outer {
+                for r in 0..repeat_count {
+                    for i in 0..inner {
+                        out[o * (repeat_count * inner) + r * inner + i] =
+                            host[o * inner + i];
+                    }
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(total, device)?;
+    let cfg = launch_cfg(total)?;
+    let outer_u32 = outer as u32;
+    let rep_u32 = repeat_count as u32;
+    let inner_u32 = inner as u32;
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(input.inner())
+            .arg(out.inner_mut())
+            .arg(&outer_u32)
+            .arg(&rep_u32)
+            .arg(&inner_u32)
+            .launch(cfg)?;
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_repeat_along_dim(_input: &CudaBuffer<f32>, _outer: usize, _rep: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f32>> { Err(GpuError::NoCudaFeature) }
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_repeat_along_dim_f64(_input: &CudaBuffer<f64>, _outer: usize, _rep: usize, _inner: usize, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
 
 // ---------------------------------------------------------------------------
 // Public API -- elementwise transcendentals & math ops

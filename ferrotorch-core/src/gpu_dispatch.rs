@@ -1910,6 +1910,35 @@ pub trait GpuBackend: Send + Sync {
             message: "fft2_c2c_f64 GPU op not yet implemented".into(),
         })
     }
+
+    /// Broadcast a `[outer, inner]` tensor into `[outer, repeat_count, inner]`
+    /// by replicating along the inserted middle dim. Used for sum_dim /
+    /// mean_dim backward where the gradient must be expanded along the
+    /// previously-reduced dim. (#524)
+    fn repeat_along_dim_f32(
+        &self,
+        _input: &GpuBufferHandle,
+        _outer: usize,
+        _repeat_count: usize,
+        _inner: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "repeat_along_dim_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// f64 counterpart. (#524)
+    fn repeat_along_dim_f64(
+        &self,
+        _input: &GpuBufferHandle,
+        _outer: usize,
+        _repeat_count: usize,
+        _inner: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "repeat_along_dim_f64 GPU op not yet implemented".into(),
+        })
+    }
     fn rfft_r2c_f32(
         &self,
         _a: &GpuBufferHandle,

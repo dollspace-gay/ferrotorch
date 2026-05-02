@@ -2785,6 +2785,34 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer_f64(out, a.device_ordinal()))
     }
 
+    fn repeat_along_dim_f32(
+        &self,
+        input: &GpuBufferHandle,
+        outer: usize,
+        repeat_count: usize,
+        inner: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let in_buf = Self::unwrap_buffer(input)?;
+        let dev = self.device(input.device_ordinal())?;
+        let out = crate::kernels::gpu_repeat_along_dim(in_buf, outer, repeat_count, inner, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(out, input.device_ordinal()))
+    }
+
+    fn repeat_along_dim_f64(
+        &self,
+        input: &GpuBufferHandle,
+        outer: usize,
+        repeat_count: usize,
+        inner: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let in_buf = Self::unwrap_buffer_f64(input)?;
+        let dev = self.device(input.device_ordinal())?;
+        let out = crate::kernels::gpu_repeat_along_dim_f64(in_buf, outer, repeat_count, inner, dev)
+            .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(out, input.device_ordinal()))
+    }
+
     fn rfft_r2c_f32(
         &self,
         a: &GpuBufferHandle,
