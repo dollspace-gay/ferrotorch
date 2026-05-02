@@ -3,9 +3,10 @@
   "display_id": 632,
   "title": "GPU svd/cholesky/solve/qr drop host bounces",
   "description": "Spun out from #604 partial close. The existing gpu_svd_f32/f64, gpu_cholesky_f32/f64, gpu_solve_f32/f64, gpu_qr_f32/f64 in cusolver.rs all do gpu_to_cpu → cuSOLVER → cpu_to_gpu sandwiches. Refactor each to take &CudaBuffer<T> and return CudaBuffer<T> with on-device row↔column transpose, mirroring the gpu_lu_factor pattern landed in #604.",
-  "status": "open",
+  "status": "closed",
   "priority": "low",
   "created_by": "y4rr",
   "created_at": "2026-05-02T01:22:30.528733163Z",
-  "updated_at": "2026-05-02T01:22:30.528733163Z"
+  "updated_at": "2026-05-02T02:31:45.225898139Z",
+  "closed_at": "2026-05-02T02:31:45.225898139Z"
 }
