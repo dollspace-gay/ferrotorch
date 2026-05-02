@@ -1,0 +1,10 @@
+{
+  "uuid": "690a441c-b7fc-482a-b856-175749d02b31",
+  "issue_uuid": "8a7ef2f3-4362-4274-918d-eb78d2e13a2c",
+  "author": "y4rr",
+  "content": "Done. Added jit-script + tokenize to default features; mps, xpu, llama, ml as opt-in; llama-cuda super-feature pulls in gpu+cudarc. Added ferrotorch-jit-script and ferrotorch-mps to workspace.dependencies (had been workspace members but not declared deps). New tests/public_surface.rs pins every README-documented module path so future drift fails at compile time. Gates: fmt clean, clippy --all-targets --features mps,xpu,ml,llama -- -D warnings clean, public_surface 13/13 pass, default + no-default-features both check.",
+  "created_at": "2026-05-02T16:16:42.277532299Z",
+  "kind": "note",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARiXNXU4zbI1qz5HLw1DvXh+nPEptEhhhZRpHCzxnagFVtCUzkdT6J75arvu93X2uJlWQSy25mOiafMkl1cWpAw=="
+}
