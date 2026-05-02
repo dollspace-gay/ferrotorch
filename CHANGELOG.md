@@ -294,6 +294,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - M≤4 cuBLAS bypass: route vector-matrix multiplies through PTX `small_matmul` kernel instead of cuBLAS SGEMM
 
 ### Changed
+- Closed audit / tracking issues whose deliverables already shipped: #562 (`docs/audit/01-15-*.md` cover the crate-by-crate gap analysis), #563 (`docs/audit/16-ferray-ferrolearn-integration.md` covers the integration audit), #572 (umbrella tracking #564-#571 — every phased subitem closed).
 - Closed previously-shipped issues #414 (gap-analysis result already in tracker comments) and #504 (Adagrad fully implemented in `ferrotorch-optim/src/adagrad.rs` with foreach on-device path, weight_decay, lr_decay, initial_accumulator_value, eps, maximize, plus 24 tests; was already re-exported from lib.rs).
 - GPU strided_scatter kernel for as_strided_scatter (CPU-only today) (#574)
 - Relax ferrotorch-ml CPU gate: auto-convert GPU tensors to CPU silently (matches torch .cpu().item() flow) (#600)
