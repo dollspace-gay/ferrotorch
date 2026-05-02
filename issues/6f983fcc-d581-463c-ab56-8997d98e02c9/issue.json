@@ -1,0 +1,10 @@
+{
+  "uuid": "6f983fcc-d581-463c-ab56-8997d98e02c9",
+  "display_id": 659,
+  "title": "Phase 1 ADR: per-crate CPU-fallback policy decision matrix (rust-gpu-discipline §3 migration)",
+  "status": "open",
+  "priority": "medium",
+  "created_by": "y4rr",
+  "created_at": "2026-05-02T21:29:45.441241038Z",
+  "updated_at": "2026-05-02T21:29:45.441241038Z"
+}
