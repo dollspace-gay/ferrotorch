@@ -1,0 +1,10 @@
+{
+  "uuid": "017bf52c-eac3-4d2f-9a00-9d51132b0742",
+  "issue_uuid": "6f983fcc-d581-463c-ab56-8997d98e02c9",
+  "author": "y4rr",
+  "content": "ADR delivered. 7-row decision matrix per rust-gpu-discipline §3: ferrotorch-gpu=A error-only (mechanical, GpuError::PtxCompileFailed exists; *_f64 sites need new GpuError::Unsupported variant which IS a §4 coordination event); ferrotorch-cubecl=D defer (public API redesign needed — return Handle vs CPU Tensor); ferrotorch-xpu=D cascading from cubecl; ferrotorch-distributions=C composite-op pattern (PyTorch CompositeImplicitAutograd analog — runs on whichever device inputs live on; document, no Err return); ferrotorch-jit=B opt-in BUT fallback target must be eager-GPU not CPU interpreter (PyTorch Inductor parity); ferrotorch-distributed=C composite (Gloo-equivalent backend, documented round-trip); ferrotorch-nn=B opt-in fallback for clip_grad_norm. Rollout order: 1.gpu (cheapest), 2.add tracing to workspace deps (prerequisite for B), 3.nn, 4.jit, 5-6.docs for distributed/distributions, 7.cubecl/xpu redesign last. 5 open questions, most important: add tracing to [workspace.dependencies]? (hard prerequisite for any opt-in fallback wiring).",
+  "created_at": "2026-05-02T21:39:54.587863809Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8Qg//fayxYNyih9nVeGsUUHGsYNacwEos3iBt9/zl3pQnozoGl1KWJoWi6ssiz2i46MxsWVMHbiGc6+QnmRWBQ=="
+}
