@@ -128,6 +128,14 @@ impl<T: Float> Tensor<T> {
         crate::grad_fns::reduction::amax(self)
     }
 
+    /// LU factorization in cuSOLVER's packed form: returns
+    /// `(LU_packed, pivots)`. Mirrors `torch.linalg.lu_factor`. On CUDA
+    /// f32/f64, runs natively via cuSOLVER `getrf` with no host bounce
+    /// for the matrix; pivots come back as a host `Vec<i32>` (O(n)). (#604)
+    pub fn lu_factor(&self) -> FerrotorchResult<(Tensor<T>, Vec<i32>)> {
+        crate::linalg::lu_factor(self)
+    }
+
     // --- Linalg ---
 
     pub fn matmul(&self, other: &Tensor<T>) -> FerrotorchResult<Tensor<T>> {

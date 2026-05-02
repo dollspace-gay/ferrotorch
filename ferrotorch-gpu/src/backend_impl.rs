@@ -2535,6 +2535,37 @@ impl GpuBackend for CudaBackendImpl {
         ))
     }
 
+    // GPU-resident LU factorization (no host bounces). Returns (LU_packed, pivots).
+    fn lu_factor_f32(
+        &self,
+        a: &GpuBufferHandle,
+        n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, Vec<i32>)> {
+        let a_buf = Self::unwrap_buffer(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let (lu, ipiv) =
+            crate::cusolver::gpu_lu_factor_f32(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        // Pivots are O(n) ints — download to host. The LU matrix (O(n²))
+        // stays on device.
+        let ipiv_host =
+            crate::transfer::gpu_to_cpu(&ipiv, dev).map_err(Self::map_gpu_err)?;
+        Ok((Self::wrap_buffer(lu, a.device_ordinal()), ipiv_host))
+    }
+
+    fn lu_factor_f64(
+        &self,
+        a: &GpuBufferHandle,
+        n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, Vec<i32>)> {
+        let a_buf = Self::unwrap_buffer_f64(a)?;
+        let dev = self.device(a.device_ordinal())?;
+        let (lu, ipiv) =
+            crate::cusolver::gpu_lu_factor_f64(a_buf, n, dev).map_err(Self::map_gpu_err)?;
+        let ipiv_host =
+            crate::transfer::gpu_to_cpu(&ipiv, dev).map_err(Self::map_gpu_err)?;
+        Ok((Self::wrap_buffer_f64(lu, a.device_ordinal()), ipiv_host))
+    }
+
     // GPU-resident eigh / eigvalsh (no host bounces — see cusolver::gpu_eigh_*).
     fn eigh_f32(
         &self,

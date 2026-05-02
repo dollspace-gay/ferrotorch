@@ -1677,6 +1677,35 @@ pub trait GpuBackend: Send + Sync {
             message: "qr_f64 GPU op not yet implemented".into(),
         })
     }
+
+    /// LU factorization in cuSOLVER's packed form: returns
+    /// `(LU_packed, pivots)` where `LU_packed` is an `n×n` row-major GPU
+    /// tensor handle (strict lower = `L`, upper = `U`), and `pivots` is a
+    /// host `Vec<i32>` of length `n` (1-based row-permutation indices,
+    /// LAPACK convention). The pivot vector is small (O(n)) and inherently
+    /// host-readable, so we return it materialized on host rather than
+    /// inventing a typed-int GPU handle. Mirrors `torch.linalg.lu_factor`.
+    /// (#604)
+    fn lu_factor_f32(
+        &self,
+        _a: &GpuBufferHandle,
+        _n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, Vec<i32>)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "lu_factor_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// f64 counterpart of [`Self::lu_factor_f32`]. (#604)
+    fn lu_factor_f64(
+        &self,
+        _a: &GpuBufferHandle,
+        _n: usize,
+    ) -> FerrotorchResult<(GpuBufferHandle, Vec<i32>)> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "lu_factor_f64 GPU op not yet implemented".into(),
+        })
+    }
     /// Symmetric eigendecomposition (eigenvalues + eigenvectors) of an
     /// `n × n` real symmetric matrix. Returns `(eigenvalues, eigenvectors)`
     /// where eigenvectors is row-major with column `j` the `j`-th eigenvector.

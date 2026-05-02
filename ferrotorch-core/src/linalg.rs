@@ -798,6 +798,118 @@ pub fn lu<T: Float>(a: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Tensor<T>, Te
     }
 }
 
+/// LU factorization in cuSOLVER's packed form: returns `(LU_packed, pivots)`
+/// where `LU_packed` is `n×n` row-major with the strict lower triangle = `L`
+/// (unit diagonal implicit) and the upper triangle = `U`, and `pivots` is a
+/// length-`n` host `Vec<i32>` of 1-based row-permutation indices (cuSOLVER /
+/// LAPACK convention). Mirrors `torch.linalg.lu_factor`. (#604)
+///
+/// On CUDA f32/f64, dispatches to the native `gpu_lu_factor` kernel
+/// (cuSOLVER `getrf` with on-device row→col→row transpose). The LU matrix
+/// stays on device (O(n²) values); only the pivot vector (O(n) ints) is
+/// downloaded to host as a `Vec<i32>` since `Tensor<T>` requires
+/// `T: Float`. Other dtypes and CPU inputs fall back to `ferray-linalg::lu`
+/// and pack the result locally.
+pub fn lu_factor<T: Float>(a: &Tensor<T>) -> FerrotorchResult<(Tensor<T>, Vec<i32>)> {
+    let shape = a.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(FerrotorchError::InvalidArgument {
+            message: format!("lu_factor requires a square 2-D tensor, got {shape:?}"),
+        });
+    }
+    let n = shape[0];
+
+    if a.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+        let backend = crate::gpu_dispatch::gpu_backend()
+            .ok_or(FerrotorchError::DeviceUnavailable)?;
+        let (lu_h, ipiv) = if is_f32::<T>() {
+            backend.lu_factor_f32(a.gpu_handle()?, n)?
+        } else {
+            backend.lu_factor_f64(a.gpu_handle()?, n)?
+        };
+        // The LU matrix stays on device; pivots are returned as a host
+        // Vec<i32> directly from the trait (O(n) ints, not worth a typed
+        // GPU int handle).
+        let lu = Tensor::from_storage(TensorStorage::gpu(lu_h), vec![n, n], false)?;
+        return Ok((lu, ipiv));
+    }
+    if a.is_cuda() {
+        return Err(FerrotorchError::NotImplementedOnCuda { op: "lu_factor" });
+    }
+
+    // CPU fallback: get full PLU from ferray-linalg, then collapse to packed
+    // LU + pivots (the cuSOLVER convention). The packed form is L's strict
+    // lower triangle plus U's upper triangle (incl. diagonal); ipiv comes
+    // from the row permutation P encoded as 1-based indices.
+    let (p, l, u) = if is_f32::<T>() {
+        let arr = tensor_to_array2_f32(a)?;
+        let (p, l, u) = ferray_linalg::lu(&arr).map_err(FerrotorchError::Ferray)?;
+        (
+            slice_f32_to_vec::<T>(p.as_slice().unwrap()),
+            slice_f32_to_vec::<T>(l.as_slice().unwrap()),
+            slice_f32_to_vec::<T>(u.as_slice().unwrap()),
+        )
+    } else if is_f64::<T>() {
+        let arr = tensor_to_array2_f64(a)?;
+        let (p, l, u) = ferray_linalg::lu(&arr).map_err(FerrotorchError::Ferray)?;
+        (
+            slice_to_vec::<T>(p.as_slice().unwrap()),
+            slice_to_vec::<T>(l.as_slice().unwrap()),
+            slice_to_vec::<T>(u.as_slice().unwrap()),
+        )
+    } else {
+        return Err(FerrotorchError::InvalidArgument {
+            message: "lu_factor requires f32 or f64".into(),
+        });
+    };
+
+    // Build packed LU buffer: lower triangle = strict-L, upper = U (incl. diag).
+    let mut packed = vec![<T as num_traits::Zero>::zero(); n * n];
+    for i in 0..n {
+        for j in 0..n {
+            packed[i * n + j] = if j < i {
+                l[i * n + j] // strict lower of L
+            } else {
+                u[i * n + j] // U upper triangle
+            };
+        }
+    }
+    // Convert P (an n×n permutation matrix) to ipiv in cuSOLVER /
+    // LAPACK swap-sequence form so the CPU and GPU paths produce
+    // interchangeable output. cuSOLVER's `ipiv[i]` (1-based) is the
+    // index of the row swapped INTO position `i` at step `i` of the
+    // factorization.
+    //
+    // Two-step conversion:
+    //   1. Read P as a permutation vector `perm` where `perm[i]` is the
+    //      column with a 1 in row `i` of P (i.e. row `i` of `P @ A`
+    //      equals row `perm[i]` of `A`).
+    //   2. Convert `perm` → swap-sequence by replaying the swaps. At
+    //      step `i`, the algorithm wants `perm[i]` at position `i`.
+    //      Find where `perm[i]` lives in the running array `work`
+    //      (originally identity), record the swap, and apply it.
+    let mut perm = vec![0_usize; n];
+    let one = T::from(1.0).unwrap();
+    for i in 0..n {
+        for j in 0..n {
+            if p[i * n + j] == one {
+                perm[i] = j;
+                break;
+            }
+        }
+    }
+    let mut work: Vec<usize> = (0..n).collect();
+    let mut ipiv = vec![0_i32; n];
+    for i in 0..n {
+        let target = perm[i];
+        let j = (i..n).find(|&k| work[k] == target).unwrap_or(i);
+        ipiv[i] = (j + 1) as i32;
+        work.swap(i, j);
+    }
+    let lu = Tensor::from_storage(TensorStorage::cpu(packed), vec![n, n], false)?;
+    Ok((lu, ipiv))
+}
+
 // ===========================================================================
 // Singular values only / least squares
 // ===========================================================================

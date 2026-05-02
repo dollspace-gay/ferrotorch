@@ -807,6 +807,180 @@ pub fn gpu_solve_f64(
 }
 
 // ---------------------------------------------------------------------------
+// LU factorization (packed): A = P * L * U  (#604)
+// ---------------------------------------------------------------------------
+//
+// Returns the cuSOLVER native packed form:
+// - LU buffer: an n×n row-major tensor where the strict lower-triangle is L
+//   (unit diagonal implicit) and the upper-triangle (incl. diagonal) is U.
+// - pivots: an i32 buffer of length n; 1-based row-permutation indices.
+//
+// Both outputs stay on device — no host bounce. Input is taken as
+// `&CudaBuffer<f32/f64>` (row-major) and we use `gpu_transpose_2d` for the
+// row→column→row roundtrip cuSOLVER demands.
+
+/// GPU-resident LU factorization of an n×n f32 matrix (#604).
+/// Mirrors `torch.linalg.lu_factor` for CUDA inputs.
+#[cfg(feature = "cuda")]
+pub fn gpu_lu_factor_f32(
+    a_dev: &CudaBuffer<f32>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<i32>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return Ok((
+            crate::transfer::alloc_zeros_f32(0, device)?,
+            alloc_zeros_i32(0, device)?,
+        ));
+    }
+    if a_dev.len() != n * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lu_factor_f32: input length mismatch",
+            expected: vec![n * n],
+            got: vec![a_dev.len()],
+        });
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    // Row-major → column-major on device. This stays in VRAM end-to-end.
+    let mut d_a_col = crate::kernels::gpu_transpose_2d(a_dev, n, n, device)?;
+    let mut d_ipiv = alloc_zeros_i32(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let mut lwork: i32 = 0;
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnSgetrf_bufferSize(
+            dn.cu(),
+            n as i32,
+            n as i32,
+            a_ptr as *mut f32,
+            n as i32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f32(lwork.max(1) as usize, device)?;
+
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnSgetrf(
+            dn.cu(),
+            n as i32,
+            n as i32,
+            a_ptr as *mut f32,
+            n as i32,
+            work_ptr as *mut f32,
+            ipiv_ptr as *mut i32,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lu_factor_f32: getrf failed (singular matrix)",
+            expected: vec![0],
+            got: vec![info_val as usize],
+        });
+    }
+
+    // Column-major LU → row-major.
+    let lu_row = crate::kernels::gpu_transpose_2d(&d_a_col, n, n, device)?;
+    Ok((lu_row, d_ipiv))
+}
+
+/// GPU-resident LU factorization (f64). Mirrors [`gpu_lu_factor_f32`]. (#604)
+#[cfg(feature = "cuda")]
+pub fn gpu_lu_factor_f64(
+    a_dev: &CudaBuffer<f64>,
+    n: usize,
+    device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<i32>)> {
+    use cudarc::cusolver::sys as csys;
+
+    if n == 0 {
+        return Ok((
+            crate::transfer::alloc_zeros_f64(0, device)?,
+            alloc_zeros_i32(0, device)?,
+        ));
+    }
+    if a_dev.len() != n * n {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lu_factor_f64: input length mismatch",
+            expected: vec![n * n],
+            got: vec![a_dev.len()],
+        });
+    }
+
+    let stream = device.stream();
+    let dn = cusolver_safe::DnHandle::new(stream.clone())?;
+
+    let mut d_a_col = crate::kernels::gpu_transpose_2d_f64(a_dev, n, n, device)?;
+    let mut d_ipiv = alloc_zeros_i32(n, device)?;
+    let mut d_info = alloc_zeros_i32(1, device)?;
+
+    let mut lwork: i32 = 0;
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        csys::cusolverDnDgetrf_bufferSize(
+            dn.cu(),
+            n as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            &mut lwork,
+        )
+        .result()?;
+    }
+
+    let mut d_work = crate::transfer::alloc_zeros_f64(lwork.max(1) as usize, device)?;
+
+    unsafe {
+        let (a_ptr, _a_sync) = d_a_col.inner_mut().device_ptr_mut(&stream);
+        let (work_ptr, _work_sync) = d_work.inner_mut().device_ptr_mut(&stream);
+        let (ipiv_ptr, _ipiv_sync) = d_ipiv.inner_mut().device_ptr_mut(&stream);
+        let (info_ptr, _info_sync) = d_info.inner_mut().device_ptr_mut(&stream);
+
+        csys::cusolverDnDgetrf(
+            dn.cu(),
+            n as i32,
+            n as i32,
+            a_ptr as *mut f64,
+            n as i32,
+            work_ptr as *mut f64,
+            ipiv_ptr as *mut i32,
+            info_ptr as *mut i32,
+        )
+        .result()?;
+    }
+
+    stream.synchronize()?;
+    let info_val = read_dev_info(&d_info, device)?;
+    if info_val != 0 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_lu_factor_f64: getrf failed (singular matrix)",
+            expected: vec![0],
+            got: vec![info_val as usize],
+        });
+    }
+
+    let lu_row = crate::kernels::gpu_transpose_2d_f64(&d_a_col, n, n, device)?;
+    Ok((lu_row, d_ipiv))
+}
+
+// ---------------------------------------------------------------------------
 // QR: A = Q * R   (reduced/thin)
 // ---------------------------------------------------------------------------
 
@@ -1562,6 +1736,26 @@ pub fn gpu_solve_f64(
     _nrhs: usize,
     _device: &GpuDevice,
 ) -> GpuResult<Vec<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_lu_factor_f32(
+    _a_dev: &CudaBuffer<f32>,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f32>, CudaBuffer<i32>)> {
+    Err(GpuError::NoCudaFeature)
+}
+
+/// Stub — always returns [`GpuError::NoCudaFeature`].
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_lu_factor_f64(
+    _a_dev: &CudaBuffer<f64>,
+    _n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<(CudaBuffer<f64>, CudaBuffer<i32>)> {
     Err(GpuError::NoCudaFeature)
 }
 
