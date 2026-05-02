@@ -2638,6 +2638,38 @@ impl GpuBackend for CudaBackendImpl {
         Ok(Self::wrap_buffer_f64(out, a.device_ordinal()))
     }
 
+    fn pad_truncate_complex_f32(
+        &self,
+        src: &GpuBufferHandle,
+        batch: usize,
+        src_n: usize,
+        dst_n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let src_buf = Self::unwrap_buffer(src)?;
+        let dev = self.device(src.device_ordinal())?;
+        let out = crate::kernels::gpu_pad_truncate_complex_f32(
+            src_buf, batch, src_n, dst_n, dev,
+        )
+        .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer(out, src.device_ordinal()))
+    }
+
+    fn pad_truncate_complex_f64(
+        &self,
+        src: &GpuBufferHandle,
+        batch: usize,
+        src_n: usize,
+        dst_n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        let src_buf = Self::unwrap_buffer_f64(src)?;
+        let dev = self.device(src.device_ordinal())?;
+        let out = crate::kernels::gpu_pad_truncate_complex_f64(
+            src_buf, batch, src_n, dst_n, dev,
+        )
+        .map_err(Self::map_gpu_err)?;
+        Ok(Self::wrap_buffer_f64(out, src.device_ordinal()))
+    }
+
     fn rfft_r2c_f32(
         &self,
         a: &GpuBufferHandle,

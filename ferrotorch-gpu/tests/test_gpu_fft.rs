@@ -174,9 +174,10 @@ fn rfft_irfft_roundtrip_f64() {
 }
 
 #[test]
-fn fft_pad_truncate_falls_back_to_cpu() {
-    // Non-matching `n` currently routes through CPU — verify it still
-    // returns the right answer (regression test for the dispatch gate).
+fn fft_pad_runs_on_gpu_and_matches_cpu() {
+    // (#605) Now that pad/truncate has a GPU kernel, this case stays on
+    // device end-to-end. Verify the result still matches the CPU reference
+    // and that the output tensor is on GPU.
     ensure_cuda();
     let data: Vec<f32> = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0];
     let a_cpu = cpu_t_f32(data, &[4, 2]);
@@ -184,11 +185,68 @@ fn fft_pad_truncate_falls_back_to_cpu() {
 
     let out = fft(&a_gpu, Some(8)).unwrap();
     let ref_out = fft(&a_cpu, Some(8)).unwrap();
-    // CPU fall-back returns CPU tensor; just compare values.
-    let out_data: Vec<f32> = if out.is_cuda() {
-        out.cpu().unwrap().data().unwrap().to_vec()
-    } else {
-        out.data().unwrap().to_vec()
-    };
-    assert_close_f32(&out_data, ref_out.data().unwrap(), 1e-4);
+    assert!(out.is_cuda(), "GPU pad/truncate should keep output on device");
+    let out_host = out.cpu().unwrap().data().unwrap().to_vec();
+    assert_close_f32(&out_host, ref_out.data().unwrap(), 1e-4);
+}
+
+#[test]
+fn fft_truncate_runs_on_gpu_and_matches_cpu() {
+    // Truncate variant: ask for fewer points than input has.
+    ensure_cuda();
+    let data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.5).collect();
+    let a_cpu = cpu_t_f32(data, &[8, 2]); // 8 complex points
+    let a_gpu = a_cpu.clone().to(Device::Cuda(0)).unwrap();
+
+    let out = fft(&a_gpu, Some(4)).unwrap();
+    let ref_out = fft(&a_cpu, Some(4)).unwrap();
+    assert!(out.is_cuda());
+    let out_host = out.cpu().unwrap().data().unwrap().to_vec();
+    assert_close_f32(&out_host, ref_out.data().unwrap(), 1e-4);
+}
+
+#[test]
+fn ifft_pad_runs_on_gpu_and_matches_cpu() {
+    // ifft pad path mirrors fft pad path — round-trip through ifft instead.
+    ensure_cuda();
+    let data: Vec<f32> = vec![1.0, 0.0, -1.0, 0.0, 0.5, 0.5];
+    let a_cpu = cpu_t_f32(data, &[3, 2]);
+    let a_gpu = a_cpu.clone().to(Device::Cuda(0)).unwrap();
+
+    let out = ifft(&a_gpu, Some(6)).unwrap();
+    let ref_out = ifft(&a_cpu, Some(6)).unwrap();
+    assert!(out.is_cuda());
+    let out_host = out.cpu().unwrap().data().unwrap().to_vec();
+    assert_close_f32(&out_host, ref_out.data().unwrap(), 1e-4);
+}
+
+#[test]
+fn fft_pad_f64_runs_on_gpu_and_matches_cpu() {
+    ensure_cuda();
+    let data: Vec<f64> = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+    let a_cpu = cpu_t_f64(data, &[3, 2]);
+    let a_gpu = a_cpu.clone().to(Device::Cuda(0)).unwrap();
+
+    let out = fft(&a_gpu, Some(8)).unwrap();
+    let ref_out = fft(&a_cpu, Some(8)).unwrap();
+    assert!(out.is_cuda());
+    let out_host = out.cpu().unwrap().data().unwrap().to_vec();
+    assert_close_f64(&out_host, ref_out.data().unwrap(), 1e-10);
+}
+
+#[test]
+fn fft_pad_batched_runs_on_gpu() {
+    // Batch dimension: shape [B, src_n, 2] with src_n < dst_n.
+    ensure_cuda();
+    let data: Vec<f32> = (0..12).map(|i| i as f32 * 0.25).collect();
+    // [B=2, src_n=3, 2]
+    let a_cpu = cpu_t_f32(data, &[2, 3, 2]);
+    let a_gpu = a_cpu.clone().to(Device::Cuda(0)).unwrap();
+
+    let out = fft(&a_gpu, Some(8)).unwrap();
+    let ref_out = fft(&a_cpu, Some(8)).unwrap();
+    assert!(out.is_cuda());
+    assert_eq!(out.shape(), &[2, 8, 2]);
+    let out_host = out.cpu().unwrap().data().unwrap().to_vec();
+    assert_close_f32(&out_host, ref_out.data().unwrap(), 1e-4);
 }

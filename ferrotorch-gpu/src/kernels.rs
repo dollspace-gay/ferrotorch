@@ -90,6 +90,8 @@ pub(crate) fn ptx_f32_to_f64(f32_ptx: &str, f32_kernel_name: &str, f64_kernel_na
         .replace("shl.b64 %off, %off, 2", "shl.b64 %off, %off, 3")
         .replace("shl.b64 %off_in, %off_in, 2", "shl.b64 %off_in, %off_in, 3")
         .replace("shl.b64 %off_out, %off_out, 2", "shl.b64 %off_out, %off_out, 3")
+        .replace("shl.b64 %off_src, %off_src, 2", "shl.b64 %off_src, %off_src, 3")
+        .replace("shl.b64 %off_dst, %off_dst, 2", "shl.b64 %off_dst, %off_dst, 3")
         // Atomics
         .replace("atom.global.add.f32", "atom.global.add.f64")
         // Common float hex literals
@@ -5563,6 +5565,97 @@ TREE_DONE_MMAX:
     st.global.f32 [%out], %acc;
 
 END_MMAX:
+    ret;
+}
+";
+
+
+/// PTX source for `pad_truncate_kernel` (#605): copies a `[batch, src_n, 2]`
+/// complex tensor into a `[batch, dst_n, 2]` output, zero-padding when
+/// `dst_n > src_n` and truncating when `dst_n < src_n`. Each thread writes
+/// one output complex pair (`2 * f32` values). Used by the GPU FFT path
+/// when the user passes `n != input_n`.
+///
+/// Thread layout: `tid` covers `batch * dst_n` complex pairs. For each
+/// output position `(b, k)`:
+///   - if `k < src_n`: copy `src[b, k, :]` to `dst[b, k, :]`
+///   - else: write zeros.
+#[cfg(feature = "cuda")]
+pub(crate) const PAD_TRUNCATE_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry pad_truncate_kernel(
+    .param .u64 src_ptr,
+    .param .u64 dst_ptr,
+    .param .u32 batch,
+    .param .u32 src_n,
+    .param .u32 dst_n
+) {
+    .reg .u32 %r_tid, %bid, %bdim, %total, %b_idx, %k_idx, %src_offset, %dst_offset;
+    .reg .u32 %tmp32, %tmp32b;
+    .reg .u64 %src_base, %dst_base, %off_src, %off_dst;
+    .reg .f32 %re, %im;
+    .reg .pred %p_oob, %p_pad;
+
+    ld.param.u64 %src_base, [src_ptr];
+    ld.param.u64 %dst_base, [dst_ptr];
+    ld.param.u32 %tmp32, [batch];
+    ld.param.u32 %tmp32b, [dst_n];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %r_tid, %tid.x;
+    mad.lo.u32 %r_tid, %bid, %bdim, %r_tid;
+
+    // total = batch * dst_n
+    mul.lo.u32 %total, %tmp32, %tmp32b;
+    setp.ge.u32 %p_oob, %r_tid, %total;
+    @%p_oob bra DONE_PT;
+
+    // b_idx = r_tid / dst_n
+    // k_idx = r_tid % dst_n
+    div.u32 %b_idx, %r_tid, %tmp32b;
+    rem.u32 %k_idx, %r_tid, %tmp32b;
+
+    // dst_offset = (b_idx * dst_n + k_idx) * 2
+    mad.lo.u32 %dst_offset, %b_idx, %tmp32b, %k_idx;
+    shl.b32 %dst_offset, %dst_offset, 1;
+
+    // Compare k_idx vs src_n.
+    ld.param.u32 %tmp32, [src_n];
+    setp.ge.u32 %p_pad, %k_idx, %tmp32;
+    @%p_pad bra PAD;
+
+    // Copy from src[b_idx, k_idx, :].
+    // src_offset = (b_idx * src_n + k_idx) * 2
+    mad.lo.u32 %src_offset, %b_idx, %tmp32, %k_idx;
+    shl.b32 %src_offset, %src_offset, 1;
+
+    cvt.u64.u32 %off_src, %src_offset;
+    shl.b64 %off_src, %off_src, 2;
+    add.u64 %off_src, %src_base, %off_src;
+
+    cvt.u64.u32 %off_dst, %dst_offset;
+    shl.b64 %off_dst, %off_dst, 2;
+    add.u64 %off_dst, %dst_base, %off_dst;
+
+    ld.global.f32 %re, [%off_src];
+    ld.global.f32 %im, [%off_src + 4];
+    st.global.f32 [%off_dst], %re;
+    st.global.f32 [%off_dst + 4], %im;
+    bra DONE_PT;
+
+PAD:
+    cvt.u64.u32 %off_dst, %dst_offset;
+    shl.b64 %off_dst, %off_dst, 2;
+    add.u64 %off_dst, %dst_base, %off_dst;
+    mov.f32 %re, 0f00000000;
+    st.global.f32 [%off_dst], %re;
+    st.global.f32 [%off_dst + 4], %re;
+
+DONE_PT:
     ret;
 }
 ";
@@ -12226,6 +12319,86 @@ pub fn gpu_masked_reduce_max(
     Err(GpuError::NoCudaFeature)
 }
 
+/// GPU pad/truncate for complex tensors stored as `[batch, n, 2]` f32 (#605).
+/// Produces `[batch, dst_n, 2]`: zero-padded when `dst_n > src_n`, truncated
+/// when `dst_n < src_n`. Single PTX kernel, no host bounce.
+#[cfg(feature = "cuda")]
+pub fn gpu_pad_truncate_complex_f32(
+    src: &CudaBuffer<f32>,
+    batch: usize,
+    src_n: usize,
+    dst_n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    use cudarc::driver::PushKernelArg;
+
+    if src.len() != batch * src_n * 2 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_pad_truncate_complex_f32",
+            expected: vec![batch * src_n * 2],
+            got: vec![src.len()],
+        });
+    }
+    let total_pairs = batch * dst_n;
+    if total_pairs == 0 {
+        return alloc_zeros_f32(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        PAD_TRUNCATE_PTX,
+        "pad_truncate_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(src, device)?;
+            let mut out = vec![0.0_f32; batch * dst_n * 2];
+            for b in 0..batch {
+                let copy_n = src_n.min(dst_n);
+                for k in 0..copy_n {
+                    out[(b * dst_n + k) * 2] = host[(b * src_n + k) * 2];
+                    out[(b * dst_n + k) * 2 + 1] = host[(b * src_n + k) * 2 + 1];
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f32(batch * dst_n * 2, device)?;
+    let cfg = launch_cfg(total_pairs)?;
+    let batch_u32 = batch as u32;
+    let src_n_u32 = src_n as u32;
+    let dst_n_u32 = dst_n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(src.inner())
+            .arg(out.inner_mut())
+            .arg(&batch_u32)
+            .arg(&src_n_u32)
+            .arg(&dst_n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_pad_truncate_complex_f32(
+    _src: &CudaBuffer<f32>,
+    _batch: usize,
+    _src_n: usize,
+    _dst_n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f32>> {
+    Err(GpuError::NoCudaFeature)
+}
+
 ///   `output[i] = sum_{k=0}^{axis_size-1} input[outer_idx * axis_size * inner_size + k * inner_size + inner_idx]`
 ///
 /// where `outer_idx = i / inner_size`, `inner_idx = i % inner_size`.
@@ -15353,6 +15526,106 @@ pub fn gpu_masked_reduce_max(_d: &CudaBuffer<f32>, _m: &CudaBuffer<f32>, _device
 pub fn gpu_masked_reduce_min_f64(_d: &CudaBuffer<f64>, _m: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
 #[cfg(not(feature = "cuda"))]
 pub fn gpu_masked_reduce_max_f64(_d: &CudaBuffer<f64>, _m: &CudaBuffer<f64>, _device: &GpuDevice) -> GpuResult<CudaBuffer<f64>> { Err(GpuError::NoCudaFeature) }
+
+/// f64 GPU pad/truncate counterpart of [`gpu_pad_truncate_complex_f32`].
+/// (#605)
+#[cfg(feature = "cuda")]
+pub fn gpu_pad_truncate_complex_f64(
+    src: &CudaBuffer<f64>,
+    batch: usize,
+    src_n: usize,
+    dst_n: usize,
+    device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    use cudarc::driver::PushKernelArg;
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    if src.len() != batch * src_n * 2 {
+        return Err(GpuError::ShapeMismatch {
+            op: "gpu_pad_truncate_complex_f64",
+            expected: vec![batch * src_n * 2],
+            got: vec![src.len()],
+        });
+    }
+    let total_pairs = batch * dst_n;
+    if total_pairs == 0 {
+        return alloc_zeros_f64(0, device);
+    }
+
+    let ctx = device.context();
+    let stream = device.stream();
+
+    // The PTX is purely integer-indexed; only the byte stride matters
+    // for the f64 version. The existing rewriter handles
+    // `shl.b64 %off_src, %off_src, 2` → `..., 3` and the offset literals
+    // (`+ 4` → `+ 8`) we use are NOT covered, so we patch the offsets in
+    // the PTX rewrite below using `replace`.
+    let ptx = CACHE
+        .get_or_init(|| {
+            let mut s = ptx_f32_to_f64(
+                PAD_TRUNCATE_PTX,
+                "pad_truncate_kernel",
+                "pad_truncate_f64_kernel",
+            );
+            // Each complex pair is 8 floats apart in f32 (re at +0, im at +4)
+            // and 16 bytes apart in f64 (re at +0, im at +8).
+            s = s.replace("[%off_src + 4]", "[%off_src + 8]");
+            s = s.replace("[%off_dst + 4]", "[%off_dst + 8]");
+            s
+        })
+        .as_str();
+
+    let f = match crate::module_cache::get_or_compile(
+        ctx,
+        ptx,
+        "pad_truncate_f64_kernel",
+        device.ordinal() as u32,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let host = gpu_to_cpu(src, device)?;
+            let mut out = vec![0.0_f64; batch * dst_n * 2];
+            for b in 0..batch {
+                let copy_n = src_n.min(dst_n);
+                for k in 0..copy_n {
+                    out[(b * dst_n + k) * 2] = host[(b * src_n + k) * 2];
+                    out[(b * dst_n + k) * 2 + 1] = host[(b * src_n + k) * 2 + 1];
+                }
+            }
+            return cpu_to_gpu(&out, device);
+        }
+    };
+
+    let mut out = alloc_zeros_f64(batch * dst_n * 2, device)?;
+    let cfg = launch_cfg(total_pairs)?;
+    let batch_u32 = batch as u32;
+    let src_n_u32 = src_n as u32;
+    let dst_n_u32 = dst_n as u32;
+
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(src.inner())
+            .arg(out.inner_mut())
+            .arg(&batch_u32)
+            .arg(&src_n_u32)
+            .arg(&dst_n_u32)
+            .launch(cfg)?;
+    }
+
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gpu_pad_truncate_complex_f64(
+    _src: &CudaBuffer<f64>,
+    _batch: usize,
+    _src_n: usize,
+    _dst_n: usize,
+    _device: &GpuDevice,
+) -> GpuResult<CudaBuffer<f64>> {
+    Err(GpuError::NoCudaFeature)
+}
 
 /// Sum along an axis for f64.
 #[cfg(feature = "cuda")]

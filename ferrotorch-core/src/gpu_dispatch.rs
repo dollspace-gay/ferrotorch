@@ -1767,6 +1767,36 @@ pub trait GpuBackend: Send + Sync {
             message: "fft_c2c_f64 GPU op not yet implemented".into(),
         })
     }
+
+    /// GPU pad/truncate for complex tensors stored as `[batch, n, 2]`
+    /// (#605). Used by the FFT path when the user passes `n != input_n` —
+    /// allocates a `[batch, dst_n, 2]` output, copies the visible portion
+    /// from `src`, and zero-fills the tail. Single PTX kernel, no host
+    /// bounce.
+    fn pad_truncate_complex_f32(
+        &self,
+        _src: &GpuBufferHandle,
+        _batch: usize,
+        _src_n: usize,
+        _dst_n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "pad_truncate_complex_f32 GPU op not yet implemented".into(),
+        })
+    }
+
+    /// f64 counterpart of [`Self::pad_truncate_complex_f32`]. (#605)
+    fn pad_truncate_complex_f64(
+        &self,
+        _src: &GpuBufferHandle,
+        _batch: usize,
+        _src_n: usize,
+        _dst_n: usize,
+    ) -> FerrotorchResult<GpuBufferHandle> {
+        Err(FerrotorchError::InvalidArgument {
+            message: "pad_truncate_complex_f64 GPU op not yet implemented".into(),
+        })
+    }
     fn rfft_r2c_f32(
         &self,
         _a: &GpuBufferHandle,

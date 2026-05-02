@@ -136,21 +136,31 @@ pub fn fft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<Te
     let batch_shape = &shape[..ndim - 2];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
 
-    if input.is_cuda() && fft_n == input_n {
-        // GPU C2C dispatch via cuFFT (#579). The pad/truncate case still
-        // routes through CPU below — adding GPU pad/truncate is follow-up
-        // work; uncommon in practice and avoids a per-batch memcpy loop.
+    if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+        // GPU C2C dispatch via cuFFT (#579), with on-device pad/truncate
+        // when `fft_n != input_n` (#605). Fully on-device — no host bounce.
         let backend = crate::gpu_dispatch::gpu_backend()
             .ok_or(FerrotorchError::DeviceUnavailable)?;
         let buf = input.gpu_handle()?;
-        let h = if is_f32::<T>() {
-            backend.fft_c2c_f32(buf, batch_size, fft_n, false)?
-        } else if is_f64::<T>() {
-            backend.fft_c2c_f64(buf, batch_size, fft_n, false)?
+
+        // Optional pad/truncate to fft_n.
+        let (transformed_handle, owned);
+        let buf_for_fft: &crate::gpu_dispatch::GpuBufferHandle = if fft_n == input_n {
+            buf
+        } else if is_f32::<T>() {
+            owned = backend.pad_truncate_complex_f32(buf, batch_size, input_n, fft_n)?;
+            transformed_handle = &owned;
+            transformed_handle
         } else {
-            return Err(FerrotorchError::InvalidArgument {
-                message: "fft requires f32 or f64".into(),
-            });
+            owned = backend.pad_truncate_complex_f64(buf, batch_size, input_n, fft_n)?;
+            transformed_handle = &owned;
+            transformed_handle
+        };
+
+        let h = if is_f32::<T>() {
+            backend.fft_c2c_f32(buf_for_fft, batch_size, fft_n, false)?
+        } else {
+            backend.fft_c2c_f64(buf_for_fft, batch_size, fft_n, false)?
         };
         let mut out_shape = batch_shape.to_vec();
         out_shape.push(fft_n);
@@ -217,18 +227,30 @@ pub fn ifft<T: Float>(input: &Tensor<T>, n: Option<usize>) -> FerrotorchResult<T
     let batch_shape = &shape[..ndim - 2];
     let batch_size: usize = batch_shape.iter().product::<usize>().max(1);
 
-    if input.is_cuda() && fft_n == input_n {
+    if input.is_cuda() && (is_f32::<T>() || is_f64::<T>()) {
+        // GPU C2C dispatch via cuFFT, with on-device pad/truncate when
+        // `fft_n != input_n` (#605).
         let backend = crate::gpu_dispatch::gpu_backend()
             .ok_or(FerrotorchError::DeviceUnavailable)?;
         let buf = input.gpu_handle()?;
-        let h = if is_f32::<T>() {
-            backend.fft_c2c_f32(buf, batch_size, fft_n, true)?
-        } else if is_f64::<T>() {
-            backend.fft_c2c_f64(buf, batch_size, fft_n, true)?
+
+        let (transformed_handle, owned);
+        let buf_for_fft: &crate::gpu_dispatch::GpuBufferHandle = if fft_n == input_n {
+            buf
+        } else if is_f32::<T>() {
+            owned = backend.pad_truncate_complex_f32(buf, batch_size, input_n, fft_n)?;
+            transformed_handle = &owned;
+            transformed_handle
         } else {
-            return Err(FerrotorchError::InvalidArgument {
-                message: "ifft requires f32 or f64".into(),
-            });
+            owned = backend.pad_truncate_complex_f64(buf, batch_size, input_n, fft_n)?;
+            transformed_handle = &owned;
+            transformed_handle
+        };
+
+        let h = if is_f32::<T>() {
+            backend.fft_c2c_f32(buf_for_fft, batch_size, fft_n, true)?
+        } else {
+            backend.fft_c2c_f64(buf_for_fft, batch_size, fft_n, true)?
         };
         let mut out_shape = batch_shape.to_vec();
         out_shape.push(fft_n);
