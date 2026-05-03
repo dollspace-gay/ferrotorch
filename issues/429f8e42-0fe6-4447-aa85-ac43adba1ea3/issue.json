@@ -1,0 +1,10 @@
+{
+  "uuid": "429f8e42-0fe6-4447-aa85-ac43adba1ea3",
+  "display_id": 679,
+  "title": "ferrotorch-jit: replace rustc-shellout JIT with cranelift-jit (in-process, no subprocess, no dlopen)",
+  "status": "open",
+  "priority": "high",
+  "created_by": "y4rr",
+  "created_at": "2026-05-03T03:53:33.514053688Z",
+  "updated_at": "2026-05-03T03:53:33.514053688Z"
+}
