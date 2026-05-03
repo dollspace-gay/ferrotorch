@@ -1,0 +1,10 @@
+{
+  "uuid": "aa3349b5-ccbb-4a80-8dbe-2b58553c88c9",
+  "issue_uuid": "f526565f-5a2b-49d4-9511-20f33d3dc29a",
+  "author": "y4rr",
+  "content": "Install succeeded — sudo dnf install -y cuda-nvcc-13-1 (391 MiB) gave us /usr/local/cuda-13.1/bin/ptxas. Ran ptxas --gpu-name=sm_86 on the extracted REDUCE_SUM_PTX and got the specific error in seconds: 'Unknown video selector: .x' on the line 'mov.u32 %tid, %tid.x;'. The bug was a register-name collision: user-declared %tid clashes with PTX's special %tid.x/y/z registers. The assembler parses %tid.x ambiguously when there's a user register named %tid in scope. Working dot-kernel uses %r_tid (line 4269) precisely to avoid this. Diagnosed in under 60 seconds with ptxas — proves the install was the right call. ALL 12 affected kernels (the 6 reductions plus embed_lookup_batch, scatter_add_rows, batchnorm_forward, maxpool2d_forward, avgpool2d_forward, fused_gru_forward) had the same bug. Fixed via 2 file-wide replace_all edits (%tid, → %my_tid, and %tid; → %my_tid;). Now every reduction kernel ptxas-validates clean. cargo test PASSES across all binaries (was 27 failing before, now 0). Workspace builds clean.",
+  "created_at": "2026-05-03T00:36:58.995571319Z",
+  "kind": "result",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAM4w60f5PTtznfTIjdPZfHZSegXJUkwhRvXa9H+HfkyjkNGUiwPNef53apygXIbxphwa1ka342kXj90pK+Q2lAw=="
+}
