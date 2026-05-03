@@ -1,0 +1,10 @@
+{
+  "uuid": "b46fdc5f-dfe8-4d3a-abe1-d7a5a96b182c",
+  "issue_uuid": "2670bda8-70a3-4421-be40-c618b3d145af",
+  "author": "y4rr",
+  "content": "Replaced ferrotorch-jit C-codegen JIT with Rust-codegen JIT (#678). Pure-Rust pipeline: LoopIR → generate_rust_source → wrap_with_trampoline → rustc --crate-type=cdylib --edition=2024 -C opt-level=3 -C panic=abort → dlopen → fn ptr. Removed: InductorTarget::CpuC variant, generate_c_source + emit_c_* + format_f64_c + c_buffer_name (~230 LoC), all test_c_* tests (15 tests), find_c_compiler. Renamed: try_jit_compile_cpu_c→try_jit_compile_cpu_rust, compile_c_kernel→compile_rust_kernel, have_c_compiler→have_rustc, all 12 test_inductor_cpuc_jit_*→test_inductor_cpurust_jit_*. New trampoline emits #[unsafe(no_mangle)] pub unsafe extern \"C\" fn that reconstructs &[&[f64]] from raw ptr-of-ptrs, calling kernel(&[in0,in1,...], out_slice). Added narrow guard in try_jit_compile_cpu_rust: bail to interpreter if any node in fusion group has duplicate inputs (e.g., Add(x,x)) since fuse_dag emits per-position buffer slots but external_inputs is dedup'd. Also closed #676 follow-up: added rust-quality §4 lint baseline to lib.rs (warn pedantic + 13 narrow allows w/ comments + crate-wide allow(missing_docs) tracked in #677), DefaultHasher→inline FNV-1a deterministic hash, removed 5 eprintln!s from test code, derived Debug on 7 missing-Debug types, added Debug bound to Codegen trait, fixed ~125 mechanical lints via cargo clippy --fix + manual edits. Verifications PASS: cargo check, clippy -D warnings (0), 287/287 jit tests, fmt, workspace build, full workspace test (all crates 0 failures). Tracked follow-ups: #677 (rustdoc pass for ~150 pub items), #672/#673/#674 done. ADR #663 items 5/8 still open.",
+  "created_at": "2026-05-03T03:37:28.848068627Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAD4Qnd3gHJxcsFD1D0h+syHLbDMKTZBJ1C8ukuRSE8llBMQiwk8nEGsmmD6HTM+X5Tnvger+0XuqXyxjxd4T3CQ=="
+}
