@@ -1,0 +1,10 @@
+{
+  "uuid": "8dcb7335-efa5-4979-99f5-cd4edd0415fd",
+  "issue_uuid": "846ede3d-c9ea-4a8c-983c-aaf9ed1a0b7f",
+  "author": "y4rr",
+  "content": "Audit follow-up #1/5 landed via architect-mode + opus 4.7 (#684). Made ferrotorch-mps skeleton architecturally honest. Removed lying-success stub: init_mps_backend() now Err(DeviceUnavailable) unconditionally with docstring pointer to #451. is_mps_available()=false, mps_device_count()=0, MpsDevice::new()=Err always. Removed metal-backend feature (was a §3-shaped lie — activated zero code paths). Renamed device_count→mps_device_count (PyTorch idiom + glob-export disambiguator); kept MpsDevice::count() as sibling. Added Debug+Clone+Copy+PartialEq+Eq+Hash derives + Display(mps:{ordinal}) impl on MpsDevice. Added lint baseline matching jit reference shape (warn pedantic + 1 narrow allow w/ justification + deny missing_docs). Simplified 5 tests to assert always-unavailable contract uniformly (no platform conditionals). NO new deps (still only ferrotorch-core), NO new cfg blocks, NO MSL kernel code, NO MpsBackendImpl constructed. All 8 audit findings addressed (3🔴+4🟡+1🟢). Verifications PASS: cargo build, clippy -D warnings (0), 5/5 tests, fmt, workspace build. Architect-mode trial #3 (opus): clean 1-round APPROVE, no REDIRECT. 5/5 architect dispatches now run; 3 of 3 with opus = clean 1-round, 1 of 1 with sonnet = 1.5-round. Next: crate #2 of 5 = ferrotorch-core.",
+  "created_at": "2026-05-03T06:19:09.413754858Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8CC13CJuidrQVPzJxvAtPUC6OMWOFziya43482oVc57mdVn47/psBwx+mAIo6XT0MAzFc29aOd47SOg8xr0SCQ=="
+}
