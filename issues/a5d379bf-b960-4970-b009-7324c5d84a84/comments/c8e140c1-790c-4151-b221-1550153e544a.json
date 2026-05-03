@@ -1,0 +1,10 @@
+{
+  "uuid": "c8e140c1-790c-4151-b221-1550153e544a",
+  "issue_uuid": "a5d379bf-b960-4970-b009-7324c5d84a84",
+  "author": "y4rr",
+  "content": "ADR #663 item 6 landed. Sonnet subagent dispatched with all 3 skills + 5 lessons + concrete file:line. Added JitError::GpuBackendUnavailable {target, reason} variant (safe — JitError is #[non_exhaustive], 0 external consumers). InductorBackend::compile() for GpuCuda/GpuPtx now returns Err with structured target+reason instead of silently routing to InterpreterBackend. SAFETY-comment migration at codegen_jit.rs:96-99 (prose // Safety → // SAFETY immediately preceding each unsafe impl, with separate per-impl invariant naming). 2 new regression tests verify the GPU compile arms return Err. Cluster scan confirmed no sibling silent-fallback patterns in jit. Verifications all PASS: cargo check, clippy -D warnings (0 warnings), 302 unit + 5 doctests, fmt, workspace build, full workspace test. Out-of-scope known-unfixed: pub struct field encapsulation, eprintln! in test code, GPU codegen test infrastructure, DefaultHasher non-determinism, missing crate-level lint config. Remaining ADR #663 items: 5 (distributions B), 8 (nn A reduce-norm kernel).",
+  "created_at": "2026-05-03T02:43:45.121319178Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAN4rDiRpFbpKIHl4Qt8dre43q3x9LXrvpJVJjOG0GbRHqReslzNXfrk3W312pnQXdi46LnkO3j4ZLVCVnIKQxAQ=="
+}
