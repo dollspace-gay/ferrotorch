@@ -1,0 +1,10 @@
+{
+  "uuid": "a03277ec-3696-40ff-ac28-060ec315f0cb",
+  "issue_uuid": "367b58be-d0b4-4d33-a4c8-857d8717e9b2",
+  "author": "y4rr",
+  "content": "Authored architect skill at ~/.claude/skills/architect/SKILL.md (#680). Hard role separation: architect never implements, dispatches subagents for all work, audits their output adversarially. Two checkpoints: (1) pre-flight document reviewed BEFORE any dispatch — goal restatement, request interpretation, divergence-from-goal, chosen approach + alternative, failure mode, evidence subagent must produce; (2) post-implementation audit AFTER subagent reports — goal alignment, evidence verification, scope-narrowing check, forbidden-pattern re-introduction check, architectural unilateralism check. Verdict required: APPROVE/REDIRECT/BLOCK; PASS-without-verdict forbidden. North star format: project + binding constraints + forbidden patterns; recited at every checkpoint. Project failure-mode list distilled from this session's history (10 patterns including letter-not-spirit, scope-narrowing escape, silent fallback re-introduction, blanket lint allows, self-reported verification, satisfying-the-skill-not-the-goal). Composes with rust-quality/-fix-discipline/-gpu-discipline (tactical, loaded by subagent) and crosslink-guide (issue tracking). User-bypass available for explicitly-mechanical tasks. Next session: trial on item 8 (clip_grad_norm GPU kernel) — invoke architect skill, produce pre-flight, dispatch with it, audit verdict-required.",
+  "created_at": "2026-05-03T04:54:25.476863800Z",
+  "kind": "handoff",
+  "signed_by": "SHA256:YWYNpJtV657L1tj0WNsAvmVQrz2HbQJv93mZZEx602c",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg/HKsBzj3mGAfTiSH5AbOUsF4b5ilHAPc85gQwD/Zjt8AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl1O6G9n28NLEH9jvk9uYjDZiKfO0XieG3oO48EWJqbD9DlhJfIyz9PXNacl2qCNhHN9qMnPxu2PypkHeAX15Dg=="
+}
